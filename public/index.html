@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>knoknok — tenant &amp; landlord requests</title>
+<link rel="stylesheet" href="/styles.css" />
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔧</text></svg>" />
+</head>
+<body>
+
+<!-- ---------------------------------------------------------------- auth -->
+<div id="auth" class="auth hidden">
+  <div class="auth-card">
+    <h1 class="logo">knoknok</h1>
+    <p class="tagline">Maintenance requests and to-dos, between tenants and landlords.</p>
+
+    <div class="tabs" id="authTabs">
+      <button class="tab active" data-mode="login">Sign in</button>
+      <button class="tab" data-mode="signup">Create account</button>
+    </div>
+
+    <form id="authForm" autocomplete="on">
+      <div id="signupOnly" class="hidden">
+        <div class="role-picker">
+          <label class="role selected"><input type="radio" name="role" value="tenant" checked /><span><strong>I'm a tenant</strong><small>Report issues in my home</small></span></label>
+          <label class="role"><input type="radio" name="role" value="landlord" /><span><strong>I'm a landlord</strong><small>Manage a property's to-dos</small></span></label>
+        </div>
+        <label class="field"><span>Your name</span><input name="displayName" placeholder="Alex Rivera" /></label>
+        <div id="tenantFields">
+          <label class="field"><span>Property code</span><input name="joinCode" placeholder="From your landlord, e.g. K4M2QP" style="text-transform:uppercase" /></label>
+          <label class="field"><span>Unit</span><input name="unit" placeholder="4B" /></label>
+        </div>
+        <div id="landlordFields" class="hidden">
+          <label class="field"><span>Property name</span><input name="propertyName" placeholder="Maple Court Apartments" /></label>
+        </div>
+      </div>
+
+      <label class="field"><span>Username</span><input name="username" autocomplete="username" required /></label>
+      <label class="field"><span>Password</span><input name="password" type="password" autocomplete="current-password" required /></label>
+
+      <p id="authError" class="error hidden"></p>
+      <button class="primary block" type="submit" id="authSubmit">Sign in</button>
+    </form>
+  </div>
+</div>
+
+<!-- ----------------------------------------------------------------- app -->
+<div id="app" class="app hidden">
+  <header class="topbar">
+    <div class="brand"><span class="logo-sm">knoknok</span><span id="propName" class="prop"></span></div>
+    <div class="topbar-right">
+      <span id="botBadge" class="badge" title="Which engine is answering triage"></span>
+      <span id="whoami" class="who"></span>
+      <button id="logout" class="ghost">Sign out</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <aside class="sidebar">
+      <div class="sidebar-head">
+        <div class="filters" id="filters"></div>
+        <button id="newBtn" class="primary small">+ New</button>
+      </div>
+      <div id="list" class="list"></div>
+      <div id="landlordInfo" class="landlord-info hidden"></div>
+    </aside>
+
+    <section id="detail" class="detail"></section>
+  </main>
+</div>
+
+<!-- ------------------------------------------------------------- new item -->
+<div id="modal" class="modal hidden">
+  <div class="modal-card">
+    <h2 id="modalTitle">New request</h2>
+    <form id="newForm">
+      <label class="field"><span>Title</span><input name="title" id="newTitle" placeholder="Kitchen sink won't drain" required /></label>
+      <label class="field"><span id="descLabel">What's happening?</span>
+        <textarea name="description" id="newDesc" rows="5" placeholder="Describe it like you'd tell a neighbour — when it started, what you've noticed, anything you've already tried."></textarea>
+      </label>
+      <label class="field landlord-field hidden"><span>Priority</span>
+        <select name="priority">
+          <option value="low">Low</option>
+          <option value="normal" selected>Normal</option>
+          <option value="high">High</option>
+          <option value="urgent">Urgent</option>
+        </select>
+      </label>
+      <p id="modalHint" class="hint"></p>
+      <p id="modalError" class="error hidden"></p>
+      <div class="modal-actions">
+        <button type="button" class="ghost" id="modalCancel">Cancel</button>
+        <button type="submit" class="primary" id="modalSubmit">Start</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>
