@@ -5,13 +5,17 @@
   "type": "module",
   "description": "Tenant <-> landlord maintenance and to-do coordination, with an AI triage bot",
   "scripts": {
-    "start": "bun run src/server.ts",
-    "dev": "bun --watch src/server.ts",
+    "start": "bun run server.ts",
+    "dev": "bun --watch server.ts",
     "seed": "bun run seed.ts",
     "test": "bun test"
   },
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.120.0",
+    "@libsql/client": "^0.17.4",
     "zod": "^4.4.3"
   },
   "devDependencies": {

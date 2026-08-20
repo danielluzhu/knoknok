@@ -9,8 +9,14 @@ import { rmSync } from "node:fs";
 
 const PORT = 4399;
 const DB = "data/test-knoknok.db";
-const BASE = `http://localhost:${PORT}`;
-let server: ReturnType<typeof Bun.spawn>;
+/**
+ * By default the suite boots the Bun dev server. Point TEST_BASE_URL at
+ * something else — the Vercel bundle running under Node, or a preview
+ * deployment — to run exactly these tests against that instead.
+ */
+const EXTERNAL = process.env.TEST_BASE_URL?.replace(/\/$/, "");
+const BASE = EXTERNAL ?? `http://localhost:${PORT}`;
+let server: ReturnType<typeof Bun.spawn> | null = null;
 
 /** A cookie jar per signed-in user, so tests can hold several sessions at once. */
 class Session {
@@ -36,22 +42,25 @@ class Session {
 const uniq = (p: string) => `${p}${Math.floor(Math.random() * 1e6)}`;
 
 beforeAll(async () => {
-  for (const suffix of ["", "-wal", "-shm"]) {
-    try { rmSync(DB + suffix); } catch { /* first run */ }
+  if (!EXTERNAL) {
+    for (const suffix of ["", "-wal", "-shm"]) {
+      try { rmSync(DB + suffix); } catch { /* first run */ }
+    }
+    server = Bun.spawn(["bun", "run", "server.ts"], {
+      env: { ...process.env, PORT: String(PORT), DB_PATH: DB, ANTHROPIC_API_KEY: "" },
+      stdout: "pipe", stderr: "pipe",
+    });
   }
-  server = Bun.spawn(["bun", "run", "src/server.ts"], {
-    env: { ...process.env, PORT: String(PORT), DB_PATH: DB, ANTHROPIC_API_KEY: "" },
-    stdout: "pipe", stderr: "pipe",
-  });
   // Wait for the port to answer rather than sleeping a fixed amount.
   for (let i = 0; i < 100; i++) {
     try { await fetch(BASE + "/api/me"); return; } catch { await Bun.sleep(100); }
   }
-  throw new Error("server did not start");
+  throw new Error(`no server answering at ${BASE}`);
 });
 
 afterAll(() => {
   server?.kill();
+  if (EXTERNAL) return;
   for (const suffix of ["", "-wal", "-shm"]) {
     try { rmSync(DB + suffix); } catch { /* already gone */ }
   }

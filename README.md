@@ -5,7 +5,8 @@ list. New tenant requests go through a triage bot first: it asks a couple of dia
 questions, walks the tenant through a safe fix where one exists, and only escalates to the
 landlord when it actually needs them.
 
-Bun + SQLite + vanilla JS. No build step, no framework, no external services required.
+Bun + libSQL + vanilla JS. No build step, no framework. Runs locally against a SQLite file
+and deploys to Vercel against Turso, with the same code and the same SQL.
 
 ## Running it
 
@@ -16,7 +17,9 @@ bun start        # http://localhost:4321
 bun test         # end-to-end API suite (33 tests, throwaway database)
 ```
 
-`PORT` and `DB_PATH` are both configurable via environment variables.
+`PORT` and `DB_PATH` are configurable via environment variables; see `.env.example` for the
+full list. Setting `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` points local development at a
+Turso database instead of the file.
 
 On this machine the app is reachable through the proxy at `https://knoknok-4321.another.ac`.
 
@@ -104,12 +107,14 @@ bun start
 ## Layout
 
 ```
-src/db.ts       schema and types
-src/auth.ts     password hashing, sessions, cookies
-src/bot.ts      triage — Claude and the rule-based fallback
-src/server.ts   HTTP routes and static serving
-public/         the whole front end (index.html, app.js, styles.css)
-seed.ts         demo property, users, and tickets
+server.ts          the listener — node:http, run by Bun locally and Node on Vercel
+src/app.ts         every route, as one Request -> Response function
+src/db.ts          schema, the libSQL client, and types
+src/auth.ts        password hashing, sessions, throttling, cookies
+src/bot.ts         triage — Claude and the rule-based fallback
+public/            the whole front end (index.html, app.js, styles.css)
+seed.ts            demo property, users, and tickets
+test/api.test.ts   end-to-end HTTP tests
 ```
 
 ## API
@@ -143,11 +148,82 @@ same way the browser does — signup and join codes, all three triage outcomes, 
 closing and reopening, re-filing, tenant-targeted to-dos, unread tracking, password change
 and session invalidation, throttling, cross-property isolation, and static path traversal.
 
+Point the same suite at any other running copy — a Vercel preview deployment, say — with:
+
+```bash
+TEST_BASE_URL=https://your-preview.vercel.app bun test
+```
+
+Note that this writes real accounts and tickets, so use a preview and a scratch database
+rather than anything you care about.
+
+## Deploying to Vercel
+
+Vercel has no persistent disk, so the SQLite file becomes a [Turso](https://turso.tech)
+database. Turso is libSQL — the same SQLite dialect — so no query in this project changes;
+only the connection does.
+
+**1. Create the database**
+
+```bash
+brew install tursodatabase/tap/turso   # or: curl -sSfL https://get.tur.so/install.sh | bash
+turso auth signup
+turso db create knoknok
+turso db show knoknok --url            # -> libsql://knoknok-you.turso.io
+turso db tokens create knoknok         # -> the auth token
+```
+
+**2. Deploy**
+
+```bash
+npm i -g vercel
+vercel link
+vercel env add TURSO_DATABASE_URL      # paste the libsql:// URL
+vercel env add TURSO_AUTH_TOKEN        # paste the token
+vercel env add ANTHROPIC_API_KEY       # optional — triage falls back to rules without it
+vercel deploy --prod
+```
+
+Or import the repository at [vercel.com/new](https://vercel.com/new) and set the same
+environment variables in the project settings. No build command and no output directory are
+needed; the defaults are correct.
+
+**3. Seed it, if you want the demo data**
+
+```bash
+TURSO_DATABASE_URL=libsql://... TURSO_AUTH_TOKEN=... bun run seed
+```
+
+The schema is created on first use — `CREATE TABLE IF NOT EXISTS`, once per instance — so
+there is no migration step to run.
+
+### How it maps onto Vercel
+
+There is no `vercel.json` and no build step — the defaults are already right.
+
+| Piece | Where it runs |
+| ----- | ------------- |
+| `server.ts` | Detected as the server entrypoint and captured as a single Vercel Function that receives every route |
+| `public/` | Served by Vercel's CDN before a request reaches the function |
+
+Three things to know if you change the structure:
+
+- **`server.ts` has to keep that name, at the root or in `src/`.** That filename is how
+  Vercel finds the entrypoint; rename it and the deployment builds but serves nothing.
+- **Keep `server.ts` free of Bun-specific APIs.** It runs on Node in production. Everything
+  it uses — `node:http`, `node:fs`, `node:crypto` — works in both, which is why one file
+  covers both environments.
+- **Sessions and throttling live in the database, not in memory**, because a serverless
+  instance is not around long enough to hold state and there may be several of them at once.
+
 ## Known limits
 
-- The thread polls every 15 seconds rather than using websockets.
+- The thread polls every 15 seconds rather than using websockets. On Vercel that is a
+  function invocation per poll per open tab, which is the main thing to watch on cost.
 - No password reset, email, or push notifications.
 - One property per user.
 - No photo attachments on requests — often the fastest way to describe a leak.
 - The Claude triage path is written and type-checked against the SDK but has not been run
   against the live API; without a key the rule-based engine handles everything.
+- Triage runs inside the request, so a slow model response counts against the function
+  timeout. The rules engine is instant; Claude usually answers in a few seconds.
