@@ -29,6 +29,51 @@ export function destroySession(token: string): void {
   db.query("DELETE FROM sessions WHERE token = ?").run(token);
 }
 
+/** Sign this user out everywhere except the session they are using right now. */
+export function dropOtherSessions(userId: number, keepToken: string | null): void {
+  if (keepToken) {
+    db.query("DELETE FROM sessions WHERE user_id = ? AND token != ?").run(userId, keepToken);
+  } else {
+    db.query("DELETE FROM sessions WHERE user_id = ?").run(userId);
+  }
+}
+
+/** Expired rows are only swept when their own token is presented, so do it in bulk too. */
+export function sweepExpiredSessions(): number {
+  return db.query("DELETE FROM sessions WHERE expires_at <= datetime('now')").run().changes;
+}
+
+/**
+ * Failed-login throttle. In-memory on purpose: a restart clearing it is fine,
+ * and it avoids a write to the users table on every wrong password.
+ */
+const attempts = new Map<string, { count: number; resetAt: number }>();
+const MAX_ATTEMPTS = 8;
+const WINDOW_MS = 15 * 60 * 1000;
+
+export function loginBlocked(key: string): boolean {
+  const rec = attempts.get(key);
+  if (!rec) return false;
+  if (Date.now() > rec.resetAt) {
+    attempts.delete(key);
+    return false;
+  }
+  return rec.count >= MAX_ATTEMPTS;
+}
+
+export function noteFailedLogin(key: string): void {
+  const rec = attempts.get(key);
+  if (!rec || Date.now() > rec.resetAt) {
+    attempts.set(key, { count: 1, resetAt: Date.now() + WINDOW_MS });
+    return;
+  }
+  rec.count += 1;
+}
+
+export function clearLoginAttempts(key: string): void {
+  attempts.delete(key);
+}
+
 function readCookie(req: Request, name: string): string | null {
   const header = req.headers.get("cookie");
   if (!header) return null;

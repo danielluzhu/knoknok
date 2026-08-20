@@ -7,7 +7,8 @@
   "scripts": {
     "start": "bun run src/server.ts",
     "dev": "bun --watch src/server.ts",
-    "seed": "bun run seed.ts"
+    "seed": "bun run seed.ts",
+    "test": "bun test"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.120.0",

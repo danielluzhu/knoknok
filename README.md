@@ -13,6 +13,7 @@ Bun + SQLite + vanilla JS. No build step, no framework, no external services req
 bun install
 bun run seed     # optional demo data
 bun start        # http://localhost:4321
+bun test         # end-to-end API suite (33 tests, throwaway database)
 ```
 
 `PORT` and `DB_PATH` are both configurable via environment variables.
@@ -63,6 +64,20 @@ tenant already tried — so nobody has to repeat themselves.
 **Closing.** Either side can close a request with a note. Reopening a bot-closed thread puts
 it back with the bot; reopening anything else puts it back on the landlord's list.
 
+**To-dos that involve a tenant.** A landlord to-do can be kept internal ("renew the building
+insurance") or raised with a specific tenant ("engineer needs access Thursday"). A raised one
+appears in that tenant's list marked *from landlord*, and the two of them talk it through in
+the same thread — no triage, since the landlord already knows what it is.
+
+**Re-filing.** The bot's category and priority are a starting point, not a verdict. The
+landlord can change either from the task header, and the change is written into the thread
+(`Dana set priority to urgent and filed it under plumbing.`) so there's a record of who
+decided what.
+
+**Unread.** Each side's read position is tracked per thread. The list shows a count of
+messages you haven't seen, and the thread draws a line where you left off. Your own messages
+and status lines never count against you.
+
 ## The bot
 
 `src/bot.ts` exposes one function, `triage(title, history)`, returning a reply plus an action
@@ -109,16 +124,30 @@ All routes are JSON and cookie-authenticated.
 | POST | `/api/tickets` | tenant → starts triage; landlord → adds a to-do |
 | GET | `/api/tickets/:id` | ticket plus full message thread |
 | POST | `/api/tickets/:id/messages` | replies; runs the bot while in triage |
+| POST | `/api/tickets/:id/update` | landlord only — priority, category, title |
 | POST | `/api/tickets/:id/escalate` | tenant skips the bot |
 | POST | `/api/tickets/:id/close` / `/reopen` | with an optional resolution note |
 | GET | `/api/property` | landlord only — join code, tenants, counts |
+| POST | `/api/password` | change password; signs out every other session |
 
 Tenants can only reach their own tickets; landlords are scoped to their own property. Both
 are enforced server-side on every request, not just hidden in the UI.
+
+Failed logins are throttled per username (8 attempts, 15-minute window, in memory).
+Changing a password invalidates every other session for that account.
+
+## Tests
+
+`bun test` boots a real server against a throwaway SQLite file and drives it over HTTP the
+same way the browser does — signup and join codes, all three triage outcomes, escalation,
+closing and reopening, re-filing, tenant-targeted to-dos, unread tracking, password change
+and session invalidation, throttling, cross-property isolation, and static path traversal.
 
 ## Known limits
 
 - The thread polls every 15 seconds rather than using websockets.
 - No password reset, email, or push notifications.
 - One property per user.
-- Rate limiting is not implemented — worth adding before this faces the open internet.
+- No photo attachments on requests — often the fastest way to describe a leak.
+- The Claude triage path is written and type-checked against the SDK but has not been run
+  against the live API; without a key the rule-based engine handles everything.

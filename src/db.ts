@@ -65,6 +65,15 @@ CREATE TABLE IF NOT EXISTS messages (
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- How far each person has read in each thread, so both sides can see what is new.
+CREATE TABLE IF NOT EXISTS ticket_reads (
+  ticket_id       INTEGER NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
+  user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  last_read_id    INTEGER NOT NULL DEFAULT 0,
+  updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (ticket_id, user_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tickets_property ON tickets(property_id, status);
 CREATE INDEX IF NOT EXISTS idx_tickets_tenant   ON tickets(tenant_id, status);
 CREATE INDEX IF NOT EXISTS idx_messages_ticket  ON messages(ticket_id, id);
@@ -101,6 +110,13 @@ export interface Ticket {
   created_at: string;
   updated_at: string;
   closed_at: string | null;
+}
+
+export interface TicketRead {
+  ticket_id: number;
+  user_id: number;
+  last_read_id: number;
+  updated_at: string;
 }
 
 export interface Message {

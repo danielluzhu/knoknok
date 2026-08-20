@@ -2,12 +2,17 @@ import { resolve } from "node:path";
 import { db, type Message, type Ticket, type User } from "./db";
 import {
   clearCookie,
+  clearLoginAttempts,
   createSession,
   currentToken,
   currentUser,
   destroySession,
+  dropOtherSessions,
   hashPassword,
+  loginBlocked,
+  noteFailedLogin,
   sessionCookie,
+  sweepExpiredSessions,
   verifyPassword,
 } from "./auth";
 import { triage, usingClaude } from "./bot";
@@ -32,6 +37,41 @@ function touch(ticketId: number) {
   db.query("UPDATE tickets SET updated_at = datetime('now') WHERE id = ?").run(ticketId);
 }
 
+const CATEGORIES = new Set([
+  "plumbing", "electrical", "hvac", "appliance", "pest",
+  "structural", "locks_security", "common_area", "other",
+]);
+const PRIORITIES = new Set(["low", "normal", "high", "urgent"]);
+
+/** Remember that this user has seen everything posted in this thread so far. */
+function markRead(ticketId: number, userId: number) {
+  db.query(
+    `INSERT INTO ticket_reads (ticket_id, user_id, last_read_id, updated_at)
+     VALUES (?, ?, (SELECT COALESCE(MAX(id), 0) FROM messages WHERE ticket_id = ?), datetime('now'))
+     ON CONFLICT (ticket_id, user_id) DO UPDATE SET
+       last_read_id = excluded.last_read_id, updated_at = excluded.updated_at`,
+  ).run(ticketId, userId, ticketId);
+}
+
+/** The last message this user had seen in this thread. Read it before markRead. */
+function readMarker(ticketId: number, userId: number): number {
+  const row = db
+    .query<{ last_read_id: number }, [number, number]>(
+      "SELECT last_read_id FROM ticket_reads WHERE ticket_id = ? AND user_id = ?",
+    )
+    .get(ticketId, userId);
+  return row?.last_read_id ?? 0;
+}
+
+/** Anyone on this property who is a tenant — used to target a landlord to-do. */
+function propertyTenant(user: User, tenantId: number): User | null {
+  return db
+    .query<User, [number, number]>(
+      "SELECT * FROM users WHERE id = ? AND property_id = ? AND role = 'tenant'",
+    )
+    .get(tenantId, user.property_id);
+}
+
 function addMessage(
   ticketId: number,
   author: Message["author"],
@@ -54,9 +94,22 @@ function ticketMessages(ticketId: number): Message[] {
     .all(ticketId);
 }
 
-/** Tenants see only their own tickets; landlords see everything on their property. */
+/**
+ * Tenants see only their own tickets; landlords see everything on their property.
+ * The joined names ride along so the detail view can name the tenant and whoever
+ * raised the task without a second round trip.
+ */
 function visibleTicket(user: User, id: number): Ticket | null {
-  const t = db.query<Ticket, [number]>("SELECT * FROM tickets WHERE id = ?").get(id);
+  const t = db
+    .query<Ticket, [number]>(
+      `SELECT t.*, u.display_name AS tenant_name, u.unit AS tenant_unit,
+              c.display_name AS creator_name, c.role AS creator_role
+       FROM tickets t
+       LEFT JOIN users u ON u.id = t.tenant_id
+       LEFT JOIN users c ON c.id = t.created_by
+       WHERE t.id = ?`,
+    )
+    .get(id);
   if (!t) return null;
   if (t.property_id !== user.property_id) return null;
   if (user.role === "tenant" && t.tenant_id !== user.id) return null;
@@ -194,15 +247,23 @@ async function handleLogin(req: Request): Promise<Response> {
   const b = (await req.json().catch(() => null)) as Record<string, string> | null;
   if (!b) return fail("Malformed request body.");
 
+  const username = String(b.username ?? "").trim();
+  const throttleKey = username.toLowerCase();
+  if (loginBlocked(throttleKey)) {
+    return fail("Too many failed attempts. Try again in 15 minutes.", 429);
+  }
+
   const user = db
     .query<User, [string]>("SELECT * FROM users WHERE username = ?")
-    .get(String(b.username ?? "").trim());
+    .get(username);
 
   // Same message either way, so this can't be used to enumerate usernames.
   if (!user || !(await verifyPassword(String(b.password ?? ""), user.password_hash))) {
+    noteFailedLogin(throttleKey);
     return fail("Incorrect username or password.", 401);
   }
 
+  clearLoginAttempts(throttleKey);
   const token = createSession(user.id);
   return json({ user: publicUser(user) }, 200, { "set-cookie": sessionCookie(req, token) });
 }
@@ -210,7 +271,7 @@ async function handleLogin(req: Request): Promise<Response> {
 function listTickets(user: User, url: URL): Response {
   const status = url.searchParams.get("status"); // open | closed | triage | all
   const clauses: string[] = ["t.property_id = $property"];
-  const params: Bindings = { $property: user.property_id };
+  const params: Bindings = { $property: user.property_id, $me: user.id };
 
   if (user.role === "tenant") {
     clauses.push("t.tenant_id = $tenant");
@@ -227,9 +288,17 @@ function listTickets(user: User, url: URL): Response {
   const rows = db
     .query(
       `SELECT t.*, u.display_name AS tenant_name, u.unit AS tenant_unit,
-              (SELECT COUNT(*) FROM messages m WHERE m.ticket_id = t.id) AS message_count,
-              (SELECT m.body FROM messages m WHERE m.ticket_id = t.id ORDER BY m.id DESC LIMIT 1) AS last_message
-       FROM tickets t LEFT JOIN users u ON u.id = t.tenant_id
+              c.display_name AS creator_name, c.role AS creator_role,
+              (SELECT m.body FROM messages m WHERE m.ticket_id = t.id ORDER BY m.id DESC LIMIT 1) AS last_message,
+              (SELECT COUNT(*) FROM messages m
+                 WHERE m.ticket_id = t.id
+                   AND m.author != 'system'
+                   AND (m.user_id IS NULL OR m.user_id != $me)
+                   AND m.id > COALESCE((SELECT r.last_read_id FROM ticket_reads r
+                                        WHERE r.ticket_id = t.id AND r.user_id = $me), 0)) AS unread
+       FROM tickets t
+       LEFT JOIN users u ON u.id = t.tenant_id
+       LEFT JOIN users c ON c.id = t.created_by
        WHERE ${clauses.join(" AND ")}
        ORDER BY
          CASE t.status WHEN 'open' THEN 0 WHEN 'triage' THEN 1 ELSE 2 END,
@@ -258,21 +327,35 @@ async function createTicket(user: User, req: Request): Promise<Response> {
 
     addMessage(ticket.id, "tenant", description, user.id);
     await runTriage(ticket);
+    markRead(ticket.id, user.id);
     return json({ ticket: visibleTicket(user, ticket.id), messages: ticketMessages(ticket.id) });
   }
 
-  // Landlords add their own to-do items — no triage, straight onto the list.
-  const priority = ["low", "normal", "high", "urgent"].includes(String(b?.priority))
-    ? String(b?.priority)
-    : "normal";
+  // Landlords add to-dos straight to the list — no triage. A to-do can be kept
+  // internal (tenant_id NULL) or raised with a specific tenant, who then sees it
+  // in their own list and can talk it through in the same thread.
+  const priority = PRIORITIES.has(String(b?.priority)) ? String(b?.priority) : "normal";
+  const category = CATEGORIES.has(String(b?.category)) ? String(b?.category) : "other";
+
+  let tenantId: number | null = null;
+  if (b?.tenantId) {
+    const tenant = propertyTenant(user, Number(b.tenantId));
+    if (!tenant) return fail("That tenant is not on this property.");
+    tenantId = tenant.id;
+  }
+
   const ticket = db
     .query(
       `INSERT INTO tickets (property_id, tenant_id, created_by, title, summary, category, priority, status)
-       VALUES (?, NULL, ?, ?, ?, ?, ?, 'open') RETURNING *`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'open') RETURNING *`,
     )
-    .get(user.property_id, user.id, title, description || title, String(b?.category ?? "other"), priority) as Ticket;
+    .get(user.property_id, tenantId, user.id, title, description || title, category, priority) as Ticket;
 
   if (description) addMessage(ticket.id, "landlord", description, user.id);
+  if (tenantId) {
+    addMessage(ticket.id, "system", `${user.display_name} raised this with the tenant.`);
+  }
+  markRead(ticket.id, user.id);
   return json({ ticket, messages: ticketMessages(ticket.id) });
 }
 
@@ -289,6 +372,7 @@ async function postMessage(user: User, ticket: Ticket, req: Request): Promise<Re
   if (ticket.status === "triage" && user.role === "tenant") {
     botResult = await runTriage(ticket);
   }
+  markRead(ticket.id, user.id);
 
   return json({
     ticket: visibleTicket(user, ticket.id),
@@ -354,6 +438,69 @@ function propertyOverview(user: User): Response {
   });
 }
 
+/**
+ * The landlord owns the to-do list, so they get the final say on how a task is
+ * filed — the bot's category and priority are a starting point, not a verdict.
+ */
+async function updateTicket(user: User, ticket: Ticket, req: Request): Promise<Response> {
+  if (user.role !== "landlord") return fail("Landlords only.", 403);
+  if (ticket.status === "closed") return fail("Reopen this task before editing it.");
+
+  const b = (await req.json().catch(() => null)) as Record<string, string> | null;
+  if (!b) return fail("Malformed request body.");
+
+  const changes: string[] = [];
+  const sets: string[] = [];
+  const params: Bindings = { $id: ticket.id };
+
+  if (b.title !== undefined) {
+    const title = String(b.title).trim();
+    if (!title) return fail("Title cannot be empty.");
+    if (title !== ticket.title) {
+      sets.push("title = $title");
+      params.$title = title;
+      changes.push(`renamed it to "${title}"`);
+    }
+  }
+  if (b.priority !== undefined && b.priority !== ticket.priority) {
+    if (!PRIORITIES.has(String(b.priority))) return fail("Unknown priority.");
+    sets.push("priority = $priority");
+    params.$priority = String(b.priority);
+    changes.push(`set priority to ${b.priority}`);
+  }
+  if (b.category !== undefined && b.category !== ticket.category) {
+    if (!CATEGORIES.has(String(b.category))) return fail("Unknown category.");
+    sets.push("category = $category");
+    params.$category = String(b.category);
+    changes.push(`filed it under ${String(b.category).replace("_", " ")}`);
+  }
+
+  if (sets.length) {
+    db.query(
+      `UPDATE tickets SET ${sets.join(", ")}, updated_at = datetime('now') WHERE id = $id`,
+    ).run(params);
+    addMessage(ticket.id, "system", `${user.display_name} ${changes.join(" and ")}.`, user.id);
+  }
+  return json({ ticket: visibleTicket(user, ticket.id), messages: ticketMessages(ticket.id) });
+}
+
+async function changePassword(user: User, req: Request, token: string | null): Promise<Response> {
+  const b = (await req.json().catch(() => null)) as Record<string, string> | null;
+  const current = String(b?.currentPassword ?? "");
+  const next = String(b?.newPassword ?? "");
+
+  if (!(await verifyPassword(current, user.password_hash))) {
+    return fail("Current password is incorrect.", 403);
+  }
+  if (next.length < 8) return fail("New password must be at least 8 characters.");
+  if (next === current) return fail("That is already your password.");
+
+  db.query("UPDATE users SET password_hash = ? WHERE id = ?").run(await hashPassword(next), user.id);
+  // Everything signed in elsewhere is now stale — this is the point of the change.
+  dropOtherSessions(user.id, token);
+  return json({ ok: true });
+}
+
 /* ----------------------------------------------------------------- serve */
 
 const server = Bun.serve({
@@ -384,6 +531,9 @@ const server = Bun.serve({
           if (user.role !== "landlord") return fail("Landlords only.", 403);
           return propertyOverview(user);
         }
+        if (path === "/api/password" && req.method === "POST") {
+          return await changePassword(user, req, currentToken(req));
+        }
         if (path === "/api/tickets") {
           if (req.method === "GET") return listTickets(user, url);
           if (req.method === "POST") return await createTicket(user, req);
@@ -396,10 +546,16 @@ const server = Bun.serve({
           const action = match[2];
 
           if (!action && req.method === "GET") {
-            return json({ ticket, messages: ticketMessages(ticket.id) });
+            const messages = ticketMessages(ticket.id);
+            // Read the marker before moving it, so the client can draw a
+            // "new messages" line where this user last left off.
+            const lastReadId = readMarker(ticket.id, user.id);
+            markRead(ticket.id, user.id); // opening the thread is reading it
+            return json({ ticket, messages, lastReadId });
           }
           if (req.method === "POST") {
             if (action === "messages") return await postMessage(user, ticket, req);
+            if (action === "update") return await updateTicket(user, ticket, req);
             if (action === "escalate") {
               if (user.role !== "tenant") return fail("Tenants only.", 403);
               return escalate(user, ticket);
@@ -427,6 +583,11 @@ const server = Bun.serve({
     return new Response(Bun.file(PUBLIC_DIR + "index.html"));
   },
 });
+
+// Expired sessions would otherwise sit in the table until their own token is
+// presented again, which for an abandoned login is never.
+sweepExpiredSessions();
+setInterval(sweepExpiredSessions, 60 * 60 * 1000).unref();
 
 console.log(
   `knoknok listening on http://localhost:${server.port}  (triage bot: ${usingClaude ? "Claude Opus 5" : "built-in rules — set ANTHROPIC_API_KEY for Claude"})`,

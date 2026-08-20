@@ -52,6 +52,7 @@
     <div class="topbar-right">
       <span id="botBadge" class="badge" title="Which engine is answering triage"></span>
       <span id="whoami" class="who"></span>
+      <button id="accountBtn" class="ghost">Account</button>
       <button id="logout" class="ghost">Sign out</button>
     </div>
   </header>
@@ -79,12 +80,22 @@
       <label class="field"><span id="descLabel">What's happening?</span>
         <textarea name="description" id="newDesc" rows="5" placeholder="Describe it like you'd tell a neighbour — when it started, what you've noticed, anything you've already tried."></textarea>
       </label>
-      <label class="field landlord-field hidden"><span>Priority</span>
-        <select name="priority">
-          <option value="low">Low</option>
-          <option value="normal" selected>Normal</option>
-          <option value="high">High</option>
-          <option value="urgent">Urgent</option>
+      <div class="field-row landlord-field hidden">
+        <label class="field"><span>Priority</span>
+          <select name="priority">
+            <option value="low">Low</option>
+            <option value="normal" selected>Normal</option>
+            <option value="high">High</option>
+            <option value="urgent">Urgent</option>
+          </select>
+        </label>
+        <label class="field"><span>Category</span>
+          <select name="category" id="newCategory"></select>
+        </label>
+      </div>
+      <label class="field landlord-field hidden"><span>Involves a tenant?</span>
+        <select name="tenantId" id="newTenant">
+          <option value="">Just me — internal to-do</option>
         </select>
       </label>
       <p id="modalHint" class="hint"></p>
@@ -92,6 +103,27 @@
       <div class="modal-actions">
         <button type="button" class="ghost" id="modalCancel">Cancel</button>
         <button type="submit" class="primary" id="modalSubmit">Start</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- -------------------------------------------------------------- account -->
+<div id="accountModal" class="modal hidden">
+  <div class="modal-card">
+    <h2>Change password</h2>
+    <form id="passwordForm">
+      <p class="hint" id="accountWho"></p>
+      <label class="field"><span>Current password</span>
+        <input name="currentPassword" type="password" autocomplete="current-password" required /></label>
+      <label class="field"><span>New password</span>
+        <input name="newPassword" type="password" autocomplete="new-password" minlength="8" required /></label>
+      <p class="hint">Changing this signs you out on every other device.</p>
+      <p id="accountError" class="error hidden"></p>
+      <p id="accountOk" class="ok-note hidden">Password updated.</p>
+      <div class="modal-actions">
+        <button type="button" class="ghost" id="accountCancel">Close</button>
+        <button type="submit" class="primary" id="accountSubmit">Update password</button>
       </div>
     </form>
   </div>
