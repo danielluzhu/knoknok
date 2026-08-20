@@ -33,6 +33,37 @@ const json = (data: unknown, status = 200, headers: Record<string, string> = {})
 
 const fail = (message: string, status = 400) => json({ error: message }, status);
 
+/**
+ * Cross-origin access, for a front end hosted somewhere other than the API —
+ * GitHub Pages, say. Set ALLOWED_ORIGINS to a comma-separated list of exact
+ * origins; anything not listed gets no CORS headers and so is refused by the
+ * browser. Unset means same-origin only, which needs no headers at all.
+ */
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS ?? "")
+  .split(",")
+  .map((o) => o.trim().replace(/\/$/, ""))
+  .filter(Boolean);
+
+function corsHeaders(req: Request): Record<string, string> {
+  const origin = req.headers.get("origin");
+  if (!origin || !ALLOWED_ORIGINS.includes(origin)) return {};
+  return {
+    "access-control-allow-origin": origin,
+    "access-control-allow-methods": "GET, POST, OPTIONS",
+    "access-control-allow-headers": "content-type, authorization",
+    "access-control-max-age": "86400",
+    // The response differs per origin, so it must not be cached across them.
+    vary: "Origin",
+  };
+}
+
+function withCors(res: Response, cors: Record<string, string>): Response {
+  if (!Object.keys(cors).length) return res;
+  const headers = new Headers(res.headers);
+  for (const [k, v] of Object.entries(cors)) headers.set(k, v);
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+}
+
 const CATEGORIES = new Set([
   "plumbing", "electrical", "hvac", "appliance", "pest",
   "structural", "locks_security", "common_area", "other",
@@ -237,7 +268,7 @@ async function handleSignup(req: Request): Promise<Response> {
   ))!;
 
   const token = await createSession(user.id);
-  return json({ user: await publicUser(user) }, 200, {
+  return json({ user: await publicUser(user), token }, 200, {
     "set-cookie": sessionCookie(req, token),
   });
 }
@@ -265,7 +296,9 @@ async function handleLogin(req: Request): Promise<Response> {
   // opportunity here — sign-ins are rare and the delete is cheap.
   void sweepExpiredSessions().catch(() => {});
   const token = await createSession(user.id);
-  return json({ user: await publicUser(user) }, 200, {
+  // The token is also returned in the body: a cross-origin front end cannot read
+  // the cookie, so it holds this and sends it as a bearer header instead.
+  return json({ user: await publicUser(user), token }, 200, {
     "set-cookie": sessionCookie(req, token),
   });
 }
@@ -531,62 +564,72 @@ export async function handleApi(req: Request): Promise<Response | null> {
   const path = url.pathname;
   if (!path.startsWith("/api/")) return null;
 
+  const cors = corsHeaders(req);
+  // Preflight: the browser asks before sending the real cross-origin request.
+  if (req.method === "OPTIONS") {
+    return withCors(new Response(null, { status: 204 }), cors);
+  }
+
   try {
-    if (path === "/api/signup" && req.method === "POST") return await handleSignup(req);
-    if (path === "/api/login" && req.method === "POST") return await handleLogin(req);
-
-    if (path === "/api/logout" && req.method === "POST") {
-      const token = currentToken(req);
-      if (token) await destroySession(token);
-      return json({ ok: true }, 200, { "set-cookie": clearCookie() });
-    }
-
-    const user = await currentUser(req);
-    if (path === "/api/me") {
-      return user ? json({ user: await publicUser(user) }) : json({ user: null });
-    }
-    if (!user) return fail("Please sign in.", 401);
-
-    if (path === "/api/property" && req.method === "GET") {
-      if (user.role !== "landlord") return fail("Landlords only.", 403);
-      return await propertyOverview(user);
-    }
-    if (path === "/api/password" && req.method === "POST") {
-      return await changePassword(user, req, currentToken(req));
-    }
-    if (path === "/api/tickets") {
-      if (req.method === "GET") return await listTickets(user, url);
-      if (req.method === "POST") return await createTicket(user, req);
-    }
-
-    const match = path.match(/^\/api\/tickets\/(\d+)(?:\/(\w+))?$/);
-    if (match) {
-      const ticket = await visibleTicket(user, Number(match[1]));
-      if (!ticket) return fail("Request not found.", 404);
-      const action = match[2];
-
-      if (!action && req.method === "GET") {
-        const messages = await ticketMessages(ticket.id);
-        // Read the marker before moving it, so the client can draw a
-        // "new messages" line where this user last left off.
-        const lastReadId = await readMarker(ticket.id, user.id);
-        await markRead(ticket.id, user.id); // opening the thread is reading it
-        return json({ ticket, messages, lastReadId });
-      }
-      if (req.method === "POST") {
-        if (action === "messages") return await postMessage(user, ticket, req);
-        if (action === "update") return await updateTicket(user, ticket, req);
-        if (action === "escalate") {
-          if (user.role !== "tenant") return fail("Tenants only.", 403);
-          return await escalate(user, ticket);
-        }
-        if (action === "close") return await closeTicket(user, ticket, req);
-        if (action === "reopen") return await reopenTicket(user, ticket);
-      }
-    }
-    return fail("Not found.", 404);
+    return withCors(await route(req, url, path), cors);
   } catch (err) {
     console.error("[api]", req.method, path, err);
-    return fail("Something went wrong on the server.", 500);
+    return withCors(fail("Something went wrong on the server.", 500), cors);
   }
+}
+
+async function route(req: Request, url: URL, path: string): Promise<Response> {
+  if (path === "/api/signup" && req.method === "POST") return await handleSignup(req);
+  if (path === "/api/login" && req.method === "POST") return await handleLogin(req);
+
+  if (path === "/api/logout" && req.method === "POST") {
+    const token = currentToken(req);
+    if (token) await destroySession(token);
+    return json({ ok: true }, 200, { "set-cookie": clearCookie() });
+  }
+
+  const user = await currentUser(req);
+  if (path === "/api/me") {
+    return user ? json({ user: await publicUser(user) }) : json({ user: null });
+  }
+  if (!user) return fail("Please sign in.", 401);
+
+  if (path === "/api/property" && req.method === "GET") {
+    if (user.role !== "landlord") return fail("Landlords only.", 403);
+    return await propertyOverview(user);
+  }
+  if (path === "/api/password" && req.method === "POST") {
+    return await changePassword(user, req, currentToken(req));
+  }
+  if (path === "/api/tickets") {
+    if (req.method === "GET") return await listTickets(user, url);
+    if (req.method === "POST") return await createTicket(user, req);
+  }
+
+  const match = path.match(/^\/api\/tickets\/(\d+)(?:\/(\w+))?$/);
+  if (match) {
+    const ticket = await visibleTicket(user, Number(match[1]));
+    if (!ticket) return fail("Request not found.", 404);
+    const action = match[2];
+
+    if (!action && req.method === "GET") {
+      const messages = await ticketMessages(ticket.id);
+      // Read the marker before moving it, so the client can draw a
+      // "new messages" line where this user last left off.
+      const lastReadId = await readMarker(ticket.id, user.id);
+      await markRead(ticket.id, user.id); // opening the thread is reading it
+      return json({ ticket, messages, lastReadId });
+    }
+    if (req.method === "POST") {
+      if (action === "messages") return await postMessage(user, ticket, req);
+      if (action === "update") return await updateTicket(user, ticket, req);
+      if (action === "escalate") {
+        if (user.role !== "tenant") return fail("Tenants only.", 403);
+        return await escalate(user, ticket);
+      }
+      if (action === "close") return await closeTicket(user, ticket, req);
+      if (action === "reopen") return await reopenTicket(user, ticket);
+    }
+  }
+  return fail("Not found.", 404);
 }

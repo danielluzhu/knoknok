@@ -6,10 +6,39 @@ const state = {
   messages: [], busy: false, tenants: [], lastReadId: 0,
 };
 
+/**
+ * Where the API lives. Empty means same origin — the case when the server also
+ * serves this page, locally or on Vercel. A static host such as GitHub Pages
+ * cannot serve the API, so it sets window.KNOKNOK_API_BASE (see config.js) to
+ * the API's origin and every request goes there instead.
+ */
+const API_BASE = (window.KNOKNOK_API_BASE || "").replace(/\/$/, "");
+const CROSS_ORIGIN = API_BASE !== "";
+const TOKEN_KEY = "knoknok_token";
+
+/**
+ * Same-origin auth rides on an httpOnly cookie, which this script cannot read
+ * and therefore cannot leak. That cookie is third-party once the front end is
+ * on another origin — Safari drops it, Chrome is heading the same way — so the
+ * cross-origin build keeps the session token here and sends it as a bearer
+ * header. Only that build touches localStorage.
+ */
+let authToken = CROSS_ORIGIN ? localStorage.getItem(TOKEN_KEY) : null;
+
+function setToken(token) {
+  if (!CROSS_ORIGIN) return;
+  authToken = token ?? null;
+  if (token) localStorage.setItem(TOKEN_KEY, token);
+  else localStorage.removeItem(TOKEN_KEY);
+}
+
 async function api(path, options = {}) {
-  const res = await fetch(path, {
-    headers: { "content-type": "application/json" },
-    ...options,
+  const headers = { "content-type": "application/json" };
+  if (authToken) headers.authorization = `Bearer ${authToken}`;
+  const res = await fetch(API_BASE + path, {
+    method: options.method ?? "GET",
+    credentials: CROSS_ORIGIN ? "omit" : "same-origin",
+    headers,
     body: options.body ? JSON.stringify(options.body) : undefined,
   });
   const data = await res.json().catch(() => ({}));
@@ -82,9 +111,10 @@ function wireAuth() {
     try {
       const body = Object.fromEntries(f.entries());
       if (body.joinCode) body.joinCode = body.joinCode.toUpperCase();
-      const { user } = await api(authMode === "login" ? "/api/login" : "/api/signup", {
+      const { user, token } = await api(authMode === "login" ? "/api/login" : "/api/signup", {
         method: "POST", body,
       });
+      setToken(token);
       state.me = user;
       e.target.reset();
       enterApp();
@@ -475,7 +505,8 @@ function wireModal() {
 /* ------------------------------------------------------------------ boot */
 
 $("#logout").addEventListener("click", async () => {
-  await api("/api/logout", { method: "POST" });
+  await api("/api/logout", { method: "POST" }).catch(() => {});
+  setToken(null);
   location.reload();
 });
 
@@ -521,10 +552,27 @@ wireModal();
 wireAccount();
 setAuthMode("login");
 
-api("/api/me").then(({ user }) => {
-  if (user) { state.me = user; enterApp(); }
-  else $("#auth").classList.remove("hidden");
-});
+// A static host cannot serve the API, so if this page is on one and nobody told
+// it where the API lives, say so plainly instead of failing request by request.
+if (!CROSS_ORIGIN && /\.github\.io$/.test(location.hostname)) {
+  document.body.innerHTML =
+    '<div class="auth"><div class="auth-card">' +
+    '<h1 class="logo">knoknok</h1>' +
+    "<p class=\"tagline\">This page is hosted on GitHub Pages, which serves files but " +
+    "cannot run the API. Set the repository variable <b>API_BASE_URL</b> to the deployed " +
+    "API's origin and re-run the Pages workflow.</p></div></div>";
+} else {
+  api("/api/me")
+    .then(({ user }) => {
+      if (user) { state.me = user; enterApp(); }
+      else $("#auth").classList.remove("hidden");
+    })
+    .catch(() => {
+      // A stale token, or the API being unreachable, both land here.
+      setToken(null);
+      $("#auth").classList.remove("hidden");
+    });
+}
 
 // Keep the list fresh so each side sees the other's replies without a refresh.
 setInterval(() => {

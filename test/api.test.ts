@@ -47,7 +47,13 @@ beforeAll(async () => {
       try { rmSync(DB + suffix); } catch { /* first run */ }
     }
     server = Bun.spawn(["bun", "run", "server.ts"], {
-      env: { ...process.env, PORT: String(PORT), DB_PATH: DB, ANTHROPIC_API_KEY: "" },
+      env: {
+        ...process.env,
+        PORT: String(PORT),
+        DB_PATH: DB,
+        ANTHROPIC_API_KEY: "",
+        ALLOWED_ORIGINS: "https://example.github.io",
+      },
       stdout: "pipe", stderr: "pipe",
     });
   }
@@ -356,6 +362,89 @@ describe("password change", () => {
     expect((await b.get("/api/tickets")).status).toBe(401); // every other session does not
     expect((await new Session().post("/api/login", { username, password: "password123" })).status).toBe(401);
     expect((await new Session().post("/api/login", { username, password: "brandnew123" })).status).toBe(200);
+  });
+});
+
+/* --------------------------------------------- cross-origin front end (Pages) */
+
+describe("bearer tokens", () => {
+  // A front end on GitHub Pages cannot use the session cookie: it is
+  // third-party to the API's origin. It holds the token and sends it instead.
+  let token = "";
+  let username = "";
+
+  test("signup and login hand back the session token", async () => {
+    username = uniq("bearer");
+    const made = await new Session().post("/api/signup", {
+      role: "tenant", username, password: "password123",
+      displayName: "Bearer B", joinCode, unit: "3C",
+    });
+    expect(made.data.token).toMatch(/^[0-9a-f]{64}$/);
+
+    const back = await new Session().post("/api/login", { username, password: "password123" });
+    expect(back.data.token).toMatch(/^[0-9a-f]{64}$/);
+    token = back.data.token;
+  });
+
+  test("the token authenticates without any cookie", async () => {
+    const res = await fetch(`${BASE}/api/me`, { headers: { authorization: `Bearer ${token}` } });
+    const data = (await res.json()) as any;
+    expect(data.user?.username).toBe(username);
+  });
+
+  test("it works for writes too, and the scheme is case-insensitive", async () => {
+    const res = await fetch(`${BASE}/api/tickets`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `bearer ${token}` },
+      body: JSON.stringify({ title: "Dripping tap", description: "The bathroom tap drips all night" }),
+    });
+    expect(res.status).toBe(200);
+    expect(((await res.json()) as any).ticket.status).toBe("triage");
+  });
+
+  test("a bogus or empty token is refused", async () => {
+    for (const header of [`Bearer ${"0".repeat(64)}`, "Bearer ", "Basic abc"]) {
+      const res = await fetch(`${BASE}/api/tickets`, { headers: { authorization: header } });
+      expect(res.status).toBe(401);
+    }
+  });
+
+  test("signing out invalidates the token", async () => {
+    await fetch(`${BASE}/api/logout`, {
+      method: "POST", headers: { authorization: `Bearer ${token}` },
+    });
+    const res = await fetch(`${BASE}/api/tickets`, { headers: { authorization: `Bearer ${token}` } });
+    expect(res.status).toBe(401);
+  });
+});
+
+describe("CORS", () => {
+  // The suite's server runs with ALLOWED_ORIGINS set to this one origin.
+  const ALLOWED = "https://example.github.io";
+
+  test("an allowed origin gets the headers it needs", async () => {
+    const res = await fetch(`${BASE}/api/me`, { headers: { origin: ALLOWED } });
+    expect(res.headers.get("access-control-allow-origin")).toBe(ALLOWED);
+    expect(res.headers.get("vary")).toBe("Origin");
+  });
+
+  test("preflight is answered", async () => {
+    const res = await fetch(`${BASE}/api/login`, {
+      method: "OPTIONS",
+      headers: {
+        origin: ALLOWED,
+        "access-control-request-method": "POST",
+        "access-control-request-headers": "authorization",
+      },
+    });
+    expect(res.status).toBe(204);
+    expect(res.headers.get("access-control-allow-headers")).toContain("authorization");
+    expect(res.headers.get("access-control-allow-methods")).toContain("POST");
+  });
+
+  test("an origin that is not on the list gets nothing, so the browser blocks it", async () => {
+    const res = await fetch(`${BASE}/api/me`, { headers: { origin: "https://not-mine.example" } });
+    expect(res.headers.get("access-control-allow-origin")).toBeNull();
   });
 });
 

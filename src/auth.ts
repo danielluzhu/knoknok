@@ -118,7 +118,7 @@ function readCookie(req: Request, name: string): string | null {
 
 /** Resolve the logged-in user, sweeping the session if it has expired. */
 export async function currentUser(req: Request): Promise<User | null> {
-  const token = readCookie(req, COOKIE);
+  const token = currentToken(req);
   if (!token) return null;
   const row = await db.get<User>(
     `SELECT u.* FROM sessions s
@@ -154,6 +154,20 @@ export function clearCookie(): string {
   return `${COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`;
 }
 
+/**
+ * The session token, from either transport.
+ *
+ * Same-origin clients send an httpOnly cookie, which JavaScript cannot read and
+ * so cannot leak. A front end on a different origin — GitHub Pages talking to
+ * the API on Vercel — cannot use that cookie at all: it is third-party, so
+ * Safari drops it outright and Chrome is heading the same way. Those clients
+ * send the same token as a bearer header instead.
+ */
 export function currentToken(req: Request): string | null {
+  const auth = req.headers.get("authorization");
+  if (auth?.toLowerCase().startsWith("bearer ")) {
+    const token = auth.slice(7).trim();
+    if (token) return token;
+  }
   return readCookie(req, COOKIE);
 }

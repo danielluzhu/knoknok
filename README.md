@@ -108,6 +108,8 @@ bun start
 
 ```
 server.ts          the listener — node:http, run by Bun locally and Node on Vercel
+public/config.js   where the front end looks for the API (empty = same origin)
+.github/workflows/ pages.yml publishes public/ to GitHub Pages
 src/app.ts         every route, as one Request -> Response function
 src/db.ts          schema, the libSQL client, and types
 src/auth.ts        password hashing, sessions, throttling, cookies
@@ -215,6 +217,48 @@ Three things to know if you change the structure:
   covers both environments.
 - **Sessions and throttling live in the database, not in memory**, because a serverless
   instance is not around long enough to hold state and there may be several of them at once.
+
+## Also hosting the front end on GitHub Pages
+
+GitHub Pages serves files; it cannot run a server or reach a database. So Pages can host the
+front end, but the API still has to live somewhere that runs code — Vercel, per the section
+above. `.github/workflows/pages.yml` publishes `public/` on every push that touches it.
+
+The two halves then sit on different origins, which changes one thing: **the session cookie
+cannot be used.** It is third-party in that arrangement, so Safari drops it and Chrome is
+heading the same way. Sign-in therefore also returns the session token in the response body,
+and a cross-origin front end holds it and sends `Authorization: Bearer <token>`. The server
+accepts either transport. Nothing changes for the Vercel-hosted copy, which stays on the
+httpOnly cookie and never puts a token in `localStorage`.
+
+**Setup**
+
+```bash
+# 1. Tell the front end where the API is (Settings -> Actions -> Variables, or:)
+gh variable set API_BASE_URL --body "https://your-app.vercel.app"
+
+# 2. Tell the API to accept the browser's requests from Pages
+vercel env add ALLOWED_ORIGINS     # value: https://your-name.github.io
+
+# 3. Enable Pages with "GitHub Actions" as the source, then run the workflow
+gh workflow run pages.yml
+```
+
+Both must be set. Without `API_BASE_URL` the published page says it is unconfigured rather
+than failing one request at a time; without `ALLOWED_ORIGINS` every call is blocked by the
+browser's same-origin policy.
+
+Redeploy the API after changing `ALLOWED_ORIGINS` — it is read at startup.
+
+### Which URL is which
+
+| URL | Serves | Needs |
+| --- | ------ | ----- |
+| `https://your-app.vercel.app` | The whole app, front end and API | Turso |
+| `https://your-name.github.io/knoknok` | The front end only, calling the API above | The two variables above |
+
+The Pages copy is a mirror, not an independent deployment: both talk to the same database, so
+an account made on one works on the other.
 
 ## Known limits
 
