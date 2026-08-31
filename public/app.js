@@ -4,6 +4,10 @@ const $ = (sel) => document.querySelector(sel);
 const state = {
   me: null, tickets: [], filter: null, selected: null,
   messages: [], busy: false, tenants: [], lastReadId: 0,
+  // Messaging: a standing conversation with the other party, separate from the
+  // per-request ticket threads. Keyed by tenant id on both sides.
+  view: "requests", chats: [], chatWith: null, chat: null,
+  chatMessages: [], chatLastReadId: 0,
 };
 
 /**
@@ -145,7 +149,9 @@ function enterApp() {
 
   $("#newBtn").textContent = me.role === "tenant" ? "+ New request" : "+ New to-do";
   state.filter = me.role === "tenant" ? "all" : "open";
+  state.view = "requests";
   renderFilters();
+  renderViews();
 
   const info = $("#landlordInfo");
   if (me.role === "landlord") {
@@ -156,6 +162,8 @@ function enterApp() {
   }
 
   refresh();
+  // Fetched even on the requests view, so the Messages badge is right on arrival.
+  refreshChats().catch(() => {});
 }
 
 /** Landlord-only sidebar footer: workload at a glance, the join code, who's here. */
@@ -182,6 +190,188 @@ async function loadProperty() {
     /* sidebar extras are optional — never block the list on them */
   }
 }
+
+/* --------------------------------------------------------------- messaging */
+
+function renderViews() {
+  const unread = state.chats.reduce((n, c) => n + (c.unread || 0), 0);
+  $("#views").innerHTML = [
+    ["requests", state.me.role === "tenant" ? "Requests" : "To-dos", 0],
+    ["messages", "Messages", unread],
+  ]
+    .map(([v, label, n]) =>
+      `<button data-v="${v}" class="${state.view === v ? "active" : ""}">${label}${
+        n ? `<span class="unread">${n}</span>` : ""
+      }</button>`)
+    .join("");
+  $("#views").querySelectorAll("button").forEach((b) =>
+    b.addEventListener("click", () => setView(b.dataset.v)));
+}
+
+function setView(view) {
+  if (state.view === view) return;
+  state.view = view;
+  const requests = view === "requests";
+  $("#filters").classList.toggle("hidden", !requests);
+  $("#newBtn").classList.toggle("hidden", !requests);
+  renderViews();
+  if (requests) {
+    state.chatWith = null;
+    refresh(false);
+    renderDetail();
+  } else {
+    state.selected = null;
+    state.ticket = null;
+    refreshChats();
+  }
+}
+
+async function refreshChats() {
+  const { chats } = await api("/api/chats");
+  state.chats = chats;
+  renderViews();
+  if (state.view !== "messages") return;
+  renderChatList();
+  // A tenant has exactly one conversation, so open it rather than making them click.
+  if (!state.chatWith && state.me.role === "tenant" && chats.length === 1) {
+    await openChat(chats[0].id);
+  } else if (!state.chatWith) {
+    renderChatDetail();
+  }
+}
+
+function renderChatList() {
+  const list = $("#list");
+  if (!state.chats.length) {
+    list.innerHTML = `<div class="empty">${
+      state.me.role === "landlord"
+        ? "No tenants have joined yet.<br>Share your property code and they'll appear here."
+        : "Your landlord's account is not set up yet."
+    }</div>`;
+    return;
+  }
+  list.innerHTML = state.chats.map((c) => `
+    <div class="row ${state.chatWith === c.id ? "active" : ""} ${c.unread ? "has-unread" : ""}" data-id="${c.id}">
+      <div class="chat-row-top">
+        <span class="chat-name">${esc(c.name)}</span>
+        <span class="row-marks">${
+          c.unread ? `<span class="unread">${c.unread}</span>` : ""
+        }<span class="row-meta">${c.last_at ? when(c.last_at) : ""}</span></span>
+      </div>
+      <div class="chat-sub">${esc(c.subtitle || "")}</div>
+      <div class="row-snippet ${c.last_message ? "" : "chat-empty"}">${
+        c.last_message ? esc(c.last_message) : "No messages yet"
+      }</div>
+    </div>`).join("");
+  list.querySelectorAll(".row").forEach((r) =>
+    r.addEventListener("click", () => openChat(Number(r.dataset.id))));
+}
+
+async function openChat(id, scroll = true) {
+  const { conversation, messages, lastReadId } = await api(`/api/chats/${id}`);
+  const switching = state.chatWith !== id;
+  state.chatWith = id;
+  state.chat = conversation;
+  state.chatMessages = messages;
+  if (switching) state.chatLastReadId = lastReadId ?? 0;
+  // The server just marked this read; clear the cached count so the badge and
+  // the row update now rather than at the next poll.
+  const cached = state.chats.find((c) => c.id === id);
+  if (cached) cached.unread = 0;
+  renderChatList();
+  renderViews();
+  renderChatDetail(scroll);
+}
+
+function renderChatDetail(scroll = true) {
+  const el = $("#detail");
+  const draft = $("#composerInput")?.value ?? "";
+  const prev = $("#thread");
+  const prevScroll = prev?.scrollTop ?? 0;
+  const wasAtBottom = !prev || prev.scrollHeight - prev.scrollTop - prev.clientHeight < 80;
+
+  if (!state.chatWith || !state.chat) {
+    el.innerHTML = `<div class="placeholder"><div>
+      <p style="font-size:34px;margin:0">💬</p>
+      <p>Pick someone to message.<br>Tenants can only message you, so nothing here is a group thread.</p>
+    </div></div>`;
+    return;
+  }
+
+  const firstNew = state.chatMessages.find(
+    (m) => m.id > (state.chatLastReadId ?? 0) && m.sender_id !== state.me.id,
+  );
+
+  el.innerHTML = `
+    <div class="detail-head">
+      <h2>${esc(state.chat.name)}</h2>
+      <div class="detail-meta"><span>${esc(state.chat.subtitle || "")}</span></div>
+    </div>
+    <div class="thread" id="thread">${
+      state.chatMessages.map((m) => {
+        const mine = m.sender_id === state.me.id;
+        const cls = mine ? state.me.role : `${m.sender_role} mine-left`;
+        const divider = firstNew && m.id === firstNew.id
+          ? '<div class="new-line"><span>new</span></div>' : "";
+        return `${divider}<div class="msg ${cls}">
+          <div class="who-line">${esc(m.sender_name || "")}</div>
+          <div class="bubble">${esc(m.body)}</div>
+        </div>`;
+      }).join("") ||
+      '<div class="placeholder"><div><p>No messages yet — say hello.</p></div></div>'
+    }</div>
+    <div class="composer">
+      <textarea id="composerInput" rows="1" placeholder="Message ${esc(state.chat.name)}…"></textarea>
+      <button class="primary" id="sendBtn">Send</button>
+    </div>`;
+
+  const input = $("#composerInput");
+  input.addEventListener("input", () => {
+    input.style.height = "auto";
+    input.style.height = Math.min(input.scrollHeight, 160) + "px";
+  });
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendChat(); }
+  });
+  $("#sendBtn").addEventListener("click", sendChat);
+  if (draft) {
+    input.value = draft;
+    input.style.height = Math.min(input.scrollHeight, 160) + "px";
+  }
+  if (scroll) input.focus();
+  const thread = $("#thread");
+  if (thread) thread.scrollTop = wasAtBottom ? thread.scrollHeight : prevScroll;
+}
+
+async function sendChat() {
+  const input = $("#composerInput");
+  const body = input.value.trim();
+  if (!body || state.busy) return;
+  input.value = "";
+  input.style.height = "auto";
+
+  // Optimistic echo, so the thread feels immediate over a slow link.
+  state.chatMessages.push({
+    id: Number.MAX_SAFE_INTEGER, sender_id: state.me.id,
+    sender_name: state.me.displayName, sender_role: state.me.role, body,
+  });
+  renderChatDetail(false);
+
+  try {
+    const { messages } = await api(`/api/chats/${state.chatWith}/messages`, {
+      method: "POST", body: { body },
+    });
+    state.chatMessages = messages;
+  } catch (ex) {
+    alert(ex.message);
+    input.value = body; // hand the text back rather than losing it
+  } finally {
+    renderChatDetail(false);
+    refreshChats();
+  }
+}
+
+/* ---------------------------------------------------------------- requests */
 
 function renderFilters() {
   const opts = state.me.role === "tenant"
@@ -251,6 +441,10 @@ async function openTicket(id, scroll = true) {
   // Only move the "new messages" line when opening a different thread — polling
   // the thread you are already reading should not shuffle it under you.
   if (switching) state.lastReadId = lastReadId ?? 0;
+  // Same as chats: opening it marked it read server-side, so drop the cached
+  // count instead of waiting for the next poll to catch up.
+  const cached = state.tickets.find((t) => t.id === id);
+  if (cached) cached.unread = 0;
   renderList();
   renderDetail(scroll);
 }
@@ -574,10 +768,15 @@ if (!CROSS_ORIGIN && /\.github\.io$/.test(location.hostname)) {
     });
 }
 
-// Keep the list fresh so each side sees the other's replies without a refresh.
+// Keep things fresh so each side sees the other's replies without a refresh.
 setInterval(() => {
-  if (state.me && !state.busy && !document.hidden) {
+  if (!state.me || state.busy || document.hidden) return;
+  // Conversations are polled in either view, so the Messages badge stays live.
+  refreshChats().catch(() => {});
+  if (state.view === "requests") {
     refresh().catch(() => {});
     if (state.selected) openTicket(state.selected, false).catch(() => {});
+  } else if (state.chatWith) {
+    openChat(state.chatWith, false).catch(() => {});
   }
 }, 15000);

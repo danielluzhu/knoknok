@@ -99,6 +99,28 @@ CREATE TABLE IF NOT EXISTS ticket_reads (
   PRIMARY KEY (ticket_id, user_id)
 );
 
+-- Direct messages between a tenant and their landlord, separate from the
+-- per-request ticket threads. A property has exactly one landlord (a landlord
+-- signup always creates its own property), so a conversation is identified by
+-- the tenant alone — tenant_id is the conversation key, not the sender.
+CREATE TABLE IF NOT EXISTS chat_messages (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  property_id INTEGER NOT NULL REFERENCES properties(id),
+  tenant_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  sender_id   INTEGER NOT NULL REFERENCES users(id),
+  body        TEXT NOT NULL,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS chat_reads (
+  tenant_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  last_read_id INTEGER NOT NULL DEFAULT 0,
+  updated_at   TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (tenant_id, user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_chat_conversation ON chat_messages(tenant_id, id);
 CREATE INDEX IF NOT EXISTS idx_tickets_property ON tickets(property_id, status);
 CREATE INDEX IF NOT EXISTS idx_tickets_tenant   ON tickets(tenant_id, status);
 CREATE INDEX IF NOT EXISTS idx_messages_ticket  ON messages(ticket_id, id);
@@ -196,6 +218,18 @@ export interface Ticket {
   tenant_unit?: string | null;
   creator_name?: string | null;
   creator_role?: Role | null;
+}
+
+export interface ChatMessage {
+  id: number;
+  property_id: number;
+  /** Whose conversation this is — always the tenant, whoever sent the message. */
+  tenant_id: number;
+  sender_id: number;
+  body: string;
+  created_at: string;
+  sender_name?: string | null;
+  sender_role?: Role | null;
 }
 
 export interface TicketRead {

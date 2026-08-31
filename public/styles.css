@@ -210,3 +210,23 @@ input, textarea, select { font: inherit; color: inherit; }
   .detail-head h2 { font-size: 17px; }
   .row { padding: 11px 12px; }
 }
+
+/* ------------------------------------------------------------- messaging */
+.views {
+  order: 0; width: 100%;
+  display: flex; gap: 4px; padding: 3px;
+  background: #f1ede8; border-radius: 9px;
+}
+.views button {
+  flex: 1; border: 0; background: transparent; padding: 6px 8px;
+  border-radius: 7px; font-weight: 600; font-size: 13.5px; color: var(--ink-soft);
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+}
+.views button.active { background: #fff; color: var(--ink); box-shadow: 0 1px 2px rgba(0,0,0,.06); }
+.views .unread { min-width: 17px; height: 17px; font-size: 11px; padding: 0 5px; }
+
+/* A conversation row: person on the left, time and unread on the right. */
+.chat-row-top { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.chat-name { font-weight: 600; font-size: 14.5px; }
+.chat-sub { font-size: 12.5px; color: var(--ink-soft); margin-top: 2px; }
+.chat-empty { font-style: italic; color: var(--ink-soft); }

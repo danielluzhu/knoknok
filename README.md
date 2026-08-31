@@ -81,6 +81,18 @@ decided what.
 messages you haven't seen, and the thread draws a line where you left off. Your own messages
 and status lines never count against you.
 
+**Messaging.** Separate from requests, each tenant has one standing conversation with their
+landlord — for the things that aren't a maintenance ticket ("can I get a second key?", "the
+bin collection moves to Wednesday"). The sidebar switches between **Requests** and
+**Messages**, and unread counts appear on the tab.
+
+Who can talk to whom falls out of the data model rather than being a rule to enforce: a
+property has exactly one landlord, so a conversation is identified by the *tenant* alone.
+A tenant may open only their own; a landlord may open any tenant's on their property. There
+is no way to address anyone else — a tenant naming another tenant's id, or their own
+landlord's id, gets a 404. Tenants cannot message each other at all, and nothing here is a
+group thread.
+
 ## The bot
 
 `src/bot.ts` exposes one function, `triage(title, history)`, returning a reply plus an action
@@ -134,6 +146,9 @@ All routes are JSON and cookie-authenticated.
 | POST | `/api/tickets/:id/update` | landlord only — priority, category, title |
 | POST | `/api/tickets/:id/escalate` | tenant skips the bot |
 | POST | `/api/tickets/:id/close` / `/reopen` | with an optional resolution note |
+| GET | `/api/chats` | conversations — one per tenant for a landlord, one for a tenant |
+| GET | `/api/chats/:tenantId` | a conversation and its messages |
+| POST | `/api/chats/:tenantId/messages` | send a direct message |
 | GET | `/api/property` | landlord only — join code, tenants, counts |
 | POST | `/api/password` | change password; signs out every other session |
 
@@ -147,8 +162,9 @@ Changing a password invalidates every other session for that account.
 
 `bun test` boots a real server against a throwaway SQLite file and drives it over HTTP the
 same way the browser does — signup and join codes, all three triage outcomes, escalation,
-closing and reopening, re-filing, tenant-targeted to-dos, unread tracking, password change
-and session invalidation, throttling, cross-property isolation, and static path traversal.
+closing and reopening, re-filing, tenant-targeted to-dos, unread tracking, direct messaging
+and who is allowed to message whom, password change and session invalidation, throttling,
+cross-property isolation, and static path traversal.
 
 Point the same suite at any other running copy — a Vercel preview deployment, say — with:
 

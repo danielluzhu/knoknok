@@ -365,6 +365,112 @@ describe("password change", () => {
   });
 });
 
+/* ------------------------------------------------------------ direct messages */
+
+describe("messaging", () => {
+  // A second tenant and a whole second property, to check who can reach whom.
+  const tenant2 = new Session();
+  let tenant2Id = 0;
+  let landlordId = 0;
+  const outsider = new Session();
+  let outsiderTenantId = 0;
+
+  beforeAll(async () => {
+    const t2 = await tenant2.post("/api/signup", {
+      role: "tenant", username: uniq("chat2"), password: "password123",
+      displayName: "Chat Two", joinCode, unit: "5D",
+    });
+    tenant2Id = t2.data.user.id;
+    landlordId = (await landlord.get("/api/me")).data.user.id;
+
+    // `other` is a landlord on a different property; give them a tenant.
+    const code = (await other.get("/api/me")).data.user.property.joinCode;
+    const o = await outsider.post("/api/signup", {
+      role: "tenant", username: uniq("outsider"), password: "password123",
+      displayName: "Outsider", joinCode: code, unit: "1A",
+    });
+    outsiderTenantId = o.data.user.id;
+  });
+
+  test("a tenant sees exactly one conversation: theirs, with their landlord", async () => {
+    const { data } = await tenant.get("/api/chats");
+    expect(data.chats).toHaveLength(1);
+    expect(data.chats[0].id).toBe(tenantId);
+    expect(data.chats[0].name).toBe("Dana W");
+    expect(data.chats[0].subtitle).toBe("your landlord");
+  });
+
+  test("a landlord sees one per tenant, including tenants nobody has messaged", async () => {
+    const { data } = await landlord.get("/api/chats");
+    const ids = data.chats.map((c: any) => c.id);
+    expect(ids).toContain(tenantId);
+    expect(ids).toContain(tenant2Id);
+    expect(data.chats.every((c: any) => c.last_message === null || typeof c.last_message === "string")).toBe(true);
+  });
+
+  test("both directions deliver, and the thread reads the same to both", async () => {
+    await tenant.post(`/api/chats/${tenantId}/messages`, { body: "Is the bin collection still Tuesday?" });
+    await landlord.post(`/api/chats/${tenantId}/messages`, { body: "Wednesday from now on." });
+
+    const asTenant = await tenant.get(`/api/chats/${tenantId}`);
+    const asLandlord = await landlord.get(`/api/chats/${tenantId}`);
+    expect(asTenant.data.messages.map((m: any) => m.body))
+      .toEqual(["Is the bin collection still Tuesday?", "Wednesday from now on."]);
+    expect(asLandlord.data.messages.map((m: any) => m.body))
+      .toEqual(asTenant.data.messages.map((m: any) => m.body));
+    expect(asTenant.data.messages[0].sender_role).toBe("tenant");
+    expect(asTenant.data.messages[1].sender_role).toBe("landlord");
+  });
+
+  test("each side sees the other's messages as unread until they open it", async () => {
+    await landlord.post(`/api/chats/${tenant2Id}/messages`, { body: "Welcome to the building." });
+    const before = await tenant2.get("/api/chats");
+    expect(before.data.chats[0].unread).toBe(1);
+
+    await tenant2.get(`/api/chats/${tenant2Id}`);
+    const after = await tenant2.get("/api/chats");
+    expect(after.data.chats[0].unread).toBe(0);
+  });
+
+  test("your own messages never count as unread to you", async () => {
+    await tenant2.post(`/api/chats/${tenant2Id}/messages`, { body: "Thanks!" });
+    const { data } = await tenant2.get("/api/chats");
+    expect(data.chats[0].unread).toBe(0);
+  });
+
+  test("a tenant cannot open another tenant's conversation", async () => {
+    expect((await tenant.get(`/api/chats/${tenant2Id}`)).status).toBe(404);
+    expect((await tenant.post(`/api/chats/${tenant2Id}/messages`, { body: "hi" })).status).toBe(404);
+  });
+
+  test("a tenant cannot address the landlord as a conversation of their own", async () => {
+    // The conversation key is the tenant; using the landlord's id names nothing.
+    expect((await tenant.get(`/api/chats/${landlordId}`)).status).toBe(404);
+  });
+
+  test("a landlord cannot reach a tenant on someone else's property", async () => {
+    expect((await landlord.get(`/api/chats/${outsiderTenantId}`)).status).toBe(404);
+    expect((await other.get(`/api/chats/${tenantId}`)).status).toBe(404);
+    expect((await other.post(`/api/chats/${tenantId}/messages`, { body: "hello" })).status).toBe(404);
+  });
+
+  test("tenants on the same property cannot see each other's threads in the list", async () => {
+    const { data } = await tenant2.get("/api/chats");
+    expect(data.chats).toHaveLength(1);
+    expect(data.chats[0].id).toBe(tenant2Id);
+  });
+
+  test("empty and oversized messages are refused", async () => {
+    expect((await tenant.post(`/api/chats/${tenantId}/messages`, { body: "   " })).status).toBe(400);
+    expect((await tenant.post(`/api/chats/${tenantId}/messages`, { body: "x".repeat(4001) })).status).toBe(400);
+  });
+
+  test("signed-out requests are refused", async () => {
+    expect((await new Session().get("/api/chats")).status).toBe(401);
+    expect((await new Session().get(`/api/chats/${tenantId}`)).status).toBe(401);
+  });
+});
+
 /* --------------------------------------------- cross-origin front end (Pages) */
 
 describe("bearer tokens", () => {

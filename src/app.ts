@@ -20,7 +20,7 @@ import {
   sweepExpiredSessions,
   verifyPassword,
 } from "./auth";
-import { db, type Message, type Ticket, type User } from "./db";
+import { db, type ChatMessage, type Message, type Ticket, type User } from "./db";
 import { triage, usingClaude } from "./bot";
 
 /* --------------------------------------------------------------- helpers */
@@ -556,6 +556,134 @@ async function propertyOverview(user: User): Promise<Response> {
   });
 }
 
+/* ------------------------------------------------------------------ chats */
+
+/**
+ * Direct messages, separate from ticket threads.
+ *
+ * A conversation is always between one tenant and the single landlord of their
+ * property, and is keyed by the tenant. So "who am I allowed to talk to" has
+ * exactly two answers: a tenant may only open their own conversation, and a
+ * landlord may open the conversation of any tenant on their property. There is
+ * no addressing scheme that could name anybody else.
+ */
+function landlordOf(propertyId: number): Promise<User | null> {
+  return db.get<User>(
+    "SELECT * FROM users WHERE property_id = ? AND role = 'landlord' ORDER BY id LIMIT 1",
+    [propertyId],
+  );
+}
+
+/** The other party, or null if this user has no business in that conversation. */
+async function chatPartner(user: User, tenantId: number): Promise<User | null> {
+  if (user.role === "tenant") {
+    // Tenants have exactly one conversation: their own, with their landlord.
+    if (tenantId !== user.id) return null;
+    return landlordOf(user.property_id);
+  }
+  return propertyTenant(user, tenantId);
+}
+
+function markChatRead(tenantId: number, userId: number) {
+  return db.run(
+    `INSERT INTO chat_reads (tenant_id, user_id, last_read_id, updated_at)
+     VALUES (?, ?, (SELECT COALESCE(MAX(id), 0) FROM chat_messages WHERE tenant_id = ?), datetime('now'))
+     ON CONFLICT (tenant_id, user_id) DO UPDATE SET
+       last_read_id = excluded.last_read_id, updated_at = excluded.updated_at`,
+    [tenantId, userId, tenantId],
+  );
+}
+
+async function chatReadMarker(tenantId: number, userId: number): Promise<number> {
+  const row = await db.get<{ last_read_id: number }>(
+    "SELECT last_read_id FROM chat_reads WHERE tenant_id = ? AND user_id = ?",
+    [tenantId, userId],
+  );
+  return row?.last_read_id ?? 0;
+}
+
+function chatMessages(tenantId: number): Promise<ChatMessage[]> {
+  return db.all<ChatMessage>(
+    `SELECT m.*, u.display_name AS sender_name, u.role AS sender_role
+     FROM chat_messages m JOIN users u ON u.id = m.sender_id
+     WHERE m.tenant_id = ? ORDER BY m.id`,
+    [tenantId],
+  );
+}
+
+/**
+ * The conversation list. A landlord gets one row per tenant — including tenants
+ * nobody has messaged yet, so there is something to click to start. A tenant
+ * gets the single row for their landlord.
+ */
+async function listChats(user: User): Promise<Response> {
+  if (user.role === "landlord") {
+    const rows = await db.all(
+      `SELECT u.id AS id, u.display_name AS name, u.unit AS subtitle,
+              (SELECT body FROM chat_messages m WHERE m.tenant_id = u.id ORDER BY m.id DESC LIMIT 1) AS last_message,
+              (SELECT created_at FROM chat_messages m WHERE m.tenant_id = u.id ORDER BY m.id DESC LIMIT 1) AS last_at,
+              (SELECT COUNT(*) FROM chat_messages m
+                 WHERE m.tenant_id = u.id AND m.sender_id != $me
+                   AND m.id > COALESCE((SELECT r.last_read_id FROM chat_reads r
+                                        WHERE r.tenant_id = u.id AND r.user_id = $me), 0)) AS unread
+       FROM users u
+       WHERE u.property_id = $property AND u.role = 'tenant'
+       ORDER BY (last_at IS NULL), last_at DESC, u.unit, u.display_name`,
+      { me: user.id, property: user.property_id },
+    );
+    return json({ chats: rows });
+  }
+
+  const landlord = await landlordOf(user.property_id);
+  if (!landlord) return json({ chats: [] }); // property with no landlord: nothing to show
+  const row = await db.get(
+    `SELECT $id AS id, $name AS name, 'your landlord' AS subtitle,
+            (SELECT body FROM chat_messages m WHERE m.tenant_id = $id ORDER BY m.id DESC LIMIT 1) AS last_message,
+            (SELECT created_at FROM chat_messages m WHERE m.tenant_id = $id ORDER BY m.id DESC LIMIT 1) AS last_at,
+            (SELECT COUNT(*) FROM chat_messages m
+               WHERE m.tenant_id = $id AND m.sender_id != $id
+                 AND m.id > COALESCE((SELECT r.last_read_id FROM chat_reads r
+                                      WHERE r.tenant_id = $id AND r.user_id = $id), 0)) AS unread`,
+    { id: user.id, name: landlord.display_name },
+  );
+  return json({ chats: [row] });
+}
+
+async function openChat(user: User, tenantId: number): Promise<Response> {
+  const partner = await chatPartner(user, tenantId);
+  if (!partner) return fail("Conversation not found.", 404);
+
+  const messages = await chatMessages(tenantId);
+  const lastReadId = await chatReadMarker(tenantId, user.id);
+  await markChatRead(tenantId, user.id);
+  return json({
+    conversation: {
+      id: tenantId,
+      name: partner.display_name,
+      subtitle: user.role === "tenant" ? "your landlord" : partner.unit,
+    },
+    messages,
+    lastReadId,
+  });
+}
+
+async function sendChat(user: User, tenantId: number, req: Request): Promise<Response> {
+  const partner = await chatPartner(user, tenantId);
+  if (!partner) return fail("Conversation not found.", 404);
+
+  const b = (await req.json().catch(() => null)) as Record<string, string> | null;
+  const body = String(b?.body ?? "").trim();
+  if (!body) return fail("Message is empty.");
+  if (body.length > 4000) return fail("Message is too long.");
+
+  await db.run(
+    "INSERT INTO chat_messages (property_id, tenant_id, sender_id, body) VALUES (?, ?, ?, ?)",
+    [user.property_id, tenantId, user.id, body],
+  );
+  await markChatRead(tenantId, user.id);
+  return json({ messages: await chatMessages(tenantId) });
+}
+
 /* ------------------------------------------------------------- the router */
 
 /** Handles every `/api/*` request. Returns null for anything else. */
@@ -601,6 +729,18 @@ async function route(req: Request, url: URL, path: string): Promise<Response> {
   if (path === "/api/password" && req.method === "POST") {
     return await changePassword(user, req, currentToken(req));
   }
+  if (path === "/api/chats" && req.method === "GET") {
+    return await listChats(user);
+  }
+  const chat = path.match(/^\/api\/chats\/(\d+)(?:\/(messages))?$/);
+  if (chat) {
+    const tenantId = Number(chat[1]);
+    if (!chat[2] && req.method === "GET") return await openChat(user, tenantId);
+    if (chat[2] === "messages" && req.method === "POST") {
+      return await sendChat(user, tenantId, req);
+    }
+  }
+
   if (path === "/api/tickets") {
     if (req.method === "GET") return await listTickets(user, url);
     if (req.method === "POST") return await createTicket(user, req);
