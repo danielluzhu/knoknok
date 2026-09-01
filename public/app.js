@@ -54,6 +54,21 @@ const esc = (s) =>
   String(s ?? "").replace(/[&<>"']/g, (c) =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 
+/** A stable hue per person, so the same name always gets the same colour. */
+const hueOf = (name) => {
+  let h = 0;
+  for (const ch of String(name)) h = (h * 31 + ch.charCodeAt(0)) % 360;
+  return h;
+};
+
+const initialsOf = (name) =>
+  String(name).trim().split(/\s+/).slice(0, 2).map((w) => w[0] || "").join("").toUpperCase();
+
+const avatar = (name, extra = "") =>
+  `<span class="avatar ${extra}" style="--h:${hueOf(name)}" aria-hidden="true">${
+    esc(initialsOf(name))
+  }</span>`;
+
 const CATEGORY_LABEL = {
   plumbing: "Plumbing", electrical: "Electrical", hvac: "Heating & cooling",
   appliance: "Appliance", pest: "Pest", structural: "Building", 
@@ -252,16 +267,21 @@ function renderChatList() {
   }
   list.innerHTML = state.chats.map((c) => `
     <div class="row ${state.chatWith === c.id ? "active" : ""} ${c.unread ? "has-unread" : ""}" data-id="${c.id}">
-      <div class="chat-row-top">
-        <span class="chat-name">${esc(c.name)}</span>
-        <span class="row-marks">${
-          c.unread ? `<span class="unread">${c.unread}</span>` : ""
-        }<span class="row-meta">${c.last_at ? when(c.last_at) : ""}</span></span>
+      <div class="with-avatar">
+        ${avatar(c.name)}
+        <div>
+          <div class="chat-row-top">
+            <span class="chat-name">${esc(c.name)}</span>
+            <span class="row-marks">${
+              c.unread ? `<span class="unread">${c.unread}</span>` : ""
+            }<span class="row-meta">${c.last_at ? when(c.last_at) : ""}</span></span>
+          </div>
+          <div class="chat-sub">${esc(c.subtitle || "")}</div>
+          <div class="row-snippet ${c.last_message ? "" : "chat-empty"}">${
+            c.last_message ? esc(c.last_message) : "No messages yet"
+          }</div>
+        </div>
       </div>
-      <div class="chat-sub">${esc(c.subtitle || "")}</div>
-      <div class="row-snippet ${c.last_message ? "" : "chat-empty"}">${
-        c.last_message ? esc(c.last_message) : "No messages yet"
-      }</div>
     </div>`).join("");
   list.querySelectorAll(".row").forEach((r) =>
     r.addEventListener("click", () => openChat(Number(r.dataset.id))));
@@ -304,8 +324,13 @@ function renderChatDetail(scroll = true) {
 
   el.innerHTML = `
     <div class="detail-head">
-      <h2>${esc(state.chat.name)}</h2>
-      <div class="detail-meta"><span>${esc(state.chat.subtitle || "")}</span></div>
+      <div class="with-avatar">
+        ${avatar(state.chat.name)}
+        <div>
+          <h2>${esc(state.chat.name)}</h2>
+          <div class="detail-meta"><span>${esc(state.chat.subtitle || "")}</span></div>
+        </div>
+      </div>
     </div>
     <div class="thread" id="thread">${
       state.chatMessages.map((m) => {
