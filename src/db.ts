@@ -124,6 +124,8 @@ CREATE TABLE IF NOT EXISTS tickets (
   -- stops being a winter emergency.
   sla_tier    TEXT,
   due_at      TEXT,
+  -- Set when this ticket was raised by a schedule rather than by a person.
+  recurring_id INTEGER REFERENCES recurring_tasks(id),
   created_at  TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
   closed_at   TEXT
@@ -154,6 +156,30 @@ CREATE TABLE IF NOT EXISTS attachments (
   size       INTEGER NOT NULL,
   bytes      BLOB NOT NULL,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Upkeep that comes round again — landscaping, roof checks, cleaning, a sewer
+-- inspection. A schedule is a template plus a cadence; each time it comes due it
+-- raises an ordinary ticket, so recurring work lands on the same list, under the
+-- same response-time targets, and is worked the same way as anything else.
+--
+-- next_due is the authority on when that happens. It is advanced from the
+-- previous due date rather than from the moment a ticket happened to be raised,
+-- so a schedule that fires late does not drift later every cycle.
+CREATE TABLE IF NOT EXISTS recurring_tasks (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  property_id   INTEGER NOT NULL REFERENCES properties(id),
+  created_by    INTEGER NOT NULL REFERENCES users(id),
+  title         TEXT NOT NULL,
+  details       TEXT NOT NULL DEFAULT '',
+  category      TEXT NOT NULL DEFAULT 'other',
+  priority      TEXT NOT NULL DEFAULT 'normal',
+  interval_days INTEGER NOT NULL,
+  assigned_vendor_id INTEGER REFERENCES users(id),
+  next_due      TEXT NOT NULL,
+  last_run      TEXT,
+  paused        INTEGER NOT NULL DEFAULT 0,
+  created_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 -- How far each person has read in each thread, so both sides can see what is new.
@@ -190,6 +216,7 @@ CREATE TABLE IF NOT EXISTS chat_reads (
 CREATE INDEX IF NOT EXISTS idx_chat_conversation ON chat_messages(tenant_id, id);
 CREATE INDEX IF NOT EXISTS idx_property_vendors_vendor ON property_vendors(vendor_id);
 CREATE INDEX IF NOT EXISTS idx_landlord_vendors_vendor ON landlord_vendors(vendor_id);
+CREATE INDEX IF NOT EXISTS idx_recurring_due ON recurring_tasks(property_id, paused, next_due);
 CREATE INDEX IF NOT EXISTS idx_tickets_property ON tickets(property_id, status);
 CREATE INDEX IF NOT EXISTS idx_tickets_tenant   ON tickets(tenant_id, status);
 CREATE INDEX IF NOT EXISTS idx_messages_ticket  ON messages(ticket_id, id);
@@ -334,6 +361,11 @@ async function evolve(): Promise<void> {
       sql: "UPDATE users SET vendor_code = ? WHERE id = ?",
       args: [await uniqueCode("portfolio_code"), (row as unknown as unknown[])[0] as number],
     });
+  }
+
+  if (!(await tableColumns("tickets")).has("recurring_id")) {
+    await client.execute(
+      "ALTER TABLE tickets ADD COLUMN recurring_id INTEGER REFERENCES recurring_tasks(id)");
   }
 
   // Response-time targets. Existing requests get one worked out from what they
@@ -524,6 +556,7 @@ export interface Ticket {
   resolution: string | null;
   closed_by: string | null;
   assigned_vendor_id: number | null;
+  recurring_id: number | null;
   sla_tier: SlaTierName | null;
   due_at: string | null;
   created_at: string;
@@ -535,6 +568,24 @@ export interface Ticket {
   creator_name?: string | null;
   creator_role?: Role | null;
   vendor_name?: string | null;
+  recurring_title?: string | null;
+  recurring_days?: number | null;
+}
+
+export interface RecurringTask {
+  id: number;
+  property_id: number;
+  created_by: number;
+  title: string;
+  details: string;
+  category: string;
+  priority: Priority;
+  interval_days: number;
+  assigned_vendor_id: number | null;
+  next_due: string;
+  last_run: string | null;
+  paused: number;
+  created_at: string;
 }
 
 export interface ChatMessage {

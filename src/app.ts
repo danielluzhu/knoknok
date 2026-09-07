@@ -20,7 +20,10 @@ import {
   sweepExpiredSessions,
   verifyPassword,
 } from "./auth";
-import { db, uniqueCode, type ChatMessage, type Message, type Ticket, type User } from "./db";
+import {
+  db, uniqueCode,
+  type ChatMessage, type Message, type RecurringTask, type Ticket, type User,
+} from "./db";
 import { triage, usingClaude } from "./bot";
 import { dueAt, slaTier, SLA_LABEL, SLA_POLICY } from "./sla";
 
@@ -50,7 +53,7 @@ function corsHeaders(req: Request): Record<string, string> {
   if (!origin || !ALLOWED_ORIGINS.includes(origin)) return {};
   return {
     "access-control-allow-origin": origin,
-    "access-control-allow-methods": "GET, POST, OPTIONS",
+    "access-control-allow-methods": "GET, POST, DELETE, OPTIONS",
     "access-control-allow-headers": "content-type, authorization",
     "access-control-max-age": "86400",
     // The response differs per origin, so it must not be cached across them.
@@ -67,9 +70,217 @@ function withCors(res: Response, cors: Record<string, string>): Response {
 
 const CATEGORIES = new Set([
   "plumbing", "electrical", "hvac", "appliance", "pest",
-  "structural", "locks_security", "common_area", "other",
+  "structural", "locks_security", "common_area",
+  "landscaping", "roofing", "cleaning", "sewer", "other",
 ]);
 const PRIORITIES = new Set(["low", "normal", "high", "urgent"]);
+
+/* ----------------------------------------------------------- schedules */
+
+/**
+ * Cadences offered in the UI. Free-form day counts are accepted too — these are
+ * the ones worth a click, and the shapes upkeep actually comes in.
+ */
+const CADENCES = [
+  { days: 7, label: "Weekly" },
+  { days: 14, label: "Every 2 weeks" },
+  { days: 30, label: "Monthly" },
+  { days: 90, label: "Quarterly" },
+  { days: 182, label: "Twice a year" },
+  { days: 365, label: "Yearly" },
+];
+
+/**
+ * Starting points for the upkeep most buildings need, so setting a property up
+ * is a few clicks rather than a blank form. Nothing is created from these until
+ * the landlord picks one.
+ */
+const SCHEDULE_SUGGESTIONS = [
+  { title: "Landscaping", category: "landscaping", interval_days: 30,
+    details: "Mow, edge, prune and clear the grounds." },
+  { title: "General cleaning", category: "cleaning", interval_days: 30,
+    details: "Communal areas: stairs, halls, entrance, bin store." },
+  { title: "Roof inspection", category: "roofing", interval_days: 182,
+    details: "Check flashing, gutters, and for slipped or missing tiles." },
+  { title: "Sewer health check", category: "sewer", interval_days: 365,
+    details: "Camera survey of the main line; clear roots and build-up." },
+];
+
+const MAX_INTERVAL_DAYS = 3650;
+
+/** Midnight-anchored day arithmetic on the SQLite timestamp shape. */
+function addDays(from: string | Date, days: number): string {
+  const base = from instanceof Date ? from : new Date(String(from).replace(" ", "T") + "Z");
+  const at = Number.isNaN(base.getTime()) ? new Date() : base;
+  return new Date(at.getTime() + days * 86400_000).toISOString().replace("T", " ").slice(0, 19);
+}
+
+/**
+ * Raise tickets for any schedule that has come due on these properties.
+ *
+ * There is no cron: the API runs as a serverless function, so this is called on
+ * the way into the paths that would show the result. It is a single indexed
+ * SELECT when nothing is due, which is almost always.
+ *
+ * A schedule that is overdue by several cycles produces one ticket, not a
+ * backlog — nobody wants eleven months of missed landscaping appearing at once —
+ * but the next due date is stepped forward from the schedule rather than from
+ * now, so the cadence stays on its original footing.
+ */
+async function runDueSchedules(scope: number[]): Promise<number> {
+  if (!scope.length) return 0;
+  const holes = scope.map(() => "?").join(",");
+  const due = await db.all<RecurringTask>(
+    `SELECT * FROM recurring_tasks
+     WHERE property_id IN (${holes}) AND paused = 0 AND next_due <= datetime('now')`,
+    scope,
+  );
+
+  for (const task of due) {
+    const ticket = (await db.get<Ticket>(
+      `INSERT INTO tickets
+         (property_id, tenant_id, created_by, title, summary, category, priority,
+          status, assigned_vendor_id, recurring_id)
+       VALUES (?, NULL, ?, ?, ?, ?, ?, 'open', ?, ?) RETURNING *`,
+      [task.property_id, task.created_by, task.title, task.details || task.title,
+       task.category, task.priority, task.assigned_vendor_id, task.id],
+    ))!;
+
+    await addMessage(ticket.id, "system", `Raised by the "${task.title}" schedule.`);
+    if (task.details) await addMessage(ticket.id, "landlord", task.details, task.created_by);
+    await applySla(ticket.id);
+
+    // Step forward from the schedule's own clock, catching up past cycles
+    // without raising a ticket for each.
+    let next = addDays(task.next_due, task.interval_days);
+    const now = Date.now();
+    while (new Date(next.replace(" ", "T") + "Z").getTime() <= now) {
+      next = addDays(next, task.interval_days);
+    }
+    await db.run(
+      "UPDATE recurring_tasks SET next_due = ?, last_run = datetime('now') WHERE id = ?",
+      [next, task.id],
+    );
+  }
+  return due.length;
+}
+
+async function listSchedules(user: User, url: URL): Promise<Response> {
+  if (user.role !== "landlord") return fail("Landlords only.", 403);
+  const scope = await requestedScope(user, url);
+  if (!scope) return fail("That property is not yours.", 403);
+  if (!scope.length) {
+    return json({ schedules: [], cadences: CADENCES, suggestions: SCHEDULE_SUGGESTIONS });
+  }
+  await runDueSchedules(scope);
+
+  const holes = scope.map(() => "?").join(",");
+  const schedules = await db.all(
+    `SELECT r.*, p.name AS property_name, v.display_name AS vendor_name,
+            (SELECT COUNT(*) FROM tickets t
+              WHERE t.recurring_id = r.id AND t.status != 'closed') AS open_now
+     FROM recurring_tasks r
+     JOIN properties p ON p.id = r.property_id
+     LEFT JOIN users v ON v.id = r.assigned_vendor_id
+     WHERE r.property_id IN (${holes})
+     ORDER BY r.paused, r.next_due`,
+    scope,
+  );
+  return json({ schedules, cadences: CADENCES, suggestions: SCHEDULE_SUGGESTIONS });
+}
+
+async function createSchedule(user: User, req: Request): Promise<Response> {
+  if (user.role !== "landlord") return fail("Landlords only.", 403);
+  const b = (await req.json().catch(() => null)) as Record<string, unknown> | null;
+
+  const title = String(b?.title ?? "").trim();
+  if (!title) return fail("Give the schedule a name.");
+
+  const days = Math.round(Number(b?.intervalDays));
+  if (!Number.isFinite(days) || days < 1 || days > MAX_INTERVAL_DAYS) {
+    return fail("How often should this happen? Pick between 1 and 3650 days.");
+  }
+
+  const owned = await accessibleProperties(user);
+  const propertyId = b?.propertyId ? Number(b.propertyId) : user.property_id;
+  if (!propertyId || !owned.includes(propertyId)) {
+    return fail("That property is not yours.", 403);
+  }
+
+  const category = CATEGORIES.has(String(b?.category)) ? String(b?.category) : "other";
+  const priority = PRIORITIES.has(String(b?.priority)) ? String(b?.priority) : "normal";
+
+  let vendorId: number | null = null;
+  if (b?.vendorId) {
+    const network = await networkVendors(user, owned);
+    const vendor = network.find((v) => v.id === Number(b.vendorId));
+    if (!vendor) return fail("That vendor is not in your network.");
+    vendorId = vendor.id;
+  }
+
+  // "Starts today" means the first ticket appears now; otherwise the first one
+  // is a full cycle away.
+  const startNow = b?.startNow !== false;
+  const nextDue = startNow
+    ? new Date().toISOString().replace("T", " ").slice(0, 19)
+    : addDays(new Date(), days);
+
+  await db.run(
+    `INSERT INTO recurring_tasks
+       (property_id, created_by, title, details, category, priority, interval_days,
+        assigned_vendor_id, next_due)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [propertyId, user.id, title, String(b?.details ?? "").trim(), category, priority,
+     days, vendorId, nextDue],
+  );
+  await runDueSchedules([propertyId]);
+  return await listSchedules(user, new URL(req.url));
+}
+
+async function updateSchedule(user: User, id: number, req: Request): Promise<Response> {
+  if (user.role !== "landlord") return fail("Landlords only.", 403);
+  const owned = await accessibleProperties(user);
+  const task = await db.get<RecurringTask>("SELECT * FROM recurring_tasks WHERE id = ?", [id]);
+  if (!task || !owned.includes(task.property_id)) return fail("Schedule not found.", 404);
+
+  const b = (await req.json().catch(() => null)) as Record<string, unknown> | null;
+  if (b?.paused !== undefined) {
+    await db.run("UPDATE recurring_tasks SET paused = ? WHERE id = ?", [b.paused ? 1 : 0, id]);
+  }
+  if (b?.intervalDays !== undefined) {
+    const days = Math.round(Number(b.intervalDays));
+    if (!Number.isFinite(days) || days < 1 || days > MAX_INTERVAL_DAYS) {
+      return fail("How often should this happen? Pick between 1 and 3650 days.");
+    }
+    // Re-anchor from the last run, so changing the cadence does not skip a turn.
+    await db.run(
+      "UPDATE recurring_tasks SET interval_days = ?, next_due = ? WHERE id = ?",
+      [days, addDays(task.last_run ?? task.created_at, days), id],
+    );
+  }
+  if (b?.vendorId !== undefined) {
+    const wanted = b.vendorId === null || b.vendorId === "" ? null : Number(b.vendorId);
+    if (wanted !== null) {
+      const network = await networkVendors(user, owned);
+      if (!network.some((v) => v.id === wanted)) return fail("That vendor is not in your network.");
+    }
+    await db.run("UPDATE recurring_tasks SET assigned_vendor_id = ? WHERE id = ?", [wanted, id]);
+  }
+  return await listSchedules(user, new URL(req.url));
+}
+
+async function deleteSchedule(user: User, id: number, req: Request): Promise<Response> {
+  if (user.role !== "landlord") return fail("Landlords only.", 403);
+  const owned = await accessibleProperties(user);
+  const task = await db.get<RecurringTask>("SELECT * FROM recurring_tasks WHERE id = ?", [id]);
+  if (!task || !owned.includes(task.property_id)) return fail("Schedule not found.", 404);
+
+  // Tickets it already raised are real work and stay; they simply stop pointing
+  // at a schedule that no longer exists.
+  await db.run("UPDATE tickets SET recurring_id = NULL WHERE recurring_id = ?", [id]);
+  await db.run("DELETE FROM recurring_tasks WHERE id = ?", [id]);
+  return await listSchedules(user, new URL(req.url));
+}
 
 /* -------------------------------------------------------- response times */
 
@@ -325,11 +536,13 @@ async function visibleTicket(user: User, id: number): Promise<Ticket | null> {
   const t = await db.get<Ticket>(
     `SELECT t.*, u.display_name AS tenant_name, u.unit AS tenant_unit,
             c.display_name AS creator_name, c.role AS creator_role,
-            v.display_name AS vendor_name, pr.name AS property_name
+            v.display_name AS vendor_name, pr.name AS property_name,
+            r.title AS recurring_title, r.interval_days AS recurring_days
      FROM tickets t
      LEFT JOIN users u ON u.id = t.tenant_id
      LEFT JOIN users c ON c.id = t.created_by
      LEFT JOIN users v ON v.id = t.assigned_vendor_id
+     LEFT JOIN recurring_tasks r ON r.id = t.recurring_id
      JOIN properties pr ON pr.id = t.property_id
      WHERE t.id = ?`,
     [id],
@@ -634,6 +847,9 @@ async function listTickets(user: User, url: URL): Promise<Response> {
   const scope = await requestedScope(user, url);
   if (!scope) return fail("That property is not yours.", 403);
   if (!scope.length) return json({ tickets: [] });
+  // No cron on a serverless function, so due schedules are raised on the way
+  // into the list that would show them.
+  await runDueSchedules(scope);
 
   const clauses: string[] = [`t.property_id IN (${scope.map((_, i) => `$p${i}`).join(",")})`];
   const params: Record<string, unknown> = { me: user.id };
@@ -660,6 +876,7 @@ async function listTickets(user: User, url: URL): Promise<Response> {
     `SELECT t.*, u.display_name AS tenant_name, u.unit AS tenant_unit,
             c.display_name AS creator_name, c.role AS creator_role,
             v.display_name AS vendor_name, pr.name AS property_name,
+            r.title AS recurring_title, r.interval_days AS recurring_days,
             (SELECT m.body FROM messages m WHERE m.ticket_id = t.id ORDER BY m.id DESC LIMIT 1) AS last_message,
             (SELECT COUNT(*) FROM messages m
                WHERE m.ticket_id = t.id
@@ -671,6 +888,7 @@ async function listTickets(user: User, url: URL): Promise<Response> {
      LEFT JOIN users u ON u.id = t.tenant_id
      LEFT JOIN users c ON c.id = t.created_by
      LEFT JOIN users v ON v.id = t.assigned_vendor_id
+     LEFT JOIN recurring_tasks r ON r.id = t.recurring_id
      JOIN properties pr ON pr.id = t.property_id
      WHERE ${clauses.join(" AND ")}
      ORDER BY
@@ -1434,6 +1652,17 @@ async function route(req: Request, url: URL, path: string): Promise<Response> {
   if (path === "/api/property" && req.method === "GET") {
     if (user.role !== "landlord") return fail("Landlords only.", 403);
     return await propertyOverview(user, url);
+  }
+
+  if (path === "/api/schedules") {
+    if (req.method === "GET") return await listSchedules(user, url);
+    if (req.method === "POST") return await createSchedule(user, req);
+  }
+  const schedule = path.match(/^\/api\/schedules\/(\d+)$/);
+  if (schedule) {
+    const id = Number(schedule[1]);
+    if (req.method === "POST") return await updateSchedule(user, id, req);
+    if (req.method === "DELETE") return await deleteSchedule(user, id, req);
   }
 
   if (path === "/api/vendors" && req.method === "GET") {

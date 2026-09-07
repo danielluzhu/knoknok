@@ -135,6 +135,45 @@
   </div>
 </div>
 
+<!-- ------------------------------------------------------- new schedule -->
+<div id="scheduleModal" class="modal hidden">
+  <div class="modal-card">
+    <h2>Recurring task</h2>
+    <form id="scheduleForm">
+      <p class="hint">Upkeep that comes round again. Each time it falls due it raises
+        an ordinary to-do, so it sits on the same list as everything else.</p>
+      <div id="scheduleSuggestions" class="suggestions"></div>
+      <label class="field"><span>What is it?</span>
+        <input name="title" id="scheduleTitle" placeholder="Landscaping" required /></label>
+      <label class="field"><span>Details <small>optional</small></span>
+        <textarea name="details" id="scheduleDetails" rows="3"
+          placeholder="What needs doing each time."></textarea></label>
+      <div class="field-row">
+        <label class="field"><span>How often</span>
+          <select name="intervalDays" id="scheduleCadence"></select></label>
+        <label class="field"><span>Category</span>
+          <select name="category" id="scheduleCategory"></select></label>
+      </div>
+      <div class="field-row">
+        <label class="field"><span>Property</span>
+          <select name="propertyId" id="scheduleProperty"></select></label>
+        <label class="field"><span>Vendor <small>optional</small></span>
+          <select name="vendorId" id="scheduleVendor"></select></label>
+      </div>
+      <label class="field"><span>First one</span>
+        <select name="startNow" id="scheduleStart">
+          <option value="true">Raise it now</option>
+          <option value="false">Wait a full cycle</option>
+        </select></label>
+      <p id="scheduleError" class="error hidden"></p>
+      <div class="modal-actions">
+        <button type="button" class="ghost" id="scheduleCancel">Cancel</button>
+        <button type="submit" class="primary" id="scheduleSubmit">Add schedule</button>
+      </div>
+    </form>
+  </div>
+</div>
+
 <!-- ------------------------------------------------------ response times -->
 <div id="standards" class="page hidden">
   <header class="topbar">

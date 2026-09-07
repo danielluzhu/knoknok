@@ -1445,3 +1445,189 @@ describe("the response-times page reflects real work", () => {
     expect(after.some((t: any) => t.id === open[0].id)).toBe(false);
   });
 });
+
+describe("recurring upkeep", () => {
+  const owner = new Session();
+  const outsider = new Session();
+  let scheduleId = 0;
+  let propertyId = 0;
+
+  test("a landlord is offered the usual upkeep as starting points", async () => {
+    const { data: lord } = await owner.post("/api/signup", {
+      role: "landlord", username: uniq("rec"), password: "password123",
+      displayName: "Rec R", propertyName: "Repeat House",
+    });
+    propertyId = lord.user.property.id;
+
+    const { status, data } = await owner.get("/api/schedules");
+    expect(status).toBe(200);
+    expect(data.schedules).toEqual([]);
+    const titles = data.suggestions.map((s: any) => s.title);
+    expect(titles).toEqual([
+      "Landscaping", "General cleaning", "Roof inspection", "Sewer health check",
+    ]);
+    // Cadences are offered rather than typed as raw day counts.
+    expect(data.cadences.map((c: any) => c.days)).toContain(30);
+  });
+
+  test("creating one raises its first to-do straight away", async () => {
+    const { status, data } = await owner.post("/api/schedules", {
+      title: "Landscaping", category: "landscaping", intervalDays: 30,
+      details: "Mow, edge and clear the grounds.",
+    });
+    expect(status).toBe(200);
+    expect(data.schedules).toHaveLength(1);
+    scheduleId = data.schedules[0].id;
+    expect(data.schedules[0].open_now).toBe(1);
+
+    const todo = (await owner.get("/api/tickets?status=open")).data.tickets
+      .find((t: any) => t.title === "Landscaping");
+    expect(todo).toBeTruthy();
+    // It is an ordinary ticket: same list, same targets, and it says where it
+    // came from.
+    expect(todo.recurring_id).toBe(scheduleId);
+    expect(todo.recurring_days).toBe(30);
+    expect(todo.sla_tier).toBeTruthy();
+    expect(todo.due_at).toBeTruthy();
+  });
+
+  test("the next one is scheduled a full cycle out", async () => {
+    const { data } = await owner.get("/api/schedules");
+    const next = new Date(data.schedules[0].next_due.replace(" ", "T") + "Z").getTime();
+    const days = Math.round((next - Date.now()) / 86400_000);
+    expect(days).toBeGreaterThanOrEqual(29);
+    expect(days).toBeLessThanOrEqual(30);
+  });
+
+  // Time cannot be advanced over HTTP, so these reach into the test database to
+  // age a schedule. Skipped when the suite is pointed at a deployment, where
+  // there is no local file to reach into.
+  test.skipIf(Boolean(EXTERNAL))("a cycle coming round raises the next one", async () => {
+    const { Database } = await import("bun:sqlite");
+    const raw = new Database(DB);
+    raw.run("UPDATE recurring_tasks SET next_due = datetime('now','-1 day') WHERE id = ?",
+      [scheduleId]);
+    raw.close();
+
+    await owner.get("/api/tickets?status=open"); // due schedules fire on the way in
+    const { data } = await owner.get("/api/tickets?status=all");
+    const raised = data.tickets.filter((t: any) => t.recurring_id === scheduleId);
+    expect(raised.length).toBe(2);
+  });
+
+  test.skipIf(Boolean(EXTERNAL))("a year of missed cycles is one to-do, not twelve", async () => {
+    const { Database } = await import("bun:sqlite");
+    const raw = new Database(DB);
+    raw.run("UPDATE recurring_tasks SET next_due = datetime('now','-365 day') WHERE id = ?",
+      [scheduleId]);
+    raw.close();
+
+    await owner.get("/api/tickets?status=open");
+    const { data } = await owner.get("/api/tickets?status=all");
+    expect(data.tickets.filter((t: any) => t.recurring_id === scheduleId)).toHaveLength(3);
+
+    // And the cadence lands back in the future rather than staying behind.
+    const { data: after } = await owner.get("/api/schedules");
+    const sched = after.schedules.find((s: any) => s.id === scheduleId);
+    expect(new Date(sched.next_due.replace(" ", "T") + "Z").getTime())
+      .toBeGreaterThan(Date.now());
+  });
+
+  test("a paused schedule stops raising anything", async () => {
+    const paused = await owner.post(`/api/schedules/${scheduleId}`, { paused: true });
+    expect(paused.data.schedules.find((s: any) => s.id === scheduleId).paused).toBe(1);
+    if (!EXTERNAL) {
+      const { Database } = await import("bun:sqlite");
+      const raw = new Database(DB);
+      raw.run("UPDATE recurring_tasks SET next_due = datetime('now','-1 day') WHERE id = ?",
+        [scheduleId]);
+      raw.close();
+    }
+    const before = (await owner.get("/api/tickets?status=all")).data.tickets
+      .filter((t: any) => t.recurring_id === scheduleId).length;
+    await owner.get("/api/tickets?status=open");
+    const after = (await owner.get("/api/tickets?status=all")).data.tickets
+      .filter((t: any) => t.recurring_id === scheduleId).length;
+    expect(after).toBe(before);
+
+    await owner.post(`/api/schedules/${scheduleId}`, { paused: false, intervalDays: 365 });
+  });
+
+  test("a schedule can be handed to a vendor, and the to-do arrives assigned", async () => {
+    const portfolioCode = (await owner.get("/api/me")).data.user.portfolioCode;
+    const vendor = new Session();
+    const { data: v } = await vendor.post("/api/signup", {
+      role: "vendor", username: uniq("mow"), password: "password123",
+      displayName: "Mow Co", vendorCode: portfolioCode,
+    });
+
+    const { data } = await owner.post("/api/schedules", {
+      title: "Sewer health check", category: "sewer", intervalDays: 365,
+      vendorId: v.user.id,
+    });
+    const sewer = data.schedules.find((s: any) => s.title === "Sewer health check");
+    expect(sewer.vendor_name).toBe("Mow Co");
+
+    const job = (await vendor.get("/api/tickets?status=all&assigned=me")).data.tickets
+      .find((t: any) => t.title === "Sewer health check");
+    expect(job).toBeTruthy();
+  });
+
+  test("a long-neglected schedule raises one to-do, not a year of them", async () => {
+    const { data } = await owner.post("/api/schedules", {
+      title: "General cleaning", category: "cleaning", intervalDays: 30, startNow: false,
+    });
+    const cleaning = data.schedules.find((s: any) => s.title === "General cleaning");
+    // Nothing yet — it was told to wait a cycle.
+    expect(cleaning.open_now).toBe(0);
+  });
+
+  test("deleting keeps the work it already raised", async () => {
+    const before = (await owner.get("/api/tickets?status=all")).data.tickets
+      .filter((t: any) => t.recurring_id === scheduleId).length;
+    expect(before).toBeGreaterThan(0);
+    // The tickets stay; only the schedule behind them goes.
+
+    const { status } = await owner.req(`/api/schedules/${scheduleId}`, { method: "DELETE" });
+    expect(status).toBe(200);
+
+    const kept = (await owner.get("/api/tickets?status=all")).data.tickets
+      .filter((t: any) => t.title === "Landscaping").length;
+    expect(kept).toBe(before);
+  });
+
+  test.each([
+    ["no name", { intervalDays: 30 }],
+    ["no cadence", { title: "Thing" }],
+    ["a nonsense cadence", { title: "Thing", intervalDays: 0 }],
+    ["an absurd cadence", { title: "Thing", intervalDays: 99999 }],
+  ])("creating with %s is refused", async (_label, body) => {
+    expect((await owner.post("/api/schedules", body)).status).toBe(400);
+  });
+
+  test("schedules belong to the landlord who made them", async () => {
+    const { data } = await owner.get("/api/schedules");
+    const mine = data.schedules[0].id;
+
+    await outsider.post("/api/signup", {
+      role: "landlord", username: uniq("nosy"), password: "password123", displayName: "Nosy N",
+    });
+    expect((await outsider.post(`/api/schedules/${mine}`, { paused: true })).status).toBe(404);
+    expect((await outsider.req(`/api/schedules/${mine}`, { method: "DELETE" })).status).toBe(404);
+    expect((await outsider.get("/api/schedules")).data.schedules).toEqual([]);
+
+    // And cannot be aimed at a property they do not own.
+    expect((await outsider.post("/api/schedules", {
+      title: "Not mine", intervalDays: 30, propertyId,
+    })).status).toBe(403);
+  });
+
+  test("tenants and vendors do not set up upkeep", async () => {
+    const vendor = new Session();
+    await vendor.post("/api/signup", {
+      role: "vendor", username: uniq("nv"), password: "password123", displayName: "NV",
+    });
+    expect((await vendor.get("/api/schedules")).status).toBe(403);
+    expect((await vendor.post("/api/schedules", { title: "x", intervalDays: 7 })).status).toBe(403);
+  });
+});

@@ -15,6 +15,8 @@ const state = {
   properties: [], scope: "all",
   // The landlord's vendor network, for the assignment picker.
   vendors: [],
+  // Recurring upkeep, and the options for setting it up.
+  schedules: [], cadences: [], suggestions: [], scheduleOpen: null,
 };
 
 /** The `?property=` every scoped request carries. */
@@ -81,8 +83,10 @@ const avatar = (name, extra = "") =>
 
 const CATEGORY_LABEL = {
   plumbing: "Plumbing", electrical: "Electrical", hvac: "Heating & cooling",
-  appliance: "Appliance", pest: "Pest", structural: "Building", 
-  locks_security: "Locks & security", common_area: "Common area", other: "Other",
+  appliance: "Appliance", pest: "Pest", structural: "Building",
+  locks_security: "Locks & security", common_area: "Common area",
+  landscaping: "Landscaping", roofing: "Roof", cleaning: "Cleaning", sewer: "Sewer",
+  other: "Other",
 };
 
 const PRIORITY_LABEL = { low: "Low", normal: "Normal", high: "High", urgent: "Urgent" };
@@ -101,6 +105,191 @@ function when(iso) {
   if (mins < 60 * 24) return `${Math.round(mins / 60)}h ago`;
   if (mins < 60 * 24 * 7) return `${Math.round(mins / 1440)}d ago`;
   return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+/* ------------------------------------------------------------- schedules */
+
+async function loadSchedules() {
+  const { schedules, cadences, suggestions } = await api(`/api/schedules?${scopeQuery()}`);
+  state.schedules = schedules;
+  state.cadences = cadences;
+  state.suggestions = suggestions;
+  renderScheduleList();
+  renderScheduleDetail();
+  // A schedule firing creates a to-do, so the counts behind us have moved.
+  loadProperty();
+}
+
+function renderScheduleList() {
+  const list = $("#list");
+  if (!state.schedules.length) {
+    list.innerHTML = `<div class="empty">
+      Nothing recurring yet.<br>Set up landscaping, cleaning, roof checks and the like
+      so they raise themselves.
+      <div style="margin-top:14px"><button class="primary small" id="firstSchedule">+ Add one</button></div>
+    </div>`;
+    $("#firstSchedule").addEventListener("click", openScheduleModal);
+    return;
+  }
+  list.innerHTML = state.schedules.map((r) => {
+    const next = new Date(r.next_due.replace(" ", "T") + "Z");
+    const days = Math.ceil((next.getTime() - Date.now()) / 86400_000);
+    const when = r.paused ? "paused"
+      : days <= 0 ? "due now"
+      : days === 1 ? "due tomorrow"
+      : `due in ${days}d`;
+    return `<div class="row ${r.paused ? "row-paused" : ""}" data-id="${r.id}">
+      <div class="row-top"><span class="row-title">${esc(r.title)}</span>
+        <span class="row-marks"><span class="row-meta">${when}</span></span></div>
+      <div class="row-meta">
+        <span class="pill ${r.paused ? "closed" : "open"}">${esc(CADENCE_LABEL(r.interval_days))}</span>
+        ${state.scope === "all" ? `<span class="pill where">${esc(r.property_name)}</span>` : ""}
+        ${r.vendor_name ? `<span class="pill taken">${esc(r.vendor_name)}</span>` : ""}
+        <span>${esc(CATEGORY_LABEL[r.category] || "Other")}</span>
+      </div>
+      ${r.details ? `<div class="row-snippet">${esc(r.details)}</div>` : ""}
+    </div>`;
+  }).join("");
+  list.querySelectorAll(".row").forEach((r) =>
+    r.addEventListener("click", () => {
+      state.scheduleOpen = Number(r.dataset.id);
+      renderScheduleDetail();
+    }));
+}
+
+function renderScheduleDetail() {
+  const el = $("#detail");
+  const r = state.schedules.find((x) => x.id === state.scheduleOpen);
+  if (!r) {
+    el.innerHTML = `<div class="placeholder"><div>
+      <p style="font-size:34px;margin:0">🗓️</p>
+      <p>Upkeep that comes round again — landscaping, cleaning, roof checks,
+      a sewer survey.<br>Each one raises an ordinary to-do when it falls due.</p>
+      <p style="margin-top:18px"><button class="primary" id="addSchedule">+ New recurring task</button></p>
+    </div></div>`;
+    $("#addSchedule").addEventListener("click", openScheduleModal);
+    return;
+  }
+  const next = new Date(r.next_due.replace(" ", "T") + "Z");
+  el.innerHTML = `
+    <div class="detail-head">
+      <h2>${esc(r.title)}</h2>
+      <div class="detail-meta">
+        <span class="pill ${r.paused ? "closed" : "open"}">${
+          r.paused ? "paused" : esc(CADENCE_LABEL(r.interval_days))}</span>
+        <span class="pill where">${esc(r.property_name)}</span>
+        <span>${esc(CATEGORY_LABEL[r.category] || "Other")}</span>
+        <span>next ${next.toLocaleDateString(undefined, { month: "short", day: "numeric" })}</span>
+        ${r.last_run ? `<span>last raised ${when(r.last_run)}</span>` : "<span>never raised yet</span>"}
+        ${r.open_now ? `<span class="pill open">${r.open_now} open now</span>` : ""}
+      </div>
+      <div class="detail-actions">
+        <label class="inline-edit">how often
+          <select id="schedCadence">${
+            state.cadences.map((c) =>
+              `<option value="${c.days}"${c.days === r.interval_days ? " selected" : ""}>${
+                esc(c.label)}</option>`).join("") +
+            (state.cadences.some((c) => c.days === r.interval_days) ? "" :
+              `<option value="${r.interval_days}" selected>${esc(CADENCE_LABEL(r.interval_days))}</option>`)
+          }</select></label>
+        <label class="inline-edit">vendor
+          <select id="schedVendor">
+            <option value="">Nobody yet</option>
+            ${state.vendors.map((v) =>
+              `<option value="${v.id}"${v.id === r.assigned_vendor_id ? " selected" : ""}>${
+                esc(v.display_name)}</option>`).join("")}
+          </select></label>
+        <button class="ghost" id="schedPause">${r.paused ? "Resume" : "Pause"}</button>
+        <button class="ghost" id="schedDelete">Delete</button>
+      </div>
+    </div>
+    ${r.details ? `<div class="brief" style="margin:14px 26px">${esc(r.details)}</div>` : ""}
+    <div class="placeholder"><div><p>
+      Each time this falls due it raises a to-do on ${esc(r.property_name)}${
+        r.vendor_name ? `, assigned to ${esc(r.vendor_name)}` : ""}.
+    </p></div></div>`;
+
+  const act = async (body, method = "POST") => {
+    try {
+      const res = await api(`/api/schedules/${r.id}`, { method, body });
+      state.schedules = res.schedules;
+      if (method === "DELETE") state.scheduleOpen = null;
+      renderScheduleList();
+      renderScheduleDetail();
+    } catch (ex) { alert(ex.message); }
+  };
+  $("#schedPause").addEventListener("click", () => act({ paused: !r.paused }));
+  $("#schedDelete").addEventListener("click", () => {
+    if (confirm(`Delete "${r.title}"? To-dos it already raised are kept.`)) act(null, "DELETE");
+  });
+  $("#schedCadence").addEventListener("change", (e) =>
+    act({ intervalDays: Number(e.target.value) }));
+  $("#schedVendor").addEventListener("change", (e) =>
+    act({ vendorId: e.target.value || null }));
+}
+
+function openScheduleModal() {
+  const modal = $("#scheduleModal");
+  $("#scheduleForm").reset();
+  $("#scheduleError").classList.add("hidden");
+  $("#scheduleCadence").innerHTML = state.cadences
+    .map((c) => `<option value="${c.days}"${c.days === 30 ? " selected" : ""}>${esc(c.label)}</option>`)
+    .join("");
+  $("#scheduleCategory").innerHTML = options(CATEGORY_LABEL, "other");
+  $("#scheduleProperty").innerHTML = state.properties
+    .map((p) => `<option value="${p.id}"${
+      p.id === state.me.property?.id ? " selected" : ""}>${esc(p.name)}</option>`).join("");
+  $("#scheduleVendor").innerHTML = '<option value="">Nobody yet</option>' +
+    state.vendors.map((v) => `<option value="${v.id}">${esc(v.display_name)}</option>`).join("");
+
+  // The upkeep most buildings need, as one click rather than a blank form.
+  $("#scheduleSuggestions").innerHTML = state.suggestions
+    .map((s, i) => `<button type="button" class="suggestion" data-i="${i}">${esc(s.title)}
+      <small>${esc(CADENCE_LABEL(s.interval_days))}</small></button>`).join("");
+  $("#scheduleSuggestions").querySelectorAll(".suggestion").forEach((b) =>
+    b.addEventListener("click", () => {
+      const s = state.suggestions[Number(b.dataset.i)];
+      $("#scheduleTitle").value = s.title;
+      $("#scheduleDetails").value = s.details;
+      $("#scheduleCategory").value = s.category;
+      $("#scheduleCadence").value = String(s.interval_days);
+      $("#scheduleSuggestions").querySelectorAll(".suggestion")
+        .forEach((o) => o.classList.toggle("picked", o === b));
+    }));
+
+  modal.classList.remove("hidden");
+  $("#scheduleTitle").focus();
+}
+
+function wireSchedules() {
+  const modal = $("#scheduleModal");
+  const close = () => modal.classList.add("hidden");
+  $("#scheduleCancel").addEventListener("click", close);
+  modal.addEventListener("click", (e) => { if (e.target === modal) close(); });
+
+  $("#scheduleForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const err = $("#scheduleError");
+    err.classList.add("hidden");
+    $("#scheduleSubmit").disabled = true;
+    try {
+      const body = Object.fromEntries(new FormData(e.target).entries());
+      body.intervalDays = Number(body.intervalDays);
+      body.startNow = body.startNow === "true";
+      if (!body.vendorId) delete body.vendorId;
+      const res = await api("/api/schedules", { method: "POST", body });
+      state.schedules = res.schedules;
+      close();
+      renderScheduleList();
+      renderScheduleDetail();
+      loadProperty();
+    } catch (ex) {
+      err.textContent = ex.message;
+      err.classList.remove("hidden");
+    } finally {
+      $("#scheduleSubmit").disabled = false;
+    }
+  });
 }
 
 /* ---------------------------------------------------------- response times */
@@ -727,10 +916,17 @@ function wireCodeChips(root) {
 /* --------------------------------------------------------------- messaging */
 
 const REQUESTS_LABEL = { tenant: "Requests", landlord: "To-dos", vendor: "Jobs" };
+const CADENCE_LABEL = (days) => ({
+  7: "weekly", 14: "every 2 weeks", 30: "monthly", 90: "quarterly",
+  182: "twice a year", 365: "yearly",
+}[days] ?? `every ${days} days`);
 
 function renderViews() {
   const unread = state.chats.reduce((n, c) => n + (c.unread || 0), 0);
   const tabs = [["requests", REQUESTS_LABEL[state.me.role] || "Requests", 0]];
+  // Recurring upkeep is the landlord's to set up; everyone else just sees the
+  // to-dos it raises.
+  if (state.me.role === "landlord") tabs.push(["schedules", "Recurring", 0]);
   // Messaging is a tenant<->landlord channel; a vendor talks on the job itself.
   if (state.me.role !== "vendor") tabs.push(["messages", "Messages", unread]);
   $("#views").innerHTML = tabs
@@ -748,12 +944,20 @@ function setView(view) {
   state.view = view;
   const requests = view === "requests";
   $("#filters").classList.toggle("hidden", !requests);
-  $("#newBtn").classList.toggle("hidden", !requests || state.me.role === "vendor");
+  $("#newBtn").classList.toggle("hidden",
+    state.me.role === "vendor" || view === "messages");
+  $("#newBtn").textContent = view === "schedules" ? "+ New recurring"
+    : state.me.role === "tenant" ? "+ New request" : "+ New to-do";
   renderViews();
   if (requests) {
     state.chatWith = null;
     refresh(false);
     renderDetail();
+  } else if (view === "schedules") {
+    state.selected = null;
+    state.ticket = null;
+    state.chatWith = null;
+    loadSchedules();
   } else {
     state.selected = null;
     state.ticket = null;
@@ -977,6 +1181,9 @@ function renderList() {
     // property it would be the same word on every row.
     const where = state.scope === "all" && t.property_name
       ? `<span class="pill where">${esc(t.property_name)}</span>` : "";
+    // Worth saying on the row: this arrived on its own, nobody reported it.
+    const repeats = t.recurring_days
+      ? `<span class="pill recurring">${esc(CADENCE_LABEL(t.recurring_days))}</span>` : "";
     const claim = state.me.role === "vendor" && t.assigned_vendor_id
       ? `<span class="pill ${t.assigned_vendor_id === state.me.id ? "mine-job" : "taken"}">${
           t.assigned_vendor_id === state.me.id ? "yours" : esc(t.vendor_name || "taken")
@@ -990,7 +1197,7 @@ function renderList() {
     return `<div class="row ${state.selected === t.id ? "active" : ""} ${t.unread > 0 ? "has-unread" : ""}" data-id="${t.id}">
       <div class="row-top"><span class="row-title">${esc(t.title)}</span>
         <span class="row-marks">${unread}<span class="dot p-${t.priority}" title="priority: ${t.priority}"></span></span></div>
-      <div class="row-meta">${statusPill}${dueBadge(t)}${where}${claim}${
+      <div class="row-meta">${statusPill}${dueBadge(t)}${repeats}${where}${claim}${
         fromLandlord ? '<span class="pill from">from landlord</span>' : ""
       }<span>${who}</span><span>${when(t.updated_at)}</span></div>
       <div class="row-snippet">${esc(t.last_message || t.summary)}</div>
@@ -1122,6 +1329,10 @@ function renderDetail(scroll = true) {
         ${meta}
         ${assignRow}
         ${party}
+        ${t.recurring_title
+          ? `<span class="pill recurring" title="Raised by a recurring schedule">${
+              esc(CADENCE_LABEL(t.recurring_days))}</span>`
+          : ""}
         ${dueBadge(t)}
         ${t.sla_tier && t.status !== "closed"
           ? `<span class="sla-note">target: ${esc(SLA_LABEL[t.sla_tier])} of being raised</span>`
@@ -1353,7 +1564,8 @@ function wireModal() {
     e.target.value = "";
   });
 
-  $("#newBtn").addEventListener("click", open);
+  $("#newBtn").addEventListener("click", () =>
+    state.view === "schedules" ? openScheduleModal() : open());
   $("#modalCancel").addEventListener("click", () => modal.classList.add("hidden"));
   modal.addEventListener("click", (e) => { if (e.target === modal) modal.classList.add("hidden"); });
 
@@ -1434,6 +1646,7 @@ wireAccount();
 wirePropertySwitch();
 wirePhotoViewer();
 wireStandards();
+wireSchedules();
 setAuthMode("login");
 
 // A static host cannot serve the API, so if this page is on one and nobody told

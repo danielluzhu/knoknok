@@ -16,6 +16,12 @@ export const CATEGORIES = [
   "structural",
   "locks_security",
   "common_area",
+  // Planned upkeep rather than something breaking. These arrive mostly from
+  // recurring schedules, but a tenant can report against them too.
+  "landscaping",
+  "roofing",
+  "cleaning",
+  "sewer",
   "other",
 ] as const;
 

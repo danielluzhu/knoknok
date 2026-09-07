@@ -186,6 +186,22 @@ input, textarea, select { font: inherit; color: inherit; }
   color: color-mix(in oklab, var(--ink-soft) 70%, transparent);
 }
 
+/* One-click starting points on the new-schedule form. */
+.suggestions { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 16px; }
+.suggestion {
+  display: inline-flex; align-items: baseline; gap: 6px;
+  padding: 6px 11px; border-radius: 999px; cursor: pointer;
+  border: 1px solid var(--line); background: var(--panel); font: inherit; color: inherit;
+  transition: border-color var(--fast), background var(--fast);
+}
+.suggestion:hover { border-color: color-mix(in oklab, var(--accent) 45%, var(--line)); }
+.suggestion.picked {
+  border-color: var(--accent); background: color-mix(in oklab, var(--accent) 10%, var(--panel));
+}
+.suggestion small { color: var(--ink-soft); font-size: 11.5px; }
+
+.row-paused { opacity: .62; }
+
 .field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 
 .error { color: var(--urgent); font-size: 14px; margin: 0 0 10px; }
@@ -461,6 +477,8 @@ input, textarea, select { font: inherit; color: inherit; }
    scroll past, not something to draw the eye. */
 /* Which building a row belongs to. Only drawn in the all-properties view, and
    kept neutral — it is orientation, not status. */
+/* Raised by a schedule rather than by a person. */
+.pill.recurring { background: color-mix(in oklab, var(--violet) 14%, var(--panel)); color: var(--violet); }
 .pill.where { background: color-mix(in oklab, var(--ink-soft) 10%, var(--panel)); color: var(--ink-soft); }
 .pill.mine-job { background: color-mix(in oklab, var(--accent) 16%, var(--panel)); color: var(--accent); }
 .pill.taken { background: color-mix(in oklab, var(--ink-soft) 12%, var(--panel)); color: var(--ink-soft); }
