@@ -613,14 +613,19 @@ describe("a landlord with several properties", () => {
     first = data.user.property.id;
   });
 
-  test("adding a property switches to it and gives it its own codes", async () => {
+  test("adding a property gives it its own codes and leaves the cursor put", async () => {
+    const before = (await owner.get("/api/properties")).data.activeId;
     const { status, data } = await owner.post("/api/properties", { name: "Birch House" });
     expect(status).toBe(200);
     expect(data.properties).toHaveLength(2);
 
-    const added = data.properties.find((p: any) => p.id === data.activeId);
+    const added = data.properties.find((p: any) => p.id === data.created);
     expect(added.name).toBe("Birch House");
     second = added.id;
+
+    // Adding a building must not drag the view into it.
+    expect(data.activeId).toBe(before);
+    expect((await owner.get("/api/me")).data.user.property.id).toBe(before);
 
     const codes = data.properties.flatMap((p: any) => [p.join_code, p.vendor_code]);
     expect(new Set(codes).size).toBe(codes.length); // every code distinct
@@ -629,7 +634,7 @@ describe("a landlord with several properties", () => {
   test("the name is optional there too", async () => {
     const { data } = await owner.post("/api/properties", {});
     expect(data.properties).toHaveLength(3);
-    const added = data.properties.find((p: any) => p.id === data.activeId);
+    const added = data.properties.find((p: any) => p.id === data.created);
     expect(added.name).toContain("Perry M's property");
   });
 
@@ -785,8 +790,8 @@ describe("vendors", () => {
     vendorCode = data.user.property.vendorCode;
     joinCode = data.user.property.joinCode;
     const extra = await owner.post("/api/properties", { name: "Cedar Annex" });
-    secondCode = extra.data.properties.find((p: any) => p.id === extra.data.activeId).vendor_code;
-    await owner.post(`/api/properties/${data.user.property.id}/select`);
+    secondCode = extra.data.properties.find((p: any) => p.id === extra.data.created).vendor_code;
+    expect(secondCode).not.toBe(vendorCode);
   });
 
   test("a vendor signs up with it", async () => {
@@ -875,14 +880,15 @@ describe("vendors", () => {
   test("one login, several properties", async () => {
     const joined = await ace.post("/api/properties/join", { vendorCode: secondCode });
     expect(joined.status).toBe(200);
-    expect(joined.data.user.property.name).toBe("Cedar Annex");
     expect(joined.data.user.propertyCount).toBe(2);
+    // Redeeming a code widens the scope without moving the cursor.
+    expect(joined.data.user.property.name).toBe("Cedar Flats");
     // The default spans both properties they hold codes for...
     const across = (await ace.get("/api/tickets?status=all")).data.tickets;
     expect(across).toHaveLength(1);
     expect(across[0].property_name).toBe("Cedar Flats");
     // ...and Cedar Annex on its own has no work yet.
-    const annex = joined.data.user.property.id;
+    const annex = joined.data.created;
     expect((await ace.get(`/api/tickets?status=all&property=${annex}`)).data.tickets)
       .toHaveLength(0);
     expect((await ace.post("/api/properties/join", { vendorCode: secondCode })).status).toBe(400);

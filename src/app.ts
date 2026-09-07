@@ -214,14 +214,19 @@ async function propertiesFor(user: User) {
   );
 }
 
-/** Create a property owned by this landlord, and make it the one they are on. */
+/**
+ * Create a property owned by this landlord.
+ *
+ * Deliberately leaves the cursor alone: adding a building to the portfolio is
+ * not a statement about which one you want to work on, and moving it would drag
+ * the view into the empty new property.
+ */
 async function createProperty(landlord: User, name: string) {
   const property = (await db.get<{ id: number }>(
     `INSERT INTO properties (name, join_code, vendor_code, landlord_id)
      VALUES (?, ?, ?, ?) RETURNING id`,
     [name, await uniqueCode("join_code"), await uniqueCode("vendor_code"), landlord.id],
   ))!;
-  await db.run("UPDATE users SET property_id = ? WHERE id = ?", [property.id, landlord.id]);
   return property.id;
 }
 
@@ -766,8 +771,9 @@ async function addProperty(user: User, req: Request): Promise<Response> {
   // header readable until they pick something.
   const count = (await propertiesFor(user)).length;
   const name = String(b?.name ?? "").trim() || `${user.display_name}'s property ${count + 1}`;
-  const id = await createProperty(user, name);
-  return json({ properties: await propertiesFor(user), activeId: id });
+  const created = await createProperty(user, name);
+  // activeId is still wherever the cursor was — the caller stays where it is.
+  return json({ properties: await propertiesFor(user), activeId: user.property_id, created });
 }
 
 /** Move this account's cursor to another of its properties. */
@@ -799,7 +805,13 @@ async function joinPropertyAsVendor(user: User, req: Request): Promise<Response>
     "INSERT INTO property_vendors (property_id, vendor_id) VALUES (?, ?)",
     [property.id, user.id],
   );
-  return await selectProperty(user, property.id);
+  // Same as adding one: redeeming a code widens what you can see, it does not
+  // say you want to look only at the property you just joined.
+  return json({
+    user: await publicUser(user),
+    properties: await propertiesFor(user),
+    created: property.id,
+  });
 }
 
 /* ------------------------------------------------------------------ chats */

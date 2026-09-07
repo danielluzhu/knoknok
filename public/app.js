@@ -281,21 +281,17 @@ function wirePropertySwitch() {
     if (answer === null) return; // cancelled
     if (!landlord && !answer.trim()) return;
     try {
-      if (landlord) {
-        const { properties, activeId } = await api("/api/properties", {
-          method: "POST", body: { name: answer.trim() },
-        });
-        state.properties = properties;
-        await selectProperty(activeId);
-        await loadProperties();
-      } else {
-        const { user } = await api("/api/properties/join", {
-          method: "POST", body: { vendorCode: answer.trim().toUpperCase() },
-        });
-        state.me = user;
-        await loadProperties();
-        await selectProperty(user.property.id);
-      }
+      const { user, properties } = landlord
+        ? await api("/api/properties", { method: "POST", body: { name: answer.trim() } })
+        : await api("/api/properties/join", {
+            method: "POST", body: { vendorCode: answer.trim().toUpperCase() },
+          });
+      if (user) state.me = user;
+      state.properties = properties;
+      // Land on everything rather than on the property just added — the point
+      // of adding one is that the portfolio grew, and the new building is empty
+      // so tunnelling into it would show a blank list.
+      await selectProperty("all");
     } catch (ex) {
       alert(ex.message);
     }
