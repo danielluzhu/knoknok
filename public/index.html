@@ -118,6 +118,12 @@
           <option value="">Just me — internal to-do</option>
         </select>
       </label>
+      <div class="field" id="newPhotoField">
+        <span>Photos <small>optional</small></span>
+        <input type="file" id="newPhotoInput" accept="image/*" multiple hidden>
+        <button type="button" class="ghost block-soft" id="newPhotoBtn">Add a photo</button>
+        <div class="photo-strip hidden" id="newPhotoStrip"></div>
+      </div>
       <p id="modalHint" class="hint"></p>
       <p id="modalError" class="error hidden"></p>
       <div class="modal-actions">
@@ -126,6 +132,11 @@
       </div>
     </form>
   </div>
+</div>
+
+<!-- --------------------------------------------------------- photo viewer -->
+<div id="photoViewer" class="photo-viewer hidden">
+  <img id="photoViewerImg" alt="Photo, full size">
 </div>
 
 <!-- -------------------------------------------------------------- account -->

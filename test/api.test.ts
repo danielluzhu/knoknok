@@ -941,3 +941,170 @@ describe("vendors", () => {
     expect(names).toContain("Bolt Electric");
   });
 });
+
+/** A tiny valid PNG, built here so the suite needs no fixture file. */
+function tinyPng(): string {
+  const W = 8, H = 8;
+  const raw: number[] = [];
+  for (let y = 0; y < H; y++) {
+    raw.push(0);
+    for (let x = 0; x < W; x++) raw.push((x * 30) % 256, (y * 30) % 256, 120);
+  }
+  const crcTable = Array.from({ length: 256 }, (_, n) => {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    return c >>> 0;
+  });
+  const crc = (buf: Uint8Array) => {
+    let c = 0xffffffff;
+    for (const b of buf) c = crcTable[(c ^ b) & 0xff]! ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+  };
+  const chunk = (tag: string, data: Uint8Array) => {
+    const body = new Uint8Array(4 + data.length);
+    body.set([...tag].map((ch) => ch.charCodeAt(0)));
+    body.set(data, 4);
+    const out = new Uint8Array(8 + data.length + 4);
+    new DataView(out.buffer).setUint32(0, data.length);
+    out.set(body, 4);
+    new DataView(out.buffer).setUint32(8 + data.length, crc(body));
+    return out;
+  };
+  const ihdr = new Uint8Array(13);
+  const dv = new DataView(ihdr.buffer);
+  dv.setUint32(0, W); dv.setUint32(4, H);
+  ihdr.set([8, 2, 0, 0, 0], 8);
+  const idat = Bun.deflateSync(new Uint8Array(raw));
+  const png = [
+    new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk("IHDR", ihdr), chunk("IDAT", idat), chunk("IEND", new Uint8Array(0)),
+  ];
+  const total = png.reduce((n, p) => n + p.length, 0);
+  const flat = new Uint8Array(total);
+  let at = 0;
+  for (const part of png) { flat.set(part, at); at += part.length; }
+  return "data:image/png;base64," + Buffer.from(flat).toString("base64");
+}
+
+describe("photos", () => {
+  const landlord = new Session();
+  const tenant = new Session();
+  const stranger = new Session();
+  const photo = tinyPng();
+  let joinCode = "";
+  let ticketId = 0;
+  let photoIds: number[] = [];
+
+  test("a tenant attaches photos to a new request", async () => {
+    const { data: lord } = await landlord.post("/api/signup", {
+      role: "landlord", username: uniq("shot"), password: "password123",
+      displayName: "Shot S", propertyName: "Kodak Court",
+    });
+    joinCode = lord.user.property.joinCode;
+    await tenant.post("/api/signup", {
+      role: "tenant", username: uniq("snap"), password: "password123",
+      displayName: "Snap S", joinCode, unit: "3A",
+    });
+
+    const { status, data } = await tenant.post("/api/tickets", {
+      title: "Ceiling stain above the shower",
+      description: "A brown ring has appeared and it is spreading.",
+      photos: [photo, photo],
+    });
+    expect(status).toBe(200);
+    ticketId = data.ticket.id;
+
+    const opening = data.messages.find((m: any) => m.author === "tenant");
+    expect(opening.photos).toHaveLength(2);
+    photoIds = opening.photos.map((p: any) => p.id);
+    // Ids only — the bytes are fetched separately, never inlined in the thread.
+    expect(JSON.stringify(data)).not.toContain("base64");
+  });
+
+  test("the bytes come back exactly as sent, and are cacheable", async () => {
+    const res = await fetch(`${BASE}/api/attachments/${photoIds[0]}`, {
+      headers: { cookie: (tenant as any).cookie },
+    });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("image/png");
+    // Private, because whether this 200s depends on who is asking.
+    expect(res.headers.get("cache-control")).toContain("private");
+
+    const got = Buffer.from(await res.arrayBuffer());
+    expect(got.toString("base64")).toBe(photo.split(",")[1]);
+  });
+
+  test("a photo is exactly as reachable as the thread it is on", async () => {
+    await stranger.post("/api/signup", {
+      role: "landlord", username: uniq("nope"), password: "password123", displayName: "Nope N",
+    });
+    const outside = await fetch(`${BASE}/api/attachments/${photoIds[0]}`, {
+      headers: { cookie: (stranger as any).cookie },
+    });
+    // 404 rather than 403 — a wrong guess should not confirm the id exists.
+    expect(outside.status).toBe(404);
+
+    const anon = await fetch(`${BASE}/api/attachments/${photoIds[0]}`);
+    expect(anon.status).toBe(401);
+
+    const missing = await fetch(`${BASE}/api/attachments/999999`, {
+      headers: { cookie: (tenant as any).cookie },
+    });
+    expect(missing.status).toBe(404);
+  });
+
+  test("a photo can be a message on its own", async () => {
+    const { status, data } = await tenant.post(`/api/tickets/${ticketId}/messages`, {
+      body: "", photos: [photo],
+    });
+    expect(status).toBe(200);
+    const last = data.messages.filter((m: any) => m.author === "tenant").at(-1);
+    expect(last.body).toBe("");
+    expect(last.photos).toHaveLength(1);
+  });
+
+  test("an empty message with no photo is still refused", async () => {
+    const { status } = await tenant.post(`/api/tickets/${ticketId}/messages`, { body: "  " });
+    expect(status).toBe(400);
+  });
+
+  test.each([
+    ["something that is not a data URL", "https://example.com/cat.jpg", "could not be read"],
+    ["a type we do not take", "data:image/gif;base64,R0lGODlhAQABAAAAACw=", "JPEG, PNG or WebP"],
+    ["a disguised script", "data:text/html;base64,PHNjcmlwdD4=", "JPEG, PNG or WebP"],
+  ])("%s is refused", async (_label, bad, message) => {
+    const { status, data } = await tenant.post(`/api/tickets/${ticketId}/messages`, {
+      body: "here", photos: [bad],
+    });
+    expect(status).toBe(400);
+    expect(data.error).toContain(message);
+  });
+
+  test("more than four photos at once is refused", async () => {
+    const { status, data } = await tenant.post(`/api/tickets/${ticketId}/messages`, {
+      body: "lots", photos: Array(5).fill(photo),
+    });
+    expect(status).toBe(400);
+    expect(data.error).toContain("4 photos");
+  });
+
+  test("a rejected batch posts nothing at all", async () => {
+    const before = (await tenant.get(`/api/tickets/${ticketId}`)).data.messages.length;
+    await tenant.post(`/api/tickets/${ticketId}/messages`, {
+      body: "one good one bad", photos: [photo, "not-a-photo"],
+    });
+    const after = (await tenant.get(`/api/tickets/${ticketId}`)).data.messages.length;
+    expect(after).toBe(before);
+  });
+
+  test("the landlord sees the photos once the request reaches them", async () => {
+    await tenant.post(`/api/tickets/${ticketId}/escalate`);
+    const { data } = await landlord.get(`/api/tickets/${ticketId}`);
+    const withPhotos = data.messages.filter((m: any) => m.photos?.length);
+    expect(withPhotos.length).toBeGreaterThan(0);
+    const res = await fetch(`${BASE}/api/attachments/${photoIds[0]}`, {
+      headers: { cookie: (landlord as any).cookie },
+    });
+    expect(res.status).toBe(200);
+  });
+});

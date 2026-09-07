@@ -629,6 +629,63 @@ input, textarea, select { font: inherit; color: inherit; }
   border-color: var(--accent); box-shadow: var(--ring); background: var(--panel);
 }
 
+/* The camera button sits level with the send button, not with the text — the
+   textarea grows as you type and would drag it upward. */
+.composer .photo-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  padding: 10px; border-radius: var(--r-md); color: var(--ink-soft);
+}
+.composer .photo-btn:hover { color: var(--accent); }
+
+/* Photos waiting to be sent, above whichever form is staging them. */
+.photo-strip {
+  display: flex; flex-wrap: wrap; gap: 8px;
+  padding: 12px 26px 0; background: var(--panel);
+}
+.shot-staged { position: relative; width: 74px; height: 74px; }
+.shot-staged img {
+  width: 100%; height: 100%; object-fit: cover;
+  border-radius: var(--r-sm); border: 1px solid var(--line);
+}
+.shot-drop {
+  position: absolute; top: -6px; right: -6px; width: 20px; height: 20px;
+  display: grid; place-items: center; padding: 0; line-height: 1;
+  border: 1px solid var(--line); border-radius: 50%;
+  background: var(--panel); color: var(--ink-soft); cursor: pointer; font-size: 14px;
+}
+.shot-drop:hover { color: var(--urgent); border-color: var(--urgent); }
+
+/* Photos on a message. Capped rather than full-bleed: the thumbnail says a photo
+   is there, and tapping it is what shows the detail. */
+.shots { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.shot-wrap {
+  display: block; padding: 0; border: 0; background: none; cursor: pointer;
+  border-radius: var(--r-sm); overflow: hidden; line-height: 0;
+}
+.shot-wrap.sending { opacity: .55; cursor: default; }
+.shot-wrap.shot-failed { display: none; }
+.shot {
+  width: 132px; height: 132px; object-fit: cover; display: block;
+  background: color-mix(in oklab, var(--ink-soft) 12%, transparent);
+  transition: transform var(--fast);
+}
+.shot-wrap:hover .shot { transform: scale(1.03); }
+
+/* Full size, over everything. */
+.photo-viewer {
+  position: fixed; inset: 0; z-index: 60; display: grid; place-items: center;
+  padding: 32px; background: color-mix(in oklab, #000 78%, transparent); cursor: zoom-out;
+}
+.photo-viewer img {
+  max-width: 100%; max-height: 100%;
+  border-radius: var(--r-sm); box-shadow: 0 18px 50px rgba(0,0,0,.5);
+}
+
+/* A secondary action that fills its field, like "Add a photo". */
+.block-soft { display: block; width: 100%; }
+/* Inside the new-request form the strip is already within the field's padding. */
+#newPhotoStrip { padding: 10px 0 0; background: none; }
+
 .placeholder {
   flex: 1; display: grid; place-items: center;
   color: var(--ink-soft); text-align: center; padding: 40px;

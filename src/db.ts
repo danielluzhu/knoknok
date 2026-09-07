@@ -113,6 +113,24 @@ CREATE TABLE IF NOT EXISTS messages (
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- Photos on a thread message: a tenant showing the problem rather than
+-- describing it. The bytes live here rather than on disk because the API runs as
+-- a serverless function with no writable filesystem, and rather than in an
+-- object store because that would be another service to hold credentials for.
+-- The client downscales before upload, so these are phone-photo-sized, not
+-- camera-sized. ticket_id is denormalised so an access check does not need to
+-- join through messages.
+CREATE TABLE IF NOT EXISTS attachments (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+  ticket_id  INTEGER NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
+  user_id    INTEGER REFERENCES users(id),
+  mime       TEXT NOT NULL,
+  size       INTEGER NOT NULL,
+  bytes      BLOB NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- How far each person has read in each thread, so both sides can see what is new.
 CREATE TABLE IF NOT EXISTS ticket_reads (
   ticket_id       INTEGER NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
@@ -149,6 +167,7 @@ CREATE INDEX IF NOT EXISTS idx_property_vendors_vendor ON property_vendors(vendo
 CREATE INDEX IF NOT EXISTS idx_tickets_property ON tickets(property_id, status);
 CREATE INDEX IF NOT EXISTS idx_tickets_tenant   ON tickets(tenant_id, status);
 CREATE INDEX IF NOT EXISTS idx_messages_ticket  ON messages(ticket_id, id);
+CREATE INDEX IF NOT EXISTS idx_attachments_ticket ON attachments(ticket_id, message_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_user    ON sessions(user_id);
 `;
 
@@ -437,4 +456,17 @@ export interface Message {
   body: string;
   created_at: string;
   author_name?: string | null;
+  /** Attached photos, as ids the client fetches separately. Never the bytes. */
+  photos?: { id: number; mime: string }[];
+}
+
+export interface Attachment {
+  id: number;
+  message_id: number;
+  ticket_id: number;
+  user_id: number | null;
+  mime: string;
+  size: number;
+  bytes: Uint8Array;
+  created_at: string;
 }

@@ -101,6 +101,164 @@ function when(iso) {
   return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
+/* ------------------------------------------------------------------ photos */
+
+const MAX_PHOTOS = 4;
+/** Long edge, in pixels. A phone photo is several times this and shows no more. */
+const PHOTO_MAX_EDGE = 1600;
+const PHOTO_QUALITY = 0.82;
+
+/** Photos staged in the composer or the new-request form, as data URLs. */
+let pendingPhotos = [];
+
+/**
+ * Shrink a picked file to something worth sending.
+ *
+ * A modern phone photo is 3–8MB, and the server stores what it is given, so this
+ * is what keeps the database from filling with pixels nobody looks at. It also
+ * strips EXIF as a side effect of re-encoding — including where the photo was
+ * taken, which is a tenant's home address.
+ */
+function shrinkPhoto(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      const scale = Math.min(1, PHOTO_MAX_EDGE / Math.max(img.width, img.height));
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(img.width * scale));
+      canvas.height = Math.max(1, Math.round(img.height * scale));
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      resolve(canvas.toDataURL("image/jpeg", PHOTO_QUALITY));
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error("That file could not be read as a photo."));
+    };
+    img.src = url;
+  });
+}
+
+/** Take files from a picker into the staging list, and redraw the strip. */
+async function stagePhotos(files, onDone) {
+  const room = MAX_PHOTOS - pendingPhotos.length;
+  if (room <= 0) {
+    alert(`Up to ${MAX_PHOTOS} photos at a time.`);
+    return;
+  }
+  for (const file of [...files].slice(0, room)) {
+    if (!file.type.startsWith("image/")) continue;
+    try {
+      pendingPhotos.push(await shrinkPhoto(file));
+    } catch (ex) {
+      alert(ex.message);
+    }
+  }
+  onDone();
+}
+
+/** The row of thumbnails sitting above whichever form is staging them. */
+function renderPhotoStrip(el) {
+  if (!el) return;
+  el.classList.toggle("hidden", !pendingPhotos.length);
+  el.innerHTML = pendingPhotos.map((src, i) => `
+    <div class="shot-staged">
+      <img src="${src}" alt="">
+      <button type="button" class="shot-drop" data-i="${i}" title="Remove">×</button>
+    </div>`).join("");
+  el.querySelectorAll(".shot-drop").forEach((b) =>
+    b.addEventListener("click", () => {
+      pendingPhotos.splice(Number(b.dataset.i), 1);
+      renderPhotoStrip(el);
+    }));
+}
+
+/**
+ * Fetched photos, by attachment id.
+ *
+ * The thread re-renders on every poll, so without this the same images would be
+ * refetched every few seconds and flicker as they reloaded. Entries are object
+ * URLs, or the in-flight promise so a re-render mid-fetch does not start a
+ * second one. Bytes need the auth header, which an <img src> cannot send, so
+ * they cannot simply be pointed at the URL.
+ */
+const photoCache = new Map();
+
+function loadPhoto(id) {
+  if (photoCache.has(id)) return photoCache.get(id);
+  const pending = (async () => {
+    const headers = authToken ? { authorization: `Bearer ${authToken}` } : {};
+    const res = await fetch(`${API_BASE}/api/attachments/${id}`, {
+      credentials: CROSS_ORIGIN ? "omit" : "same-origin",
+      headers,
+    });
+    if (!res.ok) throw new Error("photo unavailable");
+    const url = URL.createObjectURL(await res.blob());
+    photoCache.set(id, url);
+    return url;
+  })();
+  photoCache.set(id, pending);
+  pending.catch(() => photoCache.delete(id));
+  return pending;
+}
+
+/** Fill in any <img> the thread just drew that does not have its bytes yet. */
+function hydratePhotos(root) {
+  root.querySelectorAll("img.shot[data-photo]").forEach(async (img) => {
+    if (img.dataset.loaded) return;
+    try {
+      const url = await loadPhoto(Number(img.dataset.photo));
+      img.src = url;
+      img.dataset.loaded = "1";
+    } catch {
+      img.closest(".shot-wrap")?.classList.add("shot-failed");
+    }
+  });
+}
+
+/** Photos on a thread message, as thumbnails that open full size. */
+function renderPhotos(message) {
+  // An optimistic echo carries the staged data URLs, which are already in hand.
+  if (message.pendingPhotos?.length) {
+    return `<div class="shots">${message.pendingPhotos
+      .map((src) => `<span class="shot-wrap sending"><img class="shot" src="${src}" alt=""></span>`)
+      .join("")}</div>`;
+  }
+  if (!message.photos?.length) return "";
+  return `<div class="shots">${message.photos.map((p) => {
+    const cached = photoCache.get(p.id);
+    const src = typeof cached === "string" ? ` src="${cached}"` : "";
+    return `<button type="button" class="shot-wrap" data-open="${p.id}">
+      <img class="shot" data-photo="${p.id}"${src} alt="Photo on this request">
+    </button>`;
+  }).join("")}</div>`;
+}
+
+/** Full-size view. Escape or a click anywhere closes it. */
+async function openPhoto(id) {
+  const viewer = $("#photoViewer");
+  const img = $("#photoViewerImg");
+  img.removeAttribute("src");
+  viewer.classList.remove("hidden");
+  try {
+    img.src = await loadPhoto(id);
+  } catch {
+    viewer.classList.add("hidden");
+    alert("That photo could not be loaded.");
+  }
+}
+
+function wirePhotoViewer() {
+  const viewer = $("#photoViewer");
+  const close = () => viewer.classList.add("hidden");
+  viewer.addEventListener("click", close);
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !viewer.classList.contains("hidden")) close();
+  });
+}
+
 /* -------------------------------------------------------------- auth view */
 
 let authMode = "login";
@@ -703,6 +861,8 @@ function renderList() {
 async function openTicket(id, scroll = true) {
   const { ticket, messages, lastReadId } = await api(`/api/tickets/${id}`);
   const switching = state.selected !== id;
+  // Photos staged against one request must not follow you into another.
+  if (switching) pendingPhotos = [];
   state.selected = id;
   state.ticket = ticket;
   state.messages = messages;
@@ -817,11 +977,33 @@ function renderDetail(scroll = true) {
     <div class="thread" id="thread">${renderThread()}
       ${state.busy ? '<div class="msg bot"><div class="bubble thinking">The assistant is thinking…</div></div>' : ""}
     </div>
-    ${closed ? "" : `<div class="composer">
+    ${closed ? "" : `
+    <div class="photo-strip hidden" id="photoStrip"></div>
+    <div class="composer">
+      <input type="file" id="photoInput" accept="image/*" multiple hidden>
+      <button class="ghost photo-btn" id="photoBtn" title="Add a photo" aria-label="Add a photo">
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+          <path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"
+                stroke-linejoin="round"
+                d="M3 7.5h3l1.5-2h9l1.5 2h3v11H3zM12 16a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7z"/>
+        </svg>
+      </button>
       <textarea id="composerInput" rows="1" placeholder="${
         t.status === "triage" && isTenant ? "Answer the assistant…" : "Write a message…"}"></textarea>
       <button class="primary" id="sendBtn">Send</button>
     </div>`}`;
+
+  renderPhotoStrip($("#photoStrip"));
+  hydratePhotos(el);
+  // Tap a thumbnail to see it properly — a leak under a sink is not legible at
+  // thumbnail size, which is the whole reason for sending it.
+  el.querySelectorAll(".shot-wrap").forEach((b) =>
+    b.addEventListener("click", () => openPhoto(Number(b.dataset.open))));
+  $("#photoBtn")?.addEventListener("click", () => $("#photoInput").click());
+  $("#photoInput")?.addEventListener("change", async (e) => {
+    await stagePhotos(e.target.files, () => renderPhotoStrip($("#photoStrip")));
+    e.target.value = ""; // so picking the same file twice still fires
+  });
 
   $("#closeBtn")?.addEventListener("click", onClose);
   $("#claimBtn")?.addEventListener("click", () => act(`/api/tickets/${t.id}/claim`));
@@ -880,7 +1062,8 @@ function renderMessage(m) {
     : mine ? m.author : `${m.author} mine-left`;
   return `<div class="msg ${cls}">
     ${label ? `<div class="who-line">${esc(label)}</div>` : ""}
-    <div class="bubble">${esc(m.body)}</div>
+    ${m.body ? `<div class="bubble">${esc(m.body)}</div>` : ""}
+    ${renderPhotos(m)}
   </div>`;
 }
 
@@ -913,22 +1096,35 @@ function onClose() {
 async function send() {
   const input = $("#composerInput");
   const body = input.value.trim();
-  if (!body || state.busy) return;
+  const photos = pendingPhotos;
+  // A photo on its own is a complete message.
+  if ((!body && !photos.length) || state.busy) return;
   input.value = "";
   input.style.height = "auto";
+  pendingPhotos = [];
 
-  // Optimistic echo so the thread feels immediate while the bot thinks.
-  state.messages.push({ author: state.me.role, author_name: state.me.displayName, body });
+  // Optimistic echo so the thread feels immediate while the bot thinks. The
+  // staged data URLs stand in for the attachments until the server answers.
+  state.messages.push({
+    author: state.me.role, author_name: state.me.displayName, body,
+    pendingPhotos: photos,
+  });
   const waitingOnBot = state.ticket.status === "triage" && state.me.role === "tenant";
   state.busy = waitingOnBot;
   renderDetail(false);
 
   try {
-    const res = await api(`/api/tickets/${state.ticket.id}/messages`, { method: "POST", body: { body } });
+    const res = await api(`/api/tickets/${state.ticket.id}/messages`, {
+      method: "POST", body: { body, photos },
+    });
     state.ticket = res.ticket;
     state.messages = res.messages;
   } catch (ex) {
     alert(ex.message);
+    // Hand the message back rather than losing it, photos included.
+    input.value = body;
+    pendingPhotos = photos;
+    state.messages = state.messages.filter((m) => m.pendingPhotos !== photos);
   } finally {
     state.busy = false;
     renderDetail(false);
@@ -964,6 +1160,8 @@ function wireModal() {
       fillTenantOptions();
     }
     $("#newDesc").required = tenant;
+    pendingPhotos = [];
+    renderPhotoStrip($("#newPhotoStrip"));
     $("#modalError").classList.add("hidden");
     modal.classList.remove("hidden");
     $("#newTitle").focus();
@@ -982,6 +1180,12 @@ function wireModal() {
   }
   $("#newProperty").addEventListener("change", fillTenantOptions);
 
+  $("#newPhotoBtn").addEventListener("click", () => $("#newPhotoInput").click());
+  $("#newPhotoInput").addEventListener("change", async (e) => {
+    await stagePhotos(e.target.files, () => renderPhotoStrip($("#newPhotoStrip")));
+    e.target.value = "";
+  });
+
   $("#newBtn").addEventListener("click", open);
   $("#modalCancel").addEventListener("click", () => modal.classList.add("hidden"));
   modal.addEventListener("click", (e) => { if (e.target === modal) modal.classList.add("hidden"); });
@@ -994,8 +1198,11 @@ function wireModal() {
     if (state.me.role === "tenant") btn.textContent = "Asking the assistant…";
     try {
       const body = Object.fromEntries(new FormData(e.target).entries());
+      body.photos = pendingPhotos;
       const { ticket } = await api("/api/tickets", { method: "POST", body });
       e.target.reset();
+      pendingPhotos = [];
+      renderPhotoStrip($("#newPhotoStrip"));
       modal.classList.add("hidden");
       await refresh(false);
       await openTicket(ticket.id);
@@ -1058,6 +1265,7 @@ wireAuth();
 wireModal();
 wireAccount();
 wirePropertySwitch();
+wirePhotoViewer();
 setAuthMode("login");
 
 // A static host cannot serve the API, so if this page is on one and nobody told

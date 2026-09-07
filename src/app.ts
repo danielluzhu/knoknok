@@ -70,26 +70,117 @@ const CATEGORIES = new Set([
 ]);
 const PRIORITIES = new Set(["low", "normal", "high", "urgent"]);
 
+/* ----------------------------------------------------------------- photos */
+
+const PHOTO_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
+const MAX_PHOTOS = 4;
+// The client downscales before sending, so anything near this is either a very
+// large photo or not a photo at all. Generous enough not to bite in practice.
+const MAX_PHOTO_BYTES = 3 * 1024 * 1024;
+
+/**
+ * Decode one `data:image/...;base64,...` upload.
+ *
+ * Returns a message rather than throwing, because everything that can go wrong
+ * here is the caller sending something we will not take, and they should be told
+ * which thing it was.
+ */
+function decodePhoto(input: unknown): { mime: string; bytes: Buffer } | string {
+  if (typeof input !== "string") return "That photo could not be read.";
+  const match = /^data:([\w/+.-]+);base64,([A-Za-z0-9+/=\s]+)$/.exec(input.trim());
+  if (!match) return "That photo could not be read.";
+
+  const mime = match[1]!.toLowerCase();
+  if (!PHOTO_TYPES.has(mime)) return "Photos need to be JPEG, PNG or WebP.";
+
+  let bytes: Buffer;
+  try {
+    bytes = Buffer.from(match[2]!, "base64");
+  } catch {
+    return "That photo could not be read.";
+  }
+  if (!bytes.length) return "That photo is empty.";
+  if (bytes.length > MAX_PHOTO_BYTES) return "That photo is too large.";
+  return { mime, bytes };
+}
+
+/** Photos for every message on a ticket, grouped by message. */
+async function photosByMessage(ticketId: number): Promise<Map<number, { id: number; mime: string }[]>> {
+  const rows = await db.all<{ id: number; message_id: number; mime: string }>(
+    "SELECT id, message_id, mime FROM attachments WHERE ticket_id = ? ORDER BY id",
+    [ticketId],
+  );
+  const grouped = new Map<number, { id: number; mime: string }[]>();
+  for (const r of rows) {
+    const list = grouped.get(r.message_id) ?? [];
+    list.push({ id: r.id, mime: r.mime });
+    grouped.set(r.message_id, list);
+  }
+  return grouped;
+}
+
+/**
+ * Pull `photos` out of a request body. Returns an error message if any of them
+ * is unacceptable — all or nothing, so a post never half-succeeds.
+ */
+function takePhotos(b: Record<string, unknown> | null): { mime: string; bytes: Buffer }[] | string {
+  const raw = b?.photos;
+  if (raw === undefined || raw === null) return [];
+  if (!Array.isArray(raw)) return "That photo could not be read.";
+  if (raw.length > MAX_PHOTOS) return `Up to ${MAX_PHOTOS} photos at a time.`;
+
+  const out: { mime: string; bytes: Buffer }[] = [];
+  for (const one of raw) {
+    const decoded = decodePhoto(one);
+    if (typeof decoded === "string") return decoded;
+    out.push(decoded);
+  }
+  return out;
+}
+
+/* --------------------------------------------------------------- messages */
+
+/**
+ * Post a message, optionally with photos.
+ *
+ * `photos` are already-decoded uploads — validation happens at the route, so a
+ * rejected photo never reaches the point where half a message has been written.
+ */
 async function addMessage(
   ticketId: number,
   author: Message["author"],
   body: string,
   userId: number | null = null,
+  photos: { mime: string; bytes: Buffer }[] = [],
 ) {
-  await db.run(
-    "INSERT INTO messages (ticket_id, author, user_id, body) VALUES (?, ?, ?, ?)",
+  const message = (await db.get<{ id: number }>(
+    "INSERT INTO messages (ticket_id, author, user_id, body) VALUES (?, ?, ?, ?) RETURNING id",
     [ticketId, author, userId, body.trim()],
-  );
+  ))!;
+  for (const photo of photos) {
+    await db.run(
+      `INSERT INTO attachments (message_id, ticket_id, user_id, mime, size, bytes)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [message.id, ticketId, userId, photo.mime, photo.bytes.length, photo.bytes],
+    );
+  }
   await db.run("UPDATE tickets SET updated_at = datetime('now') WHERE id = ?", [ticketId]);
+  return message.id;
 }
 
-function ticketMessages(ticketId: number): Promise<Message[]> {
-  return db.all<Message>(
+async function ticketMessages(ticketId: number): Promise<Message[]> {
+  const messages = await db.all<Message>(
     `SELECT m.*, u.display_name AS author_name
      FROM messages m LEFT JOIN users u ON u.id = m.user_id
      WHERE m.ticket_id = ? ORDER BY m.id`,
     [ticketId],
   );
+  const photos = await photosByMessage(ticketId);
+  for (const m of messages) {
+    const mine = photos.get(m.id);
+    if (mine) m.photos = mine;
+  }
+  return messages;
 }
 
 /** Remember that this user has seen everything posted in this thread so far. */
@@ -472,6 +563,9 @@ async function createTicket(user: User, req: Request): Promise<Response> {
   const title = String(b?.title ?? "").trim();
   const description = String(b?.description ?? "").trim();
   if (!title) return fail("Give the request a short title.");
+
+  const photos = takePhotos(b);
+  if (typeof photos === "string") return fail(photos);
   if (user.role === "vendor") {
     return fail("Vendors work the list rather than adding to it.", 403);
   }
@@ -484,7 +578,7 @@ async function createTicket(user: User, req: Request): Promise<Response> {
       [user.property_id, user.id, user.id, title, title],
     ))!;
 
-    await addMessage(ticket.id, "tenant", description, user.id);
+    await addMessage(ticket.id, "tenant", description, user.id, photos);
     await runTriage(ticket);
     await markRead(ticket.id, user.id);
     return json({
@@ -520,7 +614,9 @@ async function createTicket(user: User, req: Request): Promise<Response> {
     [propertyId, tenantId, user.id, title, description || title, category, priority],
   ))!;
 
-  if (description) await addMessage(ticket.id, "landlord", description, user.id);
+  if (description || photos.length) {
+    await addMessage(ticket.id, "landlord", description, user.id, photos);
+  }
   if (tenantId) {
     await addMessage(ticket.id, "system", `${user.display_name} raised this with the tenant.`);
   }
@@ -529,12 +625,15 @@ async function createTicket(user: User, req: Request): Promise<Response> {
 }
 
 async function postMessage(user: User, ticket: Ticket, req: Request): Promise<Response> {
-  const b = (await req.json().catch(() => null)) as Record<string, string> | null;
+  const b = (await req.json().catch(() => null)) as Record<string, unknown> | null;
   const body = String(b?.body ?? "").trim();
-  if (!body) return fail("Message is empty.");
+  const photos = takePhotos(b);
+  if (typeof photos === "string") return fail(photos);
+  // A photo on its own says plenty — this is often the whole point of sending one.
+  if (!body && !photos.length) return fail("Message is empty.");
   if (ticket.status === "closed") return fail("This request is closed. Reopen it to keep talking.");
 
-  await addMessage(ticket.id, user.role, body, user.id);
+  await addMessage(ticket.id, user.role, body, user.id, photos);
 
   // While a request is in triage the bot owns the conversation.
   let botResult = null;
@@ -756,6 +855,36 @@ async function propertyOverview(user: User, url: URL): Promise<Response> {
     counts: Object.fromEntries(counts.map((c) => [c.status, c.n])),
     // The per-property breakdown the "all properties" sidebar lists.
     properties: await propertiesFor(user),
+  });
+}
+
+/**
+ * Serve one photo.
+ *
+ * Access is exactly the thread's access: if you cannot open the ticket you
+ * cannot fetch anything posted on it. The id is opaque and sequential, so this
+ * check is the only thing standing between a guessed number and someone else's
+ * photo — it runs before the bytes are read.
+ */
+async function servePhoto(user: User, id: number): Promise<Response> {
+  const meta = await db.get<{ ticket_id: number }>(
+    "SELECT ticket_id FROM attachments WHERE id = ?",
+    [id],
+  );
+  if (!meta) return fail("Photo not found.", 404);
+  if (!(await visibleTicket(user, meta.ticket_id))) return fail("Photo not found.", 404);
+
+  const row = (await db.get<{ mime: string; bytes: Uint8Array }>(
+    "SELECT mime, bytes FROM attachments WHERE id = ?",
+    [id],
+  ))!;
+  return new Response(row.bytes as unknown as BodyInit, {
+    headers: {
+      "content-type": row.mime,
+      // Immutable: an attachment's bytes never change, and the id is never
+      // reused. Private, because the response depends on who asked.
+      "cache-control": "private, max-age=31536000, immutable",
+    },
   });
 }
 
@@ -1025,6 +1154,9 @@ async function route(req: Request, url: URL, path: string): Promise<Response> {
     if (user.role === "tenant") return fail("Tenants belong to one property.", 403);
     return await selectProperty(user, Number(selecting[1]));
   }
+  const photo = path.match(/^\/api\/attachments\/(\d+)$/);
+  if (photo && req.method === "GET") return await servePhoto(user, Number(photo[1]));
+
   if (path === "/api/password" && req.method === "POST") {
     return await changePassword(user, req, currentToken(req));
   }
