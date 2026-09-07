@@ -26,28 +26,42 @@ if (!isRemote) {
 export const client = createClient(authToken ? { url, authToken } : { url });
 
 const SCHEMA = `
--- A landlord owns many properties, tracked by landlord_id. join_code is the
--- invite a tenant redeems to join one of them.
+-- A landlord owns many properties (landlord_id), and each property carries two
+-- separate invite codes: join_code lets tenants in, vendor_code lets contractors
+-- in. They are distinct so handing a plumber access never hands them the code
+-- that would let them sign up as a resident.
 CREATE TABLE IF NOT EXISTS properties (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   name        TEXT NOT NULL,
   join_code   TEXT NOT NULL UNIQUE,
+  vendor_code TEXT UNIQUE,
   landlord_id INTEGER REFERENCES users(id),
   created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 -- property_id is the property this account is *currently looking at*. For a
--- tenant that is the only one they will ever have; a landlord spans several, so
--- for them it is a cursor and properties.landlord_id is authoritative.
+-- tenant that is the only one they will ever have. Landlords and vendors both
+-- span several, so for them it is a cursor, and the authoritative list lives in
+-- properties.landlord_id / property_vendors respectively.
 CREATE TABLE IF NOT EXISTS users (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   username      TEXT NOT NULL UNIQUE COLLATE NOCASE,
   password_hash TEXT NOT NULL,
-  role          TEXT NOT NULL CHECK (role IN ('tenant','landlord')),
+  role          TEXT NOT NULL CHECK (role IN ('tenant','landlord','vendor')),
   display_name  TEXT NOT NULL,
   property_id   INTEGER NOT NULL REFERENCES properties(id),
   unit          TEXT,
   created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Which properties a vendor may work on. A vendor redeems one vendor_code per
+-- property, so a contractor working three buildings for the same landlord has
+-- three rows and one login.
+CREATE TABLE IF NOT EXISTS property_vendors (
+  property_id INTEGER NOT NULL REFERENCES properties(id),
+  vendor_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (property_id, vendor_id)
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -82,6 +96,9 @@ CREATE TABLE IF NOT EXISTS tickets (
   status      TEXT NOT NULL DEFAULT 'triage' CHECK (status IN ('triage','open','closed')),
   resolution  TEXT,
   closed_by   TEXT,
+  -- The vendor who claimed this job, if any. Vendors browse every open job on a
+  -- property and claim what they will do, rather than waiting to be assigned.
+  assigned_vendor_id INTEGER REFERENCES users(id),
   created_at  TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
   closed_at   TEXT
@@ -90,7 +107,7 @@ CREATE TABLE IF NOT EXISTS tickets (
 CREATE TABLE IF NOT EXISTS messages (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   ticket_id  INTEGER NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
-  author     TEXT NOT NULL CHECK (author IN ('tenant','bot','landlord','system')),
+  author     TEXT NOT NULL CHECK (author IN ('tenant','bot','landlord','vendor','system')),
   user_id    INTEGER REFERENCES users(id),
   body       TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -108,7 +125,8 @@ CREATE TABLE IF NOT EXISTS ticket_reads (
 -- Direct messages between a tenant and their landlord, separate from the
 -- per-request ticket threads. A property still has exactly one landlord — its
 -- properties.landlord_id — so a conversation is identified by the tenant alone;
--- tenant_id is the conversation key, not the sender.
+-- tenant_id is the conversation key, not the sender. Vendors are not part of
+-- this: they talk on the ticket thread, where the work is.
 CREATE TABLE IF NOT EXISTS chat_messages (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   property_id INTEGER NOT NULL REFERENCES properties(id),
@@ -127,6 +145,7 @@ CREATE TABLE IF NOT EXISTS chat_reads (
 );
 
 CREATE INDEX IF NOT EXISTS idx_chat_conversation ON chat_messages(tenant_id, id);
+CREATE INDEX IF NOT EXISTS idx_property_vendors_vendor ON property_vendors(vendor_id);
 CREATE INDEX IF NOT EXISTS idx_tickets_property ON tickets(property_id, status);
 CREATE INDEX IF NOT EXISTS idx_tickets_tenant   ON tickets(tenant_id, status);
 CREATE INDEX IF NOT EXISTS idx_messages_ticket  ON messages(ticket_id, id);
@@ -155,14 +174,16 @@ export function migrate(): Promise<void> {
 
 /**
  * `CREATE TABLE IF NOT EXISTS` does nothing to a table that already exists, so
- * a database created before a landlord could hold several properties still has
- * the old shape. These steps bring it forward and are no-ops once applied.
+ * a database created before multi-property and vendor support still has the old
+ * shape. These steps bring it forward and are all no-ops once applied.
  *
  * Everything here goes through `client` rather than `db`, because `db` awaits
  * `migrate()` and would deadlock on the migration that is running.
  */
 async function evolve(): Promise<void> {
-  if (!(await tableColumns("properties")).has("landlord_id")) {
+  const properties = await tableColumns("properties");
+
+  if (!properties.has("landlord_id")) {
     await client.execute("ALTER TABLE properties ADD COLUMN landlord_id INTEGER REFERENCES users(id)");
     // Before this column there was exactly one landlord per property, found by
     // pointing the other way — that is the owner.
@@ -174,7 +195,67 @@ async function evolve(): Promise<void> {
        ) WHERE landlord_id IS NULL`,
     );
   }
-  // Last, because the index column only exists once the step above has run.
+
+  if (!properties.has("vendor_code")) {
+    await client.execute("ALTER TABLE properties ADD COLUMN vendor_code TEXT");
+    // NULLs do not collide in a SQLite unique index, so this is safe to add
+    // before the codes below are filled in.
+    await client.execute(
+      "CREATE UNIQUE INDEX IF NOT EXISTS idx_properties_vendor_code ON properties(vendor_code)",
+    );
+  }
+
+  if (!(await tableColumns("tickets")).has("assigned_vendor_id")) {
+    await client.execute("ALTER TABLE tickets ADD COLUMN assigned_vendor_id INTEGER REFERENCES users(id)");
+  }
+
+  // A CHECK constraint cannot be altered in place — the table has to be rebuilt.
+  // Both of these gained 'vendor' as an allowed value.
+  if (!(await tableDdl("users")).includes("vendor")) {
+    await rebuild(
+      "users",
+      `CREATE TABLE users__next (
+         id            INTEGER PRIMARY KEY AUTOINCREMENT,
+         username      TEXT NOT NULL UNIQUE COLLATE NOCASE,
+         password_hash TEXT NOT NULL,
+         role          TEXT NOT NULL CHECK (role IN ('tenant','landlord','vendor')),
+         display_name  TEXT NOT NULL,
+         property_id   INTEGER NOT NULL REFERENCES properties(id),
+         unit          TEXT,
+         created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+       )`,
+      "id, username, password_hash, role, display_name, property_id, unit, created_at",
+    );
+  }
+  if (!(await tableDdl("messages")).includes("vendor")) {
+    await rebuild(
+      "messages",
+      `CREATE TABLE messages__next (
+         id         INTEGER PRIMARY KEY AUTOINCREMENT,
+         ticket_id  INTEGER NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
+         author     TEXT NOT NULL CHECK (author IN ('tenant','bot','landlord','vendor','system')),
+         user_id    INTEGER REFERENCES users(id),
+         body       TEXT NOT NULL,
+         created_at TEXT NOT NULL DEFAULT (datetime('now'))
+       )`,
+      "id, ticket_id, author, user_id, body, created_at",
+    );
+    await client.execute("CREATE INDEX IF NOT EXISTS idx_messages_ticket ON messages(ticket_id, id)");
+  }
+
+  // Any property still without a vendor code — pre-existing ones, and any the
+  // unique index above left NULL — gets one now, so a landlord always has a
+  // code to hand out.
+  const pending = await client.execute("SELECT id FROM properties WHERE vendor_code IS NULL");
+  for (const row of pending.rows) {
+    const id = (row as unknown as unknown[])[0];
+    await client.execute({
+      sql: "UPDATE properties SET vendor_code = ? WHERE id = ?",
+      args: [await uniqueCode("vendor_code"), id as number],
+    });
+  }
+
+  // Last, because these index columns only exist once the steps above have run.
   await client.execute(
     "CREATE INDEX IF NOT EXISTS idx_properties_landlord ON properties(landlord_id)",
   );
@@ -186,15 +267,50 @@ async function tableColumns(table: string): Promise<Set<string>> {
   return new Set(rs.rows.map((r) => String((r as unknown as unknown[])[at])));
 }
 
+/** The stored CREATE TABLE text, which is how we read a CHECK constraint back. */
+async function tableDdl(table: string): Promise<string> {
+  const rs = await client.execute({
+    sql: "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+    args: [table],
+  });
+  return rs.rows.length ? String((rs.rows[0] as unknown as unknown[])[0] ?? "") : "";
+}
+
+/**
+ * Replace a table with a new definition, carrying the rows across.
+ *
+ * `legacy_alter_table` matters: without it the RENAME tries to rewrite every
+ * other table's references to the name being replaced, and trips over the fact
+ * that the original was just dropped. With it, the other tables keep pointing at
+ * the name — which, after the rename, is the new table.
+ */
+async function rebuild(table: string, createNext: string, columns: string): Promise<void> {
+  await client.executeMultiple(`
+    PRAGMA foreign_keys = OFF;
+    PRAGMA legacy_alter_table = ON;
+    ${createNext};
+    INSERT INTO ${table}__next (${columns}) SELECT ${columns} FROM ${table};
+    DROP TABLE ${table};
+    ALTER TABLE ${table}__next RENAME TO ${table};
+    PRAGMA legacy_alter_table = OFF;
+    PRAGMA foreign_keys = ON;
+  `);
+}
+
 /* ------------------------------------------------------------------ codes */
 
 // No I/O/0/1 — these get read off a screen and typed in by hand.
 const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
-/** An invite code no other property is using. */
-export async function uniqueCode(column: "join_code"): Promise<string> {
+/**
+ * An invite code no other property is using. Vendor codes are prefixed so the
+ * two kinds are told apart at a glance, and so a vendor code can never be
+ * mistaken for — or collide with — a tenant one.
+ */
+export async function uniqueCode(column: "join_code" | "vendor_code"): Promise<string> {
+  const prefix = column === "vendor_code" ? "V-" : "";
   for (let attempt = 0; attempt < 50; attempt++) {
-    const code = Array.from(
+    const code = prefix + Array.from(
       { length: 6 },
       () => CODE_ALPHABET[Math.floor(Math.random() * CODE_ALPHABET.length)],
     ).join("");
@@ -246,7 +362,7 @@ export const db = {
   },
 };
 
-export type Role = "tenant" | "landlord";
+export type Role = "tenant" | "landlord" | "vendor";
 export type Status = "triage" | "open" | "closed";
 export type Priority = "low" | "normal" | "high" | "urgent";
 
@@ -254,6 +370,7 @@ export interface Property {
   id: number;
   name: string;
   join_code: string;
+  vendor_code: string | null;
   landlord_id: number | null;
   created_at: string;
 }
@@ -281,6 +398,7 @@ export interface Ticket {
   status: Status;
   resolution: string | null;
   closed_by: string | null;
+  assigned_vendor_id: number | null;
   created_at: string;
   updated_at: string;
   closed_at: string | null;
@@ -289,6 +407,7 @@ export interface Ticket {
   tenant_unit?: string | null;
   creator_name?: string | null;
   creator_role?: Role | null;
+  vendor_name?: string | null;
 }
 
 export interface ChatMessage {
@@ -313,7 +432,7 @@ export interface TicketRead {
 export interface Message {
   id: number;
   ticket_id: number;
-  author: "tenant" | "bot" | "landlord" | "system";
+  author: "tenant" | "bot" | "landlord" | "vendor" | "system";
   user_id: number | null;
   body: string;
   created_at: string;

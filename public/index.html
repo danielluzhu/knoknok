@@ -28,6 +28,7 @@
         <div class="role-picker">
           <label class="role selected"><input type="radio" name="role" value="tenant" checked /><span><strong>I'm a tenant</strong><small>Report issues in my home</small></span></label>
           <label class="role"><input type="radio" name="role" value="landlord" /><span><strong>I'm a landlord</strong><small>Manage properties and their to-dos</small></span></label>
+          <label class="role"><input type="radio" name="role" value="vendor" /><span><strong>I'm a vendor</strong><small>Pick up maintenance jobs</small></span></label>
         </div>
         <label class="field"><span>Your name</span><input name="displayName" placeholder="Alex Rivera" /></label>
         <div id="tenantFields">
@@ -37,6 +38,10 @@
         <div id="landlordFields" class="hidden">
           <label class="field"><span>Property name <small>optional</small></span><input name="propertyName" placeholder="Maple Court Apartments" /></label>
           <p class="hint">Leave this blank and we'll name it after you for now. You can add more properties once you're in.</p>
+        </div>
+        <div id="vendorFields" class="hidden">
+          <label class="field"><span>Vendor code</span><input name="vendorCode" placeholder="From the landlord, e.g. V-8XQ2M" style="text-transform:uppercase" /></label>
+          <p class="hint">A vendor code is different from the tenant code — ask the landlord for theirs.</p>
         </div>
       </div>
 

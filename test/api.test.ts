@@ -89,6 +89,9 @@ describe("accounts", () => {
     expect(status).toBe(200);
     expect(data.user.role).toBe("landlord");
     expect(data.user.property.joinCode).toMatch(/^[A-Z2-9]{6}$/);
+    // A separate code space for contractors, so handing one out never lets
+    // somebody sign up as a resident.
+    expect(data.user.property.vendorCode).toMatch(/^V-[A-Z2-9]{6}$/);
     joinCode = data.user.property.joinCode;
   });
 
@@ -101,6 +104,7 @@ describe("accounts", () => {
     expect(data.user.unit).toBe("2A");
     // The join code is a building secret — tenants must not receive it.
     expect(data.user.property.joinCode).toBeUndefined();
+    expect(data.user.property.vendorCode).toBeUndefined();
     tenantId = data.user.id;
   });
 
@@ -609,7 +613,7 @@ describe("a landlord with several properties", () => {
     first = data.user.property.id;
   });
 
-  test("adding a property switches to it and gives it its own join code", async () => {
+  test("adding a property switches to it and gives it its own codes", async () => {
     const { status, data } = await owner.post("/api/properties", { name: "Birch House" });
     expect(status).toBe(200);
     expect(data.properties).toHaveLength(2);
@@ -618,7 +622,7 @@ describe("a landlord with several properties", () => {
     expect(added.name).toBe("Birch House");
     second = added.id;
 
-    const codes = data.properties.map((p: any) => p.join_code);
+    const codes = data.properties.flatMap((p: any) => [p.join_code, p.vendor_code]);
     expect(new Set(codes).size).toBe(codes.length); // every code distinct
   });
 
@@ -686,5 +690,169 @@ describe("a landlord with several properties", () => {
     expect(data.chats[0].name).toBe("Perry M");
     expect((await resident.post(`/api/chats/${who.user.id}/messages`,
       { body: "Hello from Birch" })).status).toBe(200);
+  });
+});
+
+describe("vendors", () => {
+  const owner = new Session();
+  const resident = new Session();
+  const ace = new Session();
+  const bolt = new Session();
+  let vendorCode = "";
+  let joinCode = "";
+  let secondCode = "";
+  let jobId = 0;
+  let triageId = 0;
+
+  test("a landlord hands out a vendor code", async () => {
+    const { data } = await owner.post("/api/signup", {
+      role: "landlord", username: uniq("vlord"), password: "password123",
+      displayName: "Vera L", propertyName: "Cedar Flats",
+    });
+    vendorCode = data.user.property.vendorCode;
+    joinCode = data.user.property.joinCode;
+    const extra = await owner.post("/api/properties", { name: "Cedar Annex" });
+    secondCode = extra.data.properties.find((p: any) => p.id === extra.data.activeId).vendor_code;
+    await owner.post(`/api/properties/${data.user.property.id}/select`);
+  });
+
+  test("a vendor signs up with it", async () => {
+    const { status, data } = await ace.post("/api/signup", {
+      role: "vendor", username: uniq("ace"), password: "password123",
+      displayName: "Ace Plumbing", vendorCode: vendorCode.toLowerCase(),
+    });
+    expect(status).toBe(200);
+    expect(data.user.role).toBe("vendor");
+    expect(data.user.property.name).toBe("Cedar Flats");
+    // Codes are for handing out, not for holding.
+    expect(data.user.property.vendorCode).toBeUndefined();
+  });
+
+  test("the tenant code does not open the vendor door", async () => {
+    const { status, data } = await new Session().post("/api/signup", {
+      role: "vendor", username: uniq("wrong"), password: "password123",
+      displayName: "Wrong Code", vendorCode: joinCode,
+    });
+    expect(status).toBe(400);
+    expect(data.error).toContain("No property");
+  });
+
+  test("an escalated request shows up as an open job", async () => {
+    await resident.post("/api/signup", {
+      role: "tenant", username: uniq("cedar"), password: "password123",
+      displayName: "Cass R", joinCode, unit: "5D",
+    });
+    const made = await resident.post("/api/tickets", {
+      title: "Tap drips constantly",
+      description: "The bathroom tap drips all night and the washer looks worn through.",
+    });
+    triageId = made.data.ticket.id;
+
+    // While the bot still has it, it is a private conversation, not a job.
+    expect((await ace.get(`/api/tickets/${triageId}`)).status).toBe(404);
+    expect((await ace.get("/api/tickets?status=all")).data.tickets
+      .some((t: any) => t.id === triageId)).toBe(false);
+
+    await resident.post(`/api/tickets/${triageId}/escalate`);
+    const jobs = (await ace.get("/api/tickets?status=open")).data.tickets;
+    expect(jobs.some((t: any) => t.id === triageId)).toBe(true);
+    jobId = triageId;
+  });
+
+  test("claiming a job takes it, and only one vendor can", async () => {
+    await bolt.post("/api/signup", {
+      role: "vendor", username: uniq("bolt"), password: "password123",
+      displayName: "Bolt Electric", vendorCode,
+    });
+
+    const mine = await ace.post(`/api/tickets/${jobId}/claim`);
+    expect(mine.status).toBe(200);
+    expect(mine.data.ticket.vendor_name).toBe("Ace Plumbing");
+
+    const theirs = await bolt.post(`/api/tickets/${jobId}/claim`);
+    expect(theirs.status).toBe(409);
+    expect(theirs.data.error).toContain("already picked this up");
+  });
+
+  test("'mine' narrows the list to what this vendor holds", async () => {
+    expect((await ace.get("/api/tickets?status=all&assigned=me")).data.tickets)
+      .toHaveLength(1);
+    expect((await bolt.get("/api/tickets?status=all&assigned=me")).data.tickets)
+      .toHaveLength(0);
+  });
+
+  test("releasing puts it back for someone else", async () => {
+    expect((await bolt.post(`/api/tickets/${jobId}/release`)).status).toBe(403);
+    expect((await ace.post(`/api/tickets/${jobId}/release`)).status).toBe(200);
+    expect((await bolt.post(`/api/tickets/${jobId}/claim`)).status).toBe(200);
+    await bolt.post(`/api/tickets/${jobId}/release`);
+    await ace.post(`/api/tickets/${jobId}/claim`);
+  });
+
+  test("the vendor works the job and closes it", async () => {
+    await ace.post(`/api/tickets/${jobId}/messages`, { body: "Replaced the washer, all dry now." });
+    const closed = await ace.post(`/api/tickets/${jobId}/close`, { resolution: "New washer fitted." });
+    expect(closed.status).toBe(200);
+    expect(closed.data.ticket.status).toBe("closed");
+    // The tenant sees the work on their own thread.
+    const seen = await resident.get(`/api/tickets/${jobId}`);
+    expect(seen.data.messages.some((m: any) => m.author === "vendor")).toBe(true);
+  });
+
+  test("one login, several properties", async () => {
+    const joined = await ace.post("/api/properties/join", { vendorCode: secondCode });
+    expect(joined.status).toBe(200);
+    expect(joined.data.user.property.name).toBe("Cedar Annex");
+    expect(joined.data.user.propertyCount).toBe(2);
+    // Cedar Annex has no work, so the list is empty there.
+    expect((await ace.get("/api/tickets?status=all")).data.tickets).toHaveLength(0);
+    expect((await ace.post("/api/properties/join", { vendorCode: secondCode })).status).toBe(400);
+  });
+
+  test("a vendor cannot reach a property they hold no code for", async () => {
+    const stranger = new Session();
+    await stranger.post("/api/signup", {
+      role: "landlord", username: uniq("far"), password: "password123", displayName: "Far F",
+    });
+    const far = (await stranger.get("/api/properties")).data.properties[0].id;
+    const { status } = await ace.post(`/api/properties/${far}/select`);
+    expect(status).toBe(403);
+  });
+
+  test.each([
+    ["the landlord overview", "/api/property", "GET"],
+    ["creating a property", "/api/properties", "POST"],
+    ["opening a request", "/api/tickets", "POST"],
+  ])("a vendor is refused %s", async (_label, path, method) => {
+    const { status } = method === "GET" ? await ace.get(path) : await ace.post(path, { title: "x" });
+    expect(status).toBe(403);
+  });
+
+  test("vendors have no direct-message thread", async () => {
+    expect((await ace.get("/api/chats")).data.chats).toEqual([]);
+  });
+
+  test("a job on another property is simply not there", async () => {
+    // Ace is on Cedar Annex after the join above; the job lives on Cedar Flats.
+    // It 404s rather than 403s, which is the right way round — being told
+    // "not allowed" would confirm the job exists.
+    expect((await ace.post(`/api/tickets/${jobId}/update`, { priority: "urgent" })).status)
+      .toBe(404);
+  });
+
+  test("a vendor cannot re-file a task", async () => {
+    const flats = (await ace.get("/api/properties")).data.properties
+      .find((p: any) => p.name === "Cedar Flats");
+    await ace.post(`/api/properties/${flats.id}/select`);
+    const { status, data } = await ace.post(`/api/tickets/${jobId}/update`, { priority: "urgent" });
+    expect(status).toBe(403);
+    expect(data.error).toContain("Landlords only");
+  });
+
+  test("the landlord sees who is working the property", async () => {
+    const { data } = await owner.get("/api/property");
+    const names = data.vendors.map((v: any) => v.display_name);
+    expect(names).toContain("Ace Plumbing");
+    expect(names).toContain("Bolt Electric");
   });
 });

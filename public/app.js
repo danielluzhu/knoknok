@@ -8,8 +8,8 @@ const state = {
   // per-request ticket threads. Keyed by tenant id on both sides.
   view: "requests", chats: [], chatWith: null, chat: null,
   chatMessages: [], chatLastReadId: 0,
-  // A landlord spans several properties; `properties` is what the header
-  // switcher offers and `me.property` is the one in view.
+  // Landlords and vendors both span several properties; `properties` is what the
+  // header switcher offers and `me.property` is the one in view.
   properties: [],
 };
 
@@ -118,9 +118,10 @@ function wireAuth() {
     input.addEventListener("change", () => {
       document.querySelectorAll(".role").forEach((r) =>
         r.classList.toggle("selected", r.contains(document.querySelector(".role input:checked"))));
-      const landlord = input.value === "landlord" && input.checked;
-      $("#tenantFields").classList.toggle("hidden", landlord);
-      $("#landlordFields").classList.toggle("hidden", !landlord);
+      const role = document.querySelector(".role input:checked")?.value || "tenant";
+      $("#tenantFields").classList.toggle("hidden", role !== "tenant");
+      $("#landlordFields").classList.toggle("hidden", role !== "landlord");
+      $("#vendorFields").classList.toggle("hidden", role !== "vendor");
     });
   });
 
@@ -133,6 +134,7 @@ function wireAuth() {
     try {
       const body = Object.fromEntries(f.entries());
       if (body.joinCode) body.joinCode = body.joinCode.toUpperCase();
+      if (body.vendorCode) body.vendorCode = body.vendorCode.toUpperCase();
       const { user, token } = await api(authMode === "login" ? "/api/login" : "/api/signup", {
         method: "POST", body,
       });
@@ -157,20 +159,23 @@ function enterApp() {
   $("#app").classList.remove("hidden");
 
   // A tenant has one property and no way to change it, so they get plain text
-  // where a landlord gets the switcher.
-  const oneProperty = me.role !== "landlord";
+  // where the other two roles get the switcher.
+  const oneProperty = me.role === "tenant";
   $("#propName").classList.toggle("hidden", !oneProperty);
   $("#propSwitch").classList.toggle("hidden", oneProperty);
   $("#propName").textContent = me.property.name;
+
   $("#whoami").textContent = me.role === "tenant"
     ? `${me.displayName} · Unit ${me.unit}`
-    : `${me.displayName} · landlord`;
+    : `${me.displayName} · ${me.role}`;
   const badge = $("#botBadge");
   badge.textContent = me.botEngine === "claude" ? "bot: claude" : "bot: built-in";
   badge.title = me.botEngine === "claude"
     ? "Triage answered by Claude Opus 5"
     : "Triage answered by the built-in diagnostic script (set ANTHROPIC_API_KEY for Claude)";
 
+  // Vendors do not open work, they pick it up — so there is nothing to add.
+  $("#newBtn").classList.toggle("hidden", me.role === "vendor");
   $("#newBtn").textContent = me.role === "tenant" ? "+ New request" : "+ New to-do";
   state.filter = me.role === "tenant" ? "all" : "open";
   state.view = "requests";
@@ -181,10 +186,10 @@ function enterApp() {
   if (me.role === "landlord") {
     info.classList.remove("hidden");
     loadProperty();
-    loadProperties();
   } else {
     info.classList.add("hidden");
   }
+  if (!oneProperty) loadProperties();
 
   refresh();
   // Fetched even on the requests view, so the Messages badge is right on arrival.
@@ -204,14 +209,19 @@ async function loadProperties() {
 }
 
 function renderPropertySwitch() {
+  const landlord = state.me.role === "landlord";
   $("#propSelect").innerHTML = state.properties
     .map((p) => `<option value="${p.id}"${p.id === state.me.property.id ? " selected" : ""}>${
       esc(p.name)
     }${p.open ? ` (${p.open})` : ""}</option>`)
     .join("") || `<option>${esc(state.me.property.name)}</option>`;
+  $("#propAdd").textContent = landlord ? "+ Property" : "+ Join";
+  $("#propAdd").title = landlord
+    ? "Add another property you manage"
+    : "Join another property with a vendor code";
 }
 
-/** Switch which property the landlord is looking at, and reload everything for it. */
+/** Switch which property this account is looking at, and reload everything for it. */
 async function selectProperty(id) {
   const { user } = await api(`/api/properties/${id}/select`, { method: "POST" });
   state.me = user;
@@ -222,7 +232,7 @@ async function selectProperty(id) {
   state.tenants = [];
   $("#propName").textContent = user.property.name;
   renderPropertySwitch();
-  loadProperty();
+  if (user.role === "landlord") loadProperty();
   renderDetail();
   await refresh(false);
   refreshChats().catch(() => {});
@@ -230,8 +240,9 @@ async function selectProperty(id) {
 
 function wirePropertySwitch() {
   $("#propSelect").addEventListener("change", async (e) => {
+    const id = Number(e.target.value);
     try {
-      await selectProperty(Number(e.target.value));
+      await selectProperty(id);
     } catch (ex) {
       alert(ex.message);
       renderPropertySwitch(); // put the dropdown back where it was
@@ -239,15 +250,30 @@ function wirePropertySwitch() {
   });
 
   $("#propAdd").addEventListener("click", async () => {
-    const name = prompt(
-      "Name the new property (optional — leave blank and we'll name it for you):", "");
-    if (name === null) return; // cancelled
+    const landlord = state.me.role === "landlord";
+    const answer = prompt(
+      landlord
+        ? "Name the new property (optional — leave blank and we'll name it for you):"
+        : "Enter the vendor code for the property you're joining:",
+      "",
+    );
+    if (answer === null) return; // cancelled
+    if (!landlord && !answer.trim()) return;
     try {
-      const { properties, activeId } = await api("/api/properties", {
-        method: "POST", body: { name: name.trim() },
-      });
-      state.properties = properties;
-      await selectProperty(activeId);
+      if (landlord) {
+        const { properties, activeId } = await api("/api/properties", {
+          method: "POST", body: { name: answer.trim() },
+        });
+        state.properties = properties;
+        await selectProperty(activeId);
+      } else {
+        const { user } = await api("/api/properties/join", {
+          method: "POST", body: { vendorCode: answer.trim().toUpperCase() },
+        });
+        state.me = user;
+        await loadProperties();
+        await selectProperty(user.property.id);
+      }
     } catch (ex) {
       alert(ex.message);
     }
@@ -257,7 +283,7 @@ function wirePropertySwitch() {
 /** Landlord-only sidebar footer: workload at a glance, the join code, who's here. */
 async function loadProperty() {
   try {
-    const { tenants, counts } = await api("/api/property");
+    const { tenants, vendors, counts } = await api("/api/property");
     state.tenants = tenants;
     const open = counts.open ?? 0;
     const done = counts.closed ?? 0;
@@ -267,12 +293,21 @@ async function loadProperty() {
         <span><b>${done}</b> done</span>
         <span><b>${tenants.length}</b> tenant${tenants.length === 1 ? "" : "s"}</span>
       </div>
-      Tenants join this property with the code:<br>
+      Tenants join with:<br>
       <span class="code">${esc(state.me.property.joinCode)}</span>
       <div style="margin-top:10px">${
         tenants.length
           ? tenants.map((t) => `${esc(t.display_name)} (${esc(t.unit || "—")})`).join(", ")
           : "No tenants have joined yet."
+      }</div>
+      <div style="margin-top:14px">Vendors join with:<br>
+      <span class="code">${esc(state.me.property.vendorCode || "—")}</span></div>
+      <div style="margin-top:10px">${
+        vendors && vendors.length
+          ? vendors.map((v) =>
+              `${esc(v.display_name)}${v.jobs ? ` (${v.jobs} job${v.jobs === 1 ? "" : "s"})` : ""}`
+            ).join(", ")
+          : "No vendors yet — share the vendor code with a contractor."
       }</div>`;
   } catch {
     /* sidebar extras are optional — never block the list on them */
@@ -281,12 +316,14 @@ async function loadProperty() {
 
 /* --------------------------------------------------------------- messaging */
 
+const REQUESTS_LABEL = { tenant: "Requests", landlord: "To-dos", vendor: "Jobs" };
+
 function renderViews() {
   const unread = state.chats.reduce((n, c) => n + (c.unread || 0), 0);
-  $("#views").innerHTML = [
-    ["requests", state.me.role === "tenant" ? "Requests" : "To-dos", 0],
-    ["messages", "Messages", unread],
-  ]
+  const tabs = [["requests", REQUESTS_LABEL[state.me.role] || "Requests", 0]];
+  // Messaging is a tenant<->landlord channel; a vendor talks on the job itself.
+  if (state.me.role !== "vendor") tabs.push(["messages", "Messages", unread]);
+  $("#views").innerHTML = tabs
     .map(([v, label, n]) =>
       `<button data-v="${v}" class="${state.view === v ? "active" : ""}">${label}${
         n ? `<span class="unread">${n}</span>` : ""
@@ -301,7 +338,7 @@ function setView(view) {
   state.view = view;
   const requests = view === "requests";
   $("#filters").classList.toggle("hidden", !requests);
-  $("#newBtn").classList.toggle("hidden", !requests);
+  $("#newBtn").classList.toggle("hidden", !requests || state.me.role === "vendor");
   renderViews();
   if (requests) {
     state.chatWith = null;
@@ -474,7 +511,9 @@ async function sendChat() {
 function renderFilters() {
   const opts = state.me.role === "tenant"
     ? [["all", "All"], ["triage", "With bot"], ["open", "With landlord"], ["closed", "Closed"]]
-    : [["open", "To-do"], ["closed", "Done"], ["all", "All"]];
+    : state.me.role === "vendor"
+      ? [["open", "Open jobs"], ["mine", "Mine"], ["closed", "Done"]]
+      : [["open", "To-do"], ["closed", "Done"], ["all", "All"]];
   $("#filters").innerHTML = opts
     .map(([v, l]) => `<button data-f="${v}" class="${state.filter === v ? "active" : ""}">${l}</button>`)
     .join("");
@@ -483,7 +522,9 @@ function renderFilters() {
 }
 
 async function refresh(keepSelection = true) {
-  const { tickets } = await api(`/api/tickets?status=${state.filter}`);
+  // "Mine" is not a status — it is every job this vendor has picked up.
+  const query = state.filter === "mine" ? "status=all&assigned=me" : `status=${state.filter}`;
+  const { tickets } = await api(`/api/tickets?${query}`);
   state.tickets = tickets;
   renderList();
   if (keepSelection && state.selected && !tickets.some((t) => t.id === state.selected)) {
@@ -500,7 +541,11 @@ function renderList() {
     list.innerHTML = `<div class="empty">${
       state.me.role === "tenant"
         ? "Nothing here yet.<br>Tap <b>+ New request</b> when something needs fixing."
-        : "Nothing on the list.<br>Tenant requests land here once the assistant escalates them."
+        : state.me.role === "vendor"
+          ? (state.filter === "mine"
+              ? "You haven't picked up any jobs here.<br>Check <b>Open jobs</b> for work going spare."
+              : "No open jobs on this property right now.")
+          : "Nothing on the list.<br>Tenant requests land here once the assistant escalates them."
     }</div>`;
     return;
   }
@@ -509,9 +554,16 @@ function renderList() {
       ? `<span class="pill open">to-do</span>`
       : t.status === "triage" ? `<span class="pill triage">with bot</span>`
       : `<span class="pill closed">closed</span>`;
-    const who = state.me.role === "landlord" && t.tenant_name
+    const who = state.me.role !== "tenant" && t.tenant_name
       ? `${esc(t.tenant_name)}${t.tenant_unit ? " · " + esc(t.tenant_unit) : ""}`
       : CATEGORY_LABEL[t.category] || "Other";
+    // Vendors are choosing what to pick up, so who already has a job is the
+    // single most useful thing on the row.
+    const claim = state.me.role === "vendor" && t.assigned_vendor_id
+      ? `<span class="pill ${t.assigned_vendor_id === state.me.id ? "mine-job" : "taken"}">${
+          t.assigned_vendor_id === state.me.id ? "yours" : esc(t.vendor_name || "taken")
+        }</span>`
+      : "";
     // A tenant's own request vs one their landlord raised with them.
     const fromLandlord = state.me.role === "tenant" && t.creator_role === "landlord";
     const unread = t.unread > 0
@@ -520,7 +572,7 @@ function renderList() {
     return `<div class="row ${state.selected === t.id ? "active" : ""} ${t.unread > 0 ? "has-unread" : ""}" data-id="${t.id}">
       <div class="row-top"><span class="row-title">${esc(t.title)}</span>
         <span class="row-marks">${unread}<span class="dot p-${t.priority}" title="priority: ${t.priority}"></span></span></div>
-      <div class="row-meta">${statusPill}${
+      <div class="row-meta">${statusPill}${claim}${
         fromLandlord ? '<span class="pill from">from landlord</span>' : ""
       }<span>${who}</span><span>${when(t.updated_at)}</span></div>
       <div class="row-snippet">${esc(t.last_message || t.summary)}</div>
@@ -560,25 +612,40 @@ function renderDetail(scroll = true) {
       <p style="font-size:34px;margin:0">🔧</p>
       <p>${state.me.role === "tenant"
         ? "Pick a request, or start a new one.<br>The assistant will try to sort it out before it ever reaches your landlord."
-        : "Pick an item to see the full history — including the tenant's conversation with the assistant."}</p>
+        : state.me.role === "vendor"
+          ? "Pick a job to see what the tenant reported, then claim it if you'll take it on."
+          : "Pick an item to see the full history — including the tenant's conversation with the assistant."}</p>
     </div></div>`;
     return;
   }
   const t = state.ticket;
   const isTenant = state.me.role === "tenant";
+  const isVendor = state.me.role === "vendor";
   const closed = t.status === "closed";
+  const mineToWork = isVendor && t.assigned_vendor_id === state.me.id;
 
   const actions = [];
   if (t.status === "triage" && isTenant) {
     actions.push(`<button class="ghost" id="escalateBtn">Send to landlord now</button>`);
   }
-  if (!closed) actions.push(`<button class="primary small" id="closeBtn">${
-    isTenant ? "Mark as resolved" : "Mark complete"}</button>`);
+  if (isVendor && !closed) {
+    if (mineToWork) {
+      actions.push(`<button class="ghost" id="releaseBtn">Release</button>`);
+    } else if (!t.assigned_vendor_id) {
+      actions.push(`<button class="primary small" id="claimBtn">Pick this up</button>`);
+    }
+  }
+  // A vendor closes work they took on; anyone else closes their own item.
+  if (!closed && (!isVendor || mineToWork)) {
+    actions.push(`<button class="primary small" id="closeBtn">${
+      isTenant ? "Mark as resolved" : "Mark complete"}</button>`);
+  }
   if (closed) actions.push(`<button class="ghost" id="reopenBtn">Reopen</button>`);
 
   // The landlord owns the list, so they can re-file a task inline. The bot's
-  // guess at priority and category is a starting point, not the final word.
-  const canEdit = !isTenant && !closed;
+  // guess at priority and category is a starting point, not the final word — but
+  // it is not a vendor's call either.
+  const canEdit = state.me.role === "landlord" && !closed;
   const meta = canEdit
     ? `<label class="inline-edit">priority
          <select id="prioritySelect">${options(PRIORITY_LABEL, t.priority)}</select></label>
@@ -616,6 +683,11 @@ function renderDetail(scroll = true) {
           : '<span class="pill closed">closed</span>'}
         ${meta}
         ${party}
+        ${t.assigned_vendor_id
+          ? `<span class="pill ${mineToWork ? "mine-job" : "taken"}">${
+              mineToWork ? "yours" : esc(t.vendor_name || "vendor")
+            }</span>`
+          : ""}
         <span>opened ${when(t.created_at)}</span>
       </div>
       ${brief}
@@ -632,6 +704,8 @@ function renderDetail(scroll = true) {
     </div>`}`;
 
   $("#closeBtn")?.addEventListener("click", onClose);
+  $("#claimBtn")?.addEventListener("click", () => act(`/api/tickets/${t.id}/claim`));
+  $("#releaseBtn")?.addEventListener("click", () => act(`/api/tickets/${t.id}/release`));
   $("#reopenBtn")?.addEventListener("click", () => act(`/api/tickets/${t.id}/reopen`));
   $("#escalateBtn")?.addEventListener("click", () => act(`/api/tickets/${t.id}/escalate`));
   $("#prioritySelect")?.addEventListener("change", (e) =>
@@ -675,9 +749,10 @@ function renderThread() {
 }
 
 function renderMessage(m) {
+  const ROLE_FALLBACK = { tenant: "Tenant", landlord: "Landlord", vendor: "Vendor" };
   const label = m.author === "bot" ? "Maintenance assistant"
     : m.author === "system" ? ""
-    : m.author_name || (m.author === "tenant" ? "Tenant" : "Landlord");
+    : m.author_name || ROLE_FALLBACK[m.author] || "";
   // My own messages sit on the right; the other party's on the left.
   const mine = m.author === state.me.role;
   const cls = m.author === "system" ? "system"

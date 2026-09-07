@@ -186,12 +186,6 @@ input, textarea, select { font: inherit; color: inherit; }
   color: color-mix(in oklab, var(--ink-soft) 70%, transparent);
 }
 
-/* "optional" next to a label: present, but clearly secondary to the field name. */
-.field > span small {
-  font-weight: 400; font-size: 12px; text-transform: none;
-  color: color-mix(in oklab, var(--ink-soft) 70%, transparent);
-}
-
 .field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 
 .error { color: var(--urgent); font-size: 14px; margin: 0 0 10px; }
@@ -286,7 +280,7 @@ input, textarea, select { font: inherit; color: inherit; }
   padding-left: 12px; border-left: 1px solid var(--line);
 }
 /* The property switcher sits where the static property name does for a tenant,
-   so the header keeps one shape for both roles. */
+   so the header keeps one shape across all three roles. */
 .prop-switch {
   display: flex; align-items: center; gap: 6px;
   padding-left: 12px; border-left: 1px solid var(--line); min-width: 0;
@@ -418,6 +412,11 @@ input, textarea, select { font: inherit; color: inherit; }
 .pill.closed { background: color-mix(in oklab, var(--ok) 15%, var(--panel)); color: var(--ok); }
 .pill.urgent { background: color-mix(in oklab, var(--urgent) 15%, var(--panel)); color: var(--urgent); }
 .pill.from { background: color-mix(in oklab, var(--violet) 15%, var(--panel)); color: var(--violet); }
+/* Who holds a job. "yours" carries the accent so a vendor can pick their own
+   work out of the list at a glance; "taken" stays quiet — it is a reason to
+   scroll past, not something to draw the eye. */
+.pill.mine-job { background: color-mix(in oklab, var(--accent) 16%, var(--panel)); color: var(--accent); }
+.pill.taken { background: color-mix(in oklab, var(--ink-soft) 12%, var(--panel)); color: var(--ink-soft); }
 
 /* Initials disc. The hue comes from JS as --h, so each person is consistent. */
 .avatar {

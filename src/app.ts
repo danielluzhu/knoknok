@@ -128,25 +128,31 @@ function propertyTenant(user: User, tenantId: number): Promise<User | null> {
 async function visibleTicket(user: User, id: number): Promise<Ticket | null> {
   const t = await db.get<Ticket>(
     `SELECT t.*, u.display_name AS tenant_name, u.unit AS tenant_unit,
-            c.display_name AS creator_name, c.role AS creator_role
+            c.display_name AS creator_name, c.role AS creator_role,
+            v.display_name AS vendor_name
      FROM tickets t
      LEFT JOIN users u ON u.id = t.tenant_id
      LEFT JOIN users c ON c.id = t.created_by
+     LEFT JOIN users v ON v.id = t.assigned_vendor_id
      WHERE t.id = ?`,
     [id],
   );
   if (!t) return null;
   if (t.property_id !== user.property_id) return null;
   if (user.role === "tenant" && t.tenant_id !== user.id) return null;
+  // Triage is the tenant working through it with the bot in private. It is not
+  // work yet, and it is not a contractor's to read.
+  if (user.role === "vendor" && t.status === "triage") return null;
   return t;
 }
 
 /* ------------------------------------------------------------- properties */
 
 /**
- * A landlord runs many buildings, so `users.property_id` is only ever "the one
- * being looked at right now". This answers the real question — is this account
- * allowed to be looking at it — and every property-scoped route leans on it.
+ * A landlord runs many buildings and a vendor works across several, so
+ * `users.property_id` is only ever "the one being looked at right now". These
+ * two answer the real question — is this account allowed to be looking at it —
+ * and every property-scoped route leans on them.
  */
 function landlordOwns(userId: number, propertyId: number) {
   return db.get<{ id: number }>(
@@ -155,13 +161,23 @@ function landlordOwns(userId: number, propertyId: number) {
   );
 }
 
-/** Every property this landlord may switch to, oldest first, with a little context. */
+function vendorWorksOn(userId: number, propertyId: number) {
+  return db.get<{ property_id: number }>(
+    "SELECT property_id FROM property_vendors WHERE vendor_id = ? AND property_id = ?",
+    [userId, propertyId],
+  );
+}
+
+/** Every property this account may switch to, newest last, with a little context. */
 async function propertiesFor(user: User) {
+  const scope = user.role === "landlord"
+    ? "p.landlord_id = $me"
+    : "p.id IN (SELECT property_id FROM property_vendors WHERE vendor_id = $me)";
   return await db.all(
-    `SELECT p.id, p.name, p.join_code,
+    `SELECT p.id, p.name, p.join_code, p.vendor_code,
             (SELECT COUNT(*) FROM users u WHERE u.property_id = p.id AND u.role = 'tenant') AS tenants,
             (SELECT COUNT(*) FROM tickets t WHERE t.property_id = p.id AND t.status = 'open') AS open
-     FROM properties p WHERE p.landlord_id = $me ORDER BY p.id`,
+     FROM properties p WHERE ${scope} ORDER BY p.id`,
     { me: user.id },
   );
 }
@@ -169,18 +185,20 @@ async function propertiesFor(user: User) {
 /** Create a property owned by this landlord, and make it the one they are on. */
 async function createProperty(landlord: User, name: string) {
   const property = (await db.get<{ id: number }>(
-    "INSERT INTO properties (name, join_code, landlord_id) VALUES (?, ?, ?) RETURNING id",
-    [name, await uniqueCode("join_code"), landlord.id],
+    `INSERT INTO properties (name, join_code, vendor_code, landlord_id)
+     VALUES (?, ?, ?, ?) RETURNING id`,
+    [name, await uniqueCode("join_code"), await uniqueCode("vendor_code"), landlord.id],
   ))!;
   await db.run("UPDATE users SET property_id = ? WHERE id = ?", [property.id, landlord.id]);
   return property.id;
 }
 
 async function publicUser(u: User) {
-  const property = (await db.get<{ name: string; join_code: string }>(
-    "SELECT name, join_code FROM properties WHERE id = ?",
+  const property = (await db.get<{ name: string; join_code: string; vendor_code: string | null }>(
+    "SELECT name, join_code, vendor_code FROM properties WHERE id = ?",
     [u.property_id],
   ))!;
+  const landlord = u.role === "landlord";
   return {
     id: u.id,
     username: u.username,
@@ -190,11 +208,13 @@ async function publicUser(u: User) {
     property: {
       id: u.property_id,
       name: property.name,
-      // The join code is a shared secret for the building — landlords only.
-      joinCode: u.role === "landlord" ? property.join_code : undefined,
+      // Both codes are shared secrets for the building — landlords only. They
+      // are what a landlord hands to a tenant or a contractor respectively.
+      joinCode: landlord ? property.join_code : undefined,
+      vendorCode: landlord ? property.vendor_code : undefined,
     },
-    // Only a landlord can span several, so only they need the switcher drawn.
-    propertyCount: u.role === "landlord" ? (await propertiesFor(u)).length : 1,
+    // Only the roles that can span several need the switcher drawn at all.
+    propertyCount: u.role === "tenant" ? 1 : (await propertiesFor(u)).length,
     botEngine: usingClaude ? "claude" : "rules",
   };
 }
@@ -249,7 +269,7 @@ async function handleSignup(req: Request): Promise<Response> {
   const username = String(b.username ?? "").trim();
   const password = String(b.password ?? "");
   const displayName = String(b.displayName ?? "").trim();
-  const role = b.role === "landlord" ? "landlord" : "tenant";
+  const role = b.role === "landlord" || b.role === "vendor" ? b.role : "tenant";
 
   if (!/^[A-Za-z0-9._-]{3,32}$/.test(username)) {
     return fail("Username must be 3-32 characters (letters, numbers, . _ -).");
@@ -265,17 +285,31 @@ async function handleSignup(req: Request): Promise<Response> {
   // A landlord's first property cannot name its owner yet — the user row does
   // not exist until below — so the ownership is stamped on afterwards.
   let claimProperty = false;
+  let joinAsVendor = false;
 
   if (role === "landlord") {
     // Optional at sign-up: a landlord who has not settled on a name yet gets one
     // derived from their own, which reads fine in the header until they say more.
     const propertyName = String(b.propertyName ?? "").trim() || `${displayName}'s property`;
     const res = (await db.get<{ id: number }>(
-      "INSERT INTO properties (name, join_code) VALUES (?, ?) RETURNING id",
-      [propertyName, await uniqueCode("join_code")],
+      `INSERT INTO properties (name, join_code, vendor_code) VALUES (?, ?, ?) RETURNING id`,
+      [propertyName, await uniqueCode("join_code"), await uniqueCode("vendor_code")],
     ))!;
     propertyId = res.id;
     claimProperty = true;
+  } else if (role === "vendor") {
+    const vendorCode = String(b.vendorCode ?? "").trim().toUpperCase();
+    if (!vendorCode) return fail("Enter the vendor code the landlord gave you.");
+    const property = await db.get<{ id: number }>(
+      "SELECT id FROM properties WHERE vendor_code = ?",
+      [vendorCode],
+    );
+    // Deliberately not "that is a tenant code" — the two code spaces are
+    // separate on purpose, and saying which one was typed helps nobody but a
+    // guesser.
+    if (!property) return fail("No property matches that vendor code.");
+    propertyId = property.id;
+    joinAsVendor = true;
   } else {
     const joinCode = String(b.joinCode ?? "").trim().toUpperCase();
     unit = String(b.unit ?? "").trim();
@@ -298,6 +332,12 @@ async function handleSignup(req: Request): Promise<Response> {
 
   if (claimProperty) {
     await db.run("UPDATE properties SET landlord_id = ? WHERE id = ?", [user.id, propertyId]);
+  }
+  if (joinAsVendor) {
+    await db.run(
+      "INSERT INTO property_vendors (property_id, vendor_id) VALUES (?, ?)",
+      [propertyId, user.id],
+    );
   }
 
   const token = await createSession(user.id);
@@ -348,6 +388,11 @@ async function listTickets(user: User, url: URL): Promise<Response> {
     // Triage threads are the tenant's private conversation with the bot until escalated.
     clauses.push("t.status != 'triage'");
   }
+  // Vendors browse the whole open list and claim from it, so "mine" is a filter
+  // over that rather than the only thing they can see.
+  if (user.role === "vendor" && url.searchParams.get("assigned") === "me") {
+    clauses.push("t.assigned_vendor_id = $me");
+  }
   if (status && status !== "all") {
     clauses.push("t.status = $status");
     params.status = status;
@@ -356,6 +401,7 @@ async function listTickets(user: User, url: URL): Promise<Response> {
   const tickets = await db.all(
     `SELECT t.*, u.display_name AS tenant_name, u.unit AS tenant_unit,
             c.display_name AS creator_name, c.role AS creator_role,
+            v.display_name AS vendor_name,
             (SELECT m.body FROM messages m WHERE m.ticket_id = t.id ORDER BY m.id DESC LIMIT 1) AS last_message,
             (SELECT COUNT(*) FROM messages m
                WHERE m.ticket_id = t.id
@@ -366,6 +412,7 @@ async function listTickets(user: User, url: URL): Promise<Response> {
      FROM tickets t
      LEFT JOIN users u ON u.id = t.tenant_id
      LEFT JOIN users c ON c.id = t.created_by
+     LEFT JOIN users v ON v.id = t.assigned_vendor_id
      WHERE ${clauses.join(" AND ")}
      ORDER BY
        CASE t.status WHEN 'open' THEN 0 WHEN 'triage' THEN 1 ELSE 2 END,
@@ -382,6 +429,9 @@ async function createTicket(user: User, req: Request): Promise<Response> {
   const title = String(b?.title ?? "").trim();
   const description = String(b?.description ?? "").trim();
   if (!title) return fail("Give the request a short title.");
+  if (user.role === "vendor") {
+    return fail("Vendors work the list rather than adding to it.", 403);
+  }
 
   if (user.role === "tenant") {
     if (!description) return fail("Describe what is going on so the assistant can help.");
@@ -549,6 +599,43 @@ async function reopenTicket(user: User, ticket: Ticket): Promise<Response> {
   });
 }
 
+/**
+ * Claim a job, or put it back. Vendors see every open job on the property and
+ * take what they will do, so this is the whole assignment mechanism — a landlord
+ * never has to hand work out one piece at a time.
+ */
+async function claimTicket(user: User, ticket: Ticket, claim: boolean): Promise<Response> {
+  if (user.role !== "vendor") return fail("Vendors only.", 403);
+  if (ticket.status !== "open") return fail("Only open jobs can be picked up.");
+
+  if (claim) {
+    if (ticket.assigned_vendor_id === user.id) return fail("You already have this one.");
+    if (ticket.assigned_vendor_id) return fail("Another vendor already picked this up.", 409);
+  } else if (ticket.assigned_vendor_id !== user.id) {
+    return fail("This is not yours to release.", 403);
+  }
+
+  // The WHERE guards against two vendors claiming the same job at once: the
+  // second UPDATE matches nothing, and we say so rather than silently stealing it.
+  const res = await db.run(
+    `UPDATE tickets SET assigned_vendor_id = ?, updated_at = datetime('now')
+     WHERE id = ? AND assigned_vendor_id IS ?`,
+    [claim ? user.id : null, ticket.id, claim ? null : user.id],
+  );
+  if (!res.rowsAffected) return fail("Another vendor already picked this up.", 409);
+
+  await addMessage(
+    ticket.id,
+    "system",
+    claim ? `${user.display_name} picked this up.` : `${user.display_name} released this.`,
+    user.id,
+  );
+  return json({
+    ticket: await visibleTicket(user, ticket.id),
+    messages: await ticketMessages(ticket.id),
+  });
+}
+
 async function changePassword(
   user: User,
   req: Request,
@@ -579,12 +666,22 @@ async function propertyOverview(user: User): Promise<Response> {
      WHERE property_id = ? AND role = 'tenant' ORDER BY unit, display_name`,
     [user.property_id],
   );
+  const vendors = await db.all(
+    `SELECT u.id, u.display_name, u.username,
+            (SELECT COUNT(*) FROM tickets t
+              WHERE t.assigned_vendor_id = u.id AND t.property_id = pv.property_id
+                AND t.status = 'open') AS jobs
+     FROM property_vendors pv JOIN users u ON u.id = pv.vendor_id
+     WHERE pv.property_id = ? ORDER BY u.display_name`,
+    [user.property_id],
+  );
   const counts = await db.all<{ status: string; n: number }>(
     "SELECT status, COUNT(*) AS n FROM tickets WHERE property_id = ? GROUP BY status",
     [user.property_id],
   );
   return json({
     tenants,
+    vendors,
     counts: Object.fromEntries(counts.map((c) => [c.status, c.n])),
   });
 }
@@ -605,13 +702,36 @@ async function addProperty(user: User, req: Request): Promise<Response> {
   return json({ properties: await propertiesFor(user), activeId: id });
 }
 
-/** Move this landlord's cursor to another of their properties. */
+/** Move this account's cursor to another of its properties. */
 async function selectProperty(user: User, propertyId: number): Promise<Response> {
-  if (!(await landlordOwns(user.id, propertyId))) return fail("That property is not yours.", 403);
+  const allowed = user.role === "landlord"
+    ? await landlordOwns(user.id, propertyId)
+    : await vendorWorksOn(user.id, propertyId);
+  if (!allowed) return fail("That property is not yours.", 403);
 
   await db.run("UPDATE users SET property_id = ? WHERE id = ?", [propertyId, user.id]);
   const fresh = (await db.get<User>("SELECT * FROM users WHERE id = ?", [user.id]))!;
   return json({ user: await publicUser(fresh) });
+}
+
+/** Redeem a vendor code for an account that already exists. */
+async function joinPropertyAsVendor(user: User, req: Request): Promise<Response> {
+  const b = (await req.json().catch(() => null)) as Record<string, string> | null;
+  const code = String(b?.vendorCode ?? "").trim().toUpperCase();
+  if (!code) return fail("Enter the vendor code the landlord gave you.");
+
+  const property = await db.get<{ id: number }>(
+    "SELECT id FROM properties WHERE vendor_code = ?",
+    [code],
+  );
+  if (!property) return fail("No property matches that vendor code.");
+  if (await vendorWorksOn(user.id, property.id)) return fail("You are already on that property.");
+
+  await db.run(
+    "INSERT INTO property_vendors (property_id, vendor_id) VALUES (?, ?)",
+    [property.id, user.id],
+  );
+  return await selectProperty(user, property.id);
 }
 
 /* ------------------------------------------------------------------ chats */
@@ -677,6 +797,9 @@ function chatMessages(tenantId: number): Promise<ChatMessage[]> {
  * gets the single row for their landlord.
  */
 async function listChats(user: User): Promise<Response> {
+  // Direct messages are a tenant<->landlord channel. A vendor's conversation
+  // belongs on the ticket, where everyone involved can see it.
+  if (user.role === "vendor") return json({ chats: [] });
   if (user.role === "landlord") {
     const rows = await db.all(
       `SELECT u.id AS id, u.display_name AS name, u.unit AS subtitle,
@@ -788,13 +911,20 @@ async function route(req: Request, url: URL, path: string): Promise<Response> {
   }
 
   if (path === "/api/properties") {
-    if (user.role !== "landlord") return fail("Landlords only.", 403);
+    if (user.role === "tenant") return fail("Tenants belong to one property.", 403);
     if (req.method === "GET") return await listProperties(user);
-    if (req.method === "POST") return await addProperty(user, req);
+    if (req.method === "POST") {
+      if (user.role !== "landlord") return fail("Landlords only.", 403);
+      return await addProperty(user, req);
+    }
+  }
+  if (path === "/api/properties/join" && req.method === "POST") {
+    if (user.role !== "vendor") return fail("Vendors only.", 403);
+    return await joinPropertyAsVendor(user, req);
   }
   const selecting = path.match(/^\/api\/properties\/(\d+)\/select$/);
   if (selecting && req.method === "POST") {
-    if (user.role !== "landlord") return fail("Landlords only.", 403);
+    if (user.role === "tenant") return fail("Tenants belong to one property.", 403);
     return await selectProperty(user, Number(selecting[1]));
   }
   if (path === "/api/password" && req.method === "POST") {
@@ -840,6 +970,8 @@ async function route(req: Request, url: URL, path: string): Promise<Response> {
       }
       if (action === "close") return await closeTicket(user, ticket, req);
       if (action === "reopen") return await reopenTicket(user, ticket);
+      if (action === "claim") return await claimTicket(user, ticket, true);
+      if (action === "release") return await claimTicket(user, ticket, false);
     }
   }
   return fail("Not found.", 404);
