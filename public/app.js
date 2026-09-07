@@ -310,20 +310,28 @@ async function loadProperty() {
 
     // Invite codes belong to one property, so across the portfolio the sidebar
     // shows the breakdown instead and the codes appear once a property is picked.
+    // Each property carries its own pair of codes: the landlord hands these out,
+    // so they belong next to the building they let you into rather than behind a
+    // switch to it.
     const codes = everything
       ? `<div class="prop-breakdown">${
           (properties || []).map((p) => `
-            <button class="prop-line" data-id="${p.id}">
-              <span class="prop-line-name">${esc(p.name)}</span>
-              <span class="prop-line-meta">${p.open || 0} open · ${p.tenants || 0} tenant${
-                p.tenants === 1 ? "" : "s"
-              }</span>
-            </button>`).join("") || "No properties yet."
+            <div class="prop-line">
+              <button class="prop-line-open" data-id="${p.id}" title="Show only this property">
+                <span class="prop-line-name">${esc(p.name)}</span>
+                <span class="prop-line-meta">${p.open || 0} open · ${p.tenants || 0} tenant${
+                  p.tenants === 1 ? "" : "s"
+                }</span>
+              </button>
+              <div class="code-row">
+                ${codeChip("tenants", p.join_code)}${codeChip("vendors", p.vendor_code)}
+              </div>
+            </div>`).join("") || "No properties yet."
         }</div>`
-      : `Tenants join with:<br>
-         <span class="code">${esc(state.me.property.joinCode)}</span>
-         <div style="margin-top:14px">Vendors join with:<br>
-         <span class="code">${esc(state.me.property.vendorCode || "—")}</span></div>`;
+      : `<div class="code-row single">
+           ${codeChip("tenants", state.me.property.joinCode)}
+           ${codeChip("vendors", state.me.property.vendorCode)}
+         </div>`;
 
     $("#landlordInfo").innerHTML = `
       <div class="counts">
@@ -346,11 +354,76 @@ async function loadProperty() {
       }</div>`;
 
     // The breakdown doubles as a way in: clicking a building narrows to it.
-    $("#landlordInfo").querySelectorAll(".prop-line").forEach((b) =>
+    $("#landlordInfo").querySelectorAll(".prop-line-open").forEach((b) =>
       b.addEventListener("click", () => selectProperty(Number(b.dataset.id)).catch(() => {})));
+    wireCodeChips($("#landlordInfo"));
   } catch {
     /* sidebar extras are optional — never block the list on them */
   }
+}
+
+/**
+ * An invite code, as one click-to-copy control.
+ *
+ * These get read aloud, texted, and typed in by hand, so the whole chip is the
+ * copy target rather than a separate little button beside it.
+ */
+function codeChip(who, code) {
+  if (!code) return "";
+  return `<button type="button" class="code-chip" data-code="${esc(code)}"
+    title="Copy the ${who} code">
+      <span class="code-chip-who">${who}</span>
+      <span class="code">${esc(code)}</span>
+      <span class="code-chip-state" aria-hidden="true"></span>
+    </button>`;
+}
+
+/**
+ * Copy, with a fallback: navigator.clipboard needs a secure context, which the
+ * page has over https and on localhost but not if it is opened over plain http
+ * on a LAN address.
+ */
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.setAttribute("readonly", "");
+    area.style.cssText = "position:fixed;top:-1000px;opacity:0";
+    document.body.appendChild(area);
+    area.select();
+    let ok = false;
+    try { ok = document.execCommand("copy"); } catch { ok = false; }
+    area.remove();
+    return ok;
+  }
+}
+
+function wireCodeChips(root) {
+  root.querySelectorAll(".code-chip").forEach((chip) => {
+    chip.addEventListener("click", async (e) => {
+      e.stopPropagation(); // the row behind this one narrows the view
+      const ok = await copyText(chip.dataset.code);
+      chip.classList.toggle("copied", ok);
+      chip.classList.toggle("copy-failed", !ok);
+      const state = chip.querySelector(".code-chip-state");
+      state.textContent = ok ? "copied" : "press ⌘C";
+      if (!ok) {
+        // Nothing was copied, so at least leave it selected to copy by hand.
+        const range = document.createRange();
+        range.selectNodeContents(chip.querySelector(".code"));
+        getSelection().removeAllRanges();
+        getSelection().addRange(range);
+      }
+      clearTimeout(chip._reset);
+      chip._reset = setTimeout(() => {
+        chip.classList.remove("copied", "copy-failed");
+        state.textContent = "";
+      }, 1600);
+    });
+  });
 }
 
 /* --------------------------------------------------------------- messaging */

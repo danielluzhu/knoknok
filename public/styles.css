@@ -293,18 +293,46 @@ input, textarea, select { font: inherit; color: inherit; }
 .prop-switch select:focus { border-color: var(--accent); box-shadow: var(--ring); outline: none; }
 .ghost.tiny { padding: 5px 9px; font-size: 12.5px; white-space: nowrap; }
 
-/* The per-property breakdown in the landlord sidebar: a list that is also a
-   set of shortcuts into each building. */
-.prop-breakdown { display: flex; flex-direction: column; gap: 2px; margin: 4px 0 2px; }
-.prop-line {
+/* The per-property breakdown in the landlord sidebar: each building, what it
+   owes, and the two codes that let people in. */
+.prop-breakdown { display: flex; flex-direction: column; gap: 10px; margin: 4px 0 2px; }
+.prop-line { display: flex; flex-direction: column; gap: 5px; }
+.prop-line-open {
   display: flex; justify-content: space-between; align-items: baseline; gap: 10px;
-  width: 100%; padding: 6px 8px; margin: 0 -8px; border: 0; border-radius: var(--r-sm);
+  width: 100%; padding: 5px 8px; margin: 0 -8px; border: 0; border-radius: var(--r-sm);
   background: none; font: inherit; color: inherit; text-align: left; cursor: pointer;
   transition: background var(--fast);
 }
-.prop-line:hover { background: color-mix(in oklab, var(--accent) 8%, transparent); }
+.prop-line-open:hover { background: color-mix(in oklab, var(--accent) 8%, transparent); }
 .prop-line-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .prop-line-meta { color: var(--ink-soft); font-size: 12px; white-space: nowrap; }
+
+/* Codes are click-to-copy. The whole chip is the target — they are short enough
+   that a separate copy button beside them would be bigger than the thing it
+   copies. The label says who the code is for, since the two look alike. */
+.code-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.code-row.single { margin: 2px 0 4px; }
+.code-chip {
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 3px 8px 3px 9px; border-radius: var(--r-sm);
+  border: 1px solid transparent; background: color-mix(in oklab, var(--ink-soft) 8%, transparent);
+  font: inherit; color: inherit; cursor: pointer; position: relative;
+  transition: background var(--fast), border-color var(--fast);
+}
+.code-chip:hover { background: color-mix(in oklab, var(--accent) 10%, transparent); }
+.code-chip:focus-visible { outline: none; border-color: var(--accent); box-shadow: var(--ring); }
+.code-chip-who {
+  color: var(--ink-soft); font-size: 11px; text-transform: uppercase; letter-spacing: .06em;
+}
+/* Inside a chip the code is the content, not a callout — drop the dashed frame. */
+.code-chip .code {
+  font-size: 13px; letter-spacing: .1em; padding: 0; border: 0; background: none;
+}
+.code-chip-state {
+  color: var(--ok); font-size: 11px; min-width: 0; white-space: nowrap;
+}
+.code-chip.copied { background: color-mix(in oklab, var(--ok) 14%, transparent); }
+.code-chip.copy-failed .code-chip-state { color: var(--ink-soft); }
 
 .topbar-right { display: flex; align-items: center; gap: 10px; }
 .who { font-size: 13.5px; color: var(--ink-soft); }
