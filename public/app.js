@@ -13,6 +13,8 @@ const state = {
   // default) or one property id. `me.property` stays the cursor the server uses
   // when something has to land somewhere specific.
   properties: [], scope: "all",
+  // The landlord's vendor network, for the assignment picker.
+  vendors: [],
 };
 
 /** The `?property=` every scoped request carries. */
@@ -557,6 +559,7 @@ async function loadProperty() {
   try {
     const { tenants, vendors, counts, properties } = await api(`/api/property?${scopeQuery()}`);
     state.tenants = tenants;
+    state.vendors = vendors ?? [];
     if (properties) state.properties = properties;
     const open = counts.open ?? 0;
     const done = counts.closed ?? 0;
@@ -567,6 +570,15 @@ async function loadProperty() {
     // Each property carries its own pair of codes: the landlord hands these out,
     // so they belong next to the building they let you into rather than behind a
     // switch to it.
+    // One code covers the whole portfolio, so it belongs above the per-property
+    // ones rather than buried among them — it is the one usually handed out.
+    const portfolio = state.me.portfolioCode
+      ? `<div class="portfolio-code">
+           <div class="portfolio-code-label">Vendors join everything you manage with:</div>
+           ${codeChip("all properties", state.me.portfolioCode)}
+         </div>`
+      : "";
+
     const codes = everything
       ? `<div class="prop-breakdown">${
           (properties || []).map((p) => `
@@ -593,6 +605,7 @@ async function loadProperty() {
         <span><b>${done}</b> done</span>
         <span><b>${tenants.length}</b> tenant${tenants.length === 1 ? "" : "s"}</span>
       </div>
+      ${portfolio}
       ${codes}
       <div style="margin-top:10px">${
         tenants.length
@@ -604,7 +617,7 @@ async function loadProperty() {
           ? vendors.map((v) =>
               `${esc(v.display_name)}${v.jobs ? ` (${v.jobs} job${v.jobs === 1 ? "" : "s"})` : ""}`
             ).join(", ")
-          : "No vendors yet — share a property's vendor code with a contractor."
+          : "No vendors yet — share a code above with a contractor."
       }</div>`;
 
     // The breakdown doubles as a way in: clicking a building narrows to it.
@@ -1018,6 +1031,24 @@ function renderDetail(scroll = true) {
   }
   if (closed) actions.push(`<button class="ghost" id="reopenBtn">Reopen</button>`);
 
+  // Handing work to a vendor sits with the other things only a landlord decides
+  // about a task, and reads as one line: who is on this.
+  const isLandlord = state.me.role === "landlord";
+  const assignRow = isLandlord && !closed
+    ? `<label class="inline-edit">vendor
+         <select id="assignSelect">
+           <option value="">Nobody yet</option>
+           ${state.vendors.map((v) =>
+             `<option value="${v.id}"${
+               v.id === t.assigned_vendor_id ? " selected" : ""
+             }>${esc(v.display_name)}</option>`).join("")}
+         </select>
+       </label>${
+         state.vendors.length ? "" :
+         '<span class="sla-note">no vendors yet — share a code from the sidebar</span>'
+       }`
+    : "";
+
   // The landlord owns the list, so they can re-file a task inline. The bot's
   // guess at priority and category is a starting point, not the final word — but
   // it is not a vendor's call either.
@@ -1058,6 +1089,7 @@ function renderDetail(scroll = true) {
           : t.status === "triage" ? '<span class="pill triage">with the assistant</span>'
           : '<span class="pill closed">closed</span>'}
         ${meta}
+        ${assignRow}
         ${party}
         ${dueBadge(t)}
         ${t.sla_tier && t.status !== "closed"
@@ -1116,6 +1148,8 @@ function renderDetail(scroll = true) {
     act(`/api/tickets/${t.id}/update`, { priority: e.target.value }));
   $("#categorySelect")?.addEventListener("change", (e) =>
     act(`/api/tickets/${t.id}/update`, { category: e.target.value }));
+  $("#assignSelect")?.addEventListener("change", (e) =>
+    act(`/api/tickets/${t.id}/assign`, { vendorId: e.target.value || null }));
 
   const input = $("#composerInput");
   if (input) {

@@ -853,7 +853,7 @@ describe("vendors", () => {
 
     const theirs = await bolt.post(`/api/tickets/${jobId}/claim`);
     expect(theirs.status).toBe(409);
-    expect(theirs.data.error).toContain("already picked this up");
+    expect(theirs.data.error).toContain("already has this one");
   });
 
   test("'mine' narrows the list to what this vendor holds", async () => {
@@ -1260,5 +1260,112 @@ describe("a vendor without a code", () => {
     });
     expect(status).toBe(400);
     expect(data.error).toContain("No property");
+  });
+});
+
+describe("a landlord's vendor network", () => {
+  const owner = new Session();
+  const ace = new Session();
+  const bolt = new Session();
+  let portfolioCode = "";
+  let aceId = 0;
+  let jobId = 0;
+
+  test("a landlord gets one code covering everything they own", async () => {
+    const { data } = await owner.post("/api/signup", {
+      role: "landlord", username: uniq("net"), password: "password123",
+      displayName: "Net N", propertyName: "First House",
+    });
+    portfolioCode = data.user.portfolioCode;
+    expect(portfolioCode).toMatch(/^VP-[A-Z2-9]{6}$/);
+    // Distinct from the per-property code, so the two cannot be confused.
+    expect(portfolioCode).not.toBe(data.user.property.vendorCode);
+    await owner.post("/api/properties", { name: "Second House" });
+  });
+
+  test("one code lets a vendor see the whole portfolio", async () => {
+    const { status, data } = await ace.post("/api/signup", {
+      role: "vendor", username: uniq("ace"), password: "password123",
+      displayName: "Ace Plumbing", vendorCode: portfolioCode.toLowerCase(),
+    });
+    expect(status).toBe(200);
+    expect(data.user.propertyCount).toBe(2);
+    aceId = data.user.id;
+  });
+
+  test("a property added later is covered without reissuing anything", async () => {
+    await owner.post("/api/properties", { name: "Third House" });
+    const { data } = await ace.get("/api/properties");
+    expect(data.properties.map((p: any) => p.name))
+      .toEqual(["First House", "Second House", "Third House"]);
+  });
+
+  test("the code is a landlord secret, not something vendors receive", async () => {
+    expect((await ace.get("/api/me")).data.user.portfolioCode).toBeUndefined();
+  });
+
+  test("the landlord sees who is in their network", async () => {
+    const { data } = await owner.get("/api/vendors");
+    expect(data.vendors.map((v: any) => v.display_name)).toContain("Ace Plumbing");
+  });
+
+  test("a landlord assigns a job to one of them", async () => {
+    const made = await owner.post("/api/tickets", { title: "Gutter is detached" });
+    jobId = made.data.ticket.id;
+
+    const { status, data } = await owner.post(`/api/tickets/${jobId}/assign`, { vendorId: aceId });
+    expect(status).toBe(200);
+    expect(data.ticket.assigned_vendor_id).toBe(aceId);
+    expect(data.ticket.vendor_name).toBe("Ace Plumbing");
+    expect(data.messages.at(-1).body).toContain("assigned this to Ace Plumbing");
+
+    // It lands on the vendor's own list as theirs.
+    expect((await ace.get("/api/tickets?status=all&assigned=me")).data.tickets)
+      .toHaveLength(1);
+  });
+
+  test("the vendor can hand it back, and then anyone may take it", async () => {
+    const released = await ace.post(`/api/tickets/${jobId}/release`);
+    expect(released.status).toBe(200);
+    expect(released.data.ticket.assigned_vendor_id).toBeNull();
+
+    await bolt.post("/api/signup", {
+      role: "vendor", username: uniq("bolt"), password: "password123",
+      displayName: "Bolt Electric", vendorCode: portfolioCode,
+    });
+    expect((await bolt.post(`/api/tickets/${jobId}/claim`)).status).toBe(200);
+    await bolt.post(`/api/tickets/${jobId}/release`);
+  });
+
+  test("the landlord can unassign", async () => {
+    await owner.post(`/api/tickets/${jobId}/assign`, { vendorId: aceId });
+    const { data } = await owner.post(`/api/tickets/${jobId}/assign`, { vendorId: null });
+    expect(data.ticket.assigned_vendor_id).toBeNull();
+    expect(data.messages.at(-1).body).toContain("unassigned this");
+  });
+
+  test("only a landlord assigns, and only within their own network", async () => {
+    expect((await ace.post(`/api/tickets/${jobId}/assign`, { vendorId: aceId })).status).toBe(403);
+
+    const outsider = new Session();
+    const { data: them } = await outsider.post("/api/signup", {
+      role: "vendor", username: uniq("far"), password: "password123", displayName: "Far F",
+    });
+    const { status, data } = await owner.post(`/api/tickets/${jobId}/assign`, {
+      vendorId: them.user.id,
+    });
+    expect(status).toBe(400);
+    expect(data.error).toContain("not in your network");
+  });
+
+  test("a per-property code still works alongside the portfolio one", async () => {
+    const solo = new Session();
+    const propertyCode = (await owner.get("/api/properties")).data.properties[0].vendor_code;
+    const { data } = await solo.post("/api/signup", {
+      role: "vendor", username: uniq("one"), password: "password123",
+      displayName: "One Property", vendorCode: propertyCode,
+    });
+    // One building, not the portfolio.
+    expect(data.user.propertyCount).toBe(1);
   });
 });

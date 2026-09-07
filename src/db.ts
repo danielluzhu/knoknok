@@ -56,17 +56,31 @@ CREATE TABLE IF NOT EXISTS users (
   display_name  TEXT NOT NULL,
   property_id   INTEGER REFERENCES properties(id),
   unit          TEXT,
+  -- A landlord's portfolio-wide vendor invite: one code that covers everything
+  -- they own, now and later. Null for everyone else.
+  vendor_code   TEXT,
   created_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- Which properties a vendor may work on. A vendor redeems one vendor_code per
--- property, so a contractor working three buildings for the same landlord has
--- three rows and one login.
+-- Which properties a vendor may work on, one row per property code redeemed.
+-- The other route in is landlord_vendors below, which covers a whole portfolio
+-- at once; a vendor's access is the union of the two.
 CREATE TABLE IF NOT EXISTS property_vendors (
   property_id INTEGER NOT NULL REFERENCES properties(id),
   vendor_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   created_at  TEXT NOT NULL DEFAULT (datetime('now')),
   PRIMARY KEY (property_id, vendor_id)
+);
+
+-- A vendor working for a landlord across everything they own. This is the
+-- relationship a landlord actually has with their regular contractors, so it is
+-- recorded against the landlord rather than copied onto each property — which
+-- also means a property added next month is covered without reissuing anything.
+CREATE TABLE IF NOT EXISTS landlord_vendors (
+  landlord_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  vendor_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (landlord_id, vendor_id)
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -175,6 +189,7 @@ CREATE TABLE IF NOT EXISTS chat_reads (
 
 CREATE INDEX IF NOT EXISTS idx_chat_conversation ON chat_messages(tenant_id, id);
 CREATE INDEX IF NOT EXISTS idx_property_vendors_vendor ON property_vendors(vendor_id);
+CREATE INDEX IF NOT EXISTS idx_landlord_vendors_vendor ON landlord_vendors(vendor_id);
 CREATE INDEX IF NOT EXISTS idx_tickets_property ON tickets(property_id, status);
 CREATE INDEX IF NOT EXISTS idx_tickets_tenant   ON tickets(tenant_id, status);
 CREATE INDEX IF NOT EXISTS idx_messages_ticket  ON messages(ticket_id, id);
@@ -304,6 +319,23 @@ async function evolve(): Promise<void> {
     );
   }
 
+  // A landlord's portfolio-wide vendor code.
+  if (!(await tableColumns("users")).has("vendor_code")) {
+    await client.execute("ALTER TABLE users ADD COLUMN vendor_code TEXT");
+  }
+  await client.execute(
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_vendor_code ON users(vendor_code)",
+  );
+  const codeless = await client.execute(
+    "SELECT id FROM users WHERE role = 'landlord' AND vendor_code IS NULL",
+  );
+  for (const row of codeless.rows) {
+    await client.execute({
+      sql: "UPDATE users SET vendor_code = ? WHERE id = ?",
+      args: [await uniqueCode("portfolio_code"), (row as unknown as unknown[])[0] as number],
+    });
+  }
+
   // Response-time targets. Existing requests get one worked out from what they
   // already say, so the list is not split between tickets that have a target and
   // tickets that do not.
@@ -386,20 +418,29 @@ const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
  * two kinds are told apart at a glance, and so a vendor code can never be
  * mistaken for — or collide with — a tenant one.
  */
-export async function uniqueCode(column: "join_code" | "vendor_code"): Promise<string> {
-  const prefix = column === "vendor_code" ? "V-" : "";
+export async function uniqueCode(
+  kind: "join_code" | "vendor_code" | "portfolio_code",
+): Promise<string> {
+  // Distinct prefixes so the three kinds are told apart at a glance, and so a
+  // code of one kind can never be mistaken for — or collide with — another.
+  const shape = {
+    join_code: { prefix: "", from: "properties", column: "join_code" },
+    vendor_code: { prefix: "V-", from: "properties", column: "vendor_code" },
+    portfolio_code: { prefix: "VP-", from: "users", column: "vendor_code" },
+  }[kind];
+
   for (let attempt = 0; attempt < 50; attempt++) {
-    const code = prefix + Array.from(
+    const code = shape.prefix + Array.from(
       { length: 6 },
       () => CODE_ALPHABET[Math.floor(Math.random() * CODE_ALPHABET.length)],
     ).join("");
     const taken = await client.execute({
-      sql: `SELECT 1 FROM properties WHERE ${column} = ?`,
+      sql: `SELECT 1 FROM ${shape.from} WHERE ${shape.column} = ?`,
       args: [code],
     });
     if (!taken.rows.length) return code;
   }
-  throw new Error(`could not allocate a ${column}`);
+  throw new Error(`could not allocate a ${kind}`);
 }
 
 export type Args = Record<string, unknown> | unknown[];
@@ -462,6 +503,8 @@ export interface User {
   display_name: string;
   /** Null only for a vendor who has not been given a property code yet. */
   property_id: number | null;
+  /** A landlord's portfolio-wide vendor invite. Null for other roles. */
+  vendor_code?: string | null;
   unit: string | null;
   created_at: string;
 }
