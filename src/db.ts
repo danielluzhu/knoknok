@@ -19,12 +19,35 @@ const authToken = process.env.TURSO_AUTH_TOKEN?.trim();
 export const isRemote = Boolean(remoteUrl);
 const url = remoteUrl ?? `file:${process.env.DB_PATH ?? "data/knoknok.db"}`;
 
-if (!isRemote) {
-  // A file: URL needs its directory to exist; a Turso URL does not.
-  mkdirSync(dirname(url.replace(/^file:/, "")), { recursive: true });
-}
+/**
+ * The connection, opened on first use rather than at import.
+ *
+ * Both halves of opening a local database — creating its directory and opening
+ * the file — throw on a read-only filesystem. A serverless deployment with no
+ * TURSO_DATABASE_URL set is exactly that case, and doing this work at import
+ * meant the failure took down the module and with it every route, including the
+ * static page, leaving an opaque 500 everywhere for what is a configuration
+ * mistake. Opening lazily keeps the failure inside a request, where it can be
+ * reported as itself.
+ */
+let connection: ReturnType<typeof createClient> | null = null;
 
-export const client = createClient(authToken ? { url, authToken } : { url });
+function client(): ReturnType<typeof createClient> {
+  if (connection) return connection;
+  try {
+    if (!isRemote) mkdirSync(dirname(url.replace(/^file:/, "")), { recursive: true });
+    connection = createClient(authToken ? { url, authToken } : { url });
+    return connection;
+  } catch (err) {
+    if (isRemote) throw err;
+    throw new Error(
+      `Cannot open a local database at "${url.replace(/^file:/, "")}". On a read-only host `
+      + `such as a serverless deployment, set TURSO_DATABASE_URL and TURSO_AUTH_TOKEN to `
+      + `point at a Turso database instead.`,
+      { cause: err },
+    );
+  }
+}
 
 const SCHEMA = `
 -- A landlord owns many properties (landlord_id), and each property carries two
@@ -231,14 +254,20 @@ CREATE INDEX IF NOT EXISTS idx_sessions_user    ON sessions(user_id);
  */
 let migration: Promise<void> | null = null;
 export function migrate(): Promise<void> {
+  // A failed migration must not be cached as the answer for the rest of the
+  // process — a misconfigured instance would then never recover, even once the
+  // configuration was fixed.
   migration ??= (async () => {
     // PRAGMAs are a local-file concern; Turso manages both settings itself.
     if (!isRemote) {
-      await client.executeMultiple("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
+      await client().executeMultiple("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
     }
-    await client.executeMultiple(SCHEMA);
+    await client().executeMultiple(SCHEMA);
     await evolve();
-  })();
+  })().catch((err) => {
+    migration = null;
+    throw err;
+  });
   return migration;
 }
 
@@ -256,10 +285,10 @@ async function evolve(): Promise<void> {
   const properties = await tableColumns("properties");
 
   if (!properties.has("landlord_id")) {
-    await client.execute("ALTER TABLE properties ADD COLUMN landlord_id INTEGER REFERENCES users(id)");
+    await client().execute("ALTER TABLE properties ADD COLUMN landlord_id INTEGER REFERENCES users(id)");
     // Before this column there was exactly one landlord per property, found by
     // pointing the other way — that is the owner.
-    await client.execute(
+    await client().execute(
       `UPDATE properties SET landlord_id = (
          SELECT u.id FROM users u
          WHERE u.property_id = properties.id AND u.role = 'landlord'
@@ -269,16 +298,16 @@ async function evolve(): Promise<void> {
   }
 
   if (!properties.has("vendor_code")) {
-    await client.execute("ALTER TABLE properties ADD COLUMN vendor_code TEXT");
+    await client().execute("ALTER TABLE properties ADD COLUMN vendor_code TEXT");
     // NULLs do not collide in a SQLite unique index, so this is safe to add
     // before the codes below are filled in.
-    await client.execute(
+    await client().execute(
       "CREATE UNIQUE INDEX IF NOT EXISTS idx_properties_vendor_code ON properties(vendor_code)",
     );
   }
 
   if (!(await tableColumns("tickets")).has("assigned_vendor_id")) {
-    await client.execute("ALTER TABLE tickets ADD COLUMN assigned_vendor_id INTEGER REFERENCES users(id)");
+    await client().execute("ALTER TABLE tickets ADD COLUMN assigned_vendor_id INTEGER REFERENCES users(id)");
   }
 
   // A CHECK constraint cannot be altered in place — the table has to be rebuilt.
@@ -312,16 +341,16 @@ async function evolve(): Promise<void> {
        )`,
       "id, ticket_id, author, user_id, body, created_at",
     );
-    await client.execute("CREATE INDEX IF NOT EXISTS idx_messages_ticket ON messages(ticket_id, id)");
+    await client().execute("CREATE INDEX IF NOT EXISTS idx_messages_ticket ON messages(ticket_id, id)");
   }
 
   // Any property still without a vendor code — pre-existing ones, and any the
   // unique index above left NULL — gets one now, so a landlord always has a
   // code to hand out.
-  const pending = await client.execute("SELECT id FROM properties WHERE vendor_code IS NULL");
+  const pending = await client().execute("SELECT id FROM properties WHERE vendor_code IS NULL");
   for (const row of pending.rows) {
     const id = (row as unknown as unknown[])[0];
-    await client.execute({
+    await client().execute({
       sql: "UPDATE properties SET vendor_code = ? WHERE id = ?",
       args: [await uniqueCode("vendor_code"), id as number],
     });
@@ -348,23 +377,23 @@ async function evolve(): Promise<void> {
 
   // A landlord's portfolio-wide vendor code.
   if (!(await tableColumns("users")).has("vendor_code")) {
-    await client.execute("ALTER TABLE users ADD COLUMN vendor_code TEXT");
+    await client().execute("ALTER TABLE users ADD COLUMN vendor_code TEXT");
   }
-  await client.execute(
+  await client().execute(
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_vendor_code ON users(vendor_code)",
   );
-  const codeless = await client.execute(
+  const codeless = await client().execute(
     "SELECT id FROM users WHERE role = 'landlord' AND vendor_code IS NULL",
   );
   for (const row of codeless.rows) {
-    await client.execute({
+    await client().execute({
       sql: "UPDATE users SET vendor_code = ? WHERE id = ?",
       args: [await uniqueCode("portfolio_code"), (row as unknown as unknown[])[0] as number],
     });
   }
 
   if (!(await tableColumns("tickets")).has("recurring_id")) {
-    await client.execute(
+    await client().execute(
       "ALTER TABLE tickets ADD COLUMN recurring_id INTEGER REFERENCES recurring_tasks(id)");
   }
 
@@ -373,10 +402,10 @@ async function evolve(): Promise<void> {
   // tickets that do not.
   const tickets = await tableColumns("tickets");
   if (!tickets.has("sla_tier")) {
-    await client.execute("ALTER TABLE tickets ADD COLUMN sla_tier TEXT");
-    await client.execute("ALTER TABLE tickets ADD COLUMN due_at TEXT");
+    await client().execute("ALTER TABLE tickets ADD COLUMN sla_tier TEXT");
+    await client().execute("ALTER TABLE tickets ADD COLUMN due_at TEXT");
   }
-  const undated = await client.execute(
+  const undated = await client().execute(
     "SELECT id, title, summary, category, priority, created_at FROM tickets WHERE due_at IS NULL",
   );
   const at = (row: unknown, i: number) => (row as unknown as unknown[])[i];
@@ -389,30 +418,30 @@ async function evolve(): Promise<void> {
       text: `${at(row, 1) ?? ""} ${at(row, 2) ?? ""}`,
       at: new Date(createdAt.replace(" ", "T") + "Z"),
     });
-    await client.execute({
+    await client().execute({
       sql: "UPDATE tickets SET sla_tier = ?, due_at = ? WHERE id = ?",
       args: [tier, dueAt(createdAt, tier), id],
     });
   }
 
   // Last, because these index columns only exist once the steps above have run.
-  await client.execute(
+  await client().execute(
     "CREATE INDEX IF NOT EXISTS idx_properties_landlord ON properties(landlord_id)",
   );
-  await client.execute(
+  await client().execute(
     "CREATE INDEX IF NOT EXISTS idx_tickets_due ON tickets(property_id, status, due_at)",
   );
 }
 
 async function tableColumns(table: string): Promise<Set<string>> {
-  const rs = await client.execute(`PRAGMA table_info(${table})`);
+  const rs = await client().execute(`PRAGMA table_info(${table})`);
   const at = rs.columns.indexOf("name");
   return new Set(rs.rows.map((r) => String((r as unknown as unknown[])[at])));
 }
 
 /** The stored CREATE TABLE text, which is how we read a CHECK constraint back. */
 async function tableDdl(table: string): Promise<string> {
-  const rs = await client.execute({
+  const rs = await client().execute({
     sql: "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
     args: [table],
   });
@@ -428,7 +457,7 @@ async function tableDdl(table: string): Promise<string> {
  * the name — which, after the rename, is the new table.
  */
 async function rebuild(table: string, createNext: string, columns: string): Promise<void> {
-  await client.executeMultiple(`
+  await client().executeMultiple(`
     PRAGMA foreign_keys = OFF;
     PRAGMA legacy_alter_table = ON;
     ${createNext};
@@ -466,7 +495,7 @@ export async function uniqueCode(
       { length: 6 },
       () => CODE_ALPHABET[Math.floor(Math.random() * CODE_ALPHABET.length)],
     ).join("");
-    const taken = await client.execute({
+    const taken = await client().execute({
       sql: `SELECT 1 FROM ${shape.from} WHERE ${shape.column} = ?`,
       args: [code],
     });
@@ -497,7 +526,7 @@ function normalize(args?: Args) {
 export const db = {
   async all<T>(sql: string, args?: Args): Promise<T[]> {
     await migrate();
-    const rs = await client.execute({ sql, args: normalize(args) });
+    const rs = await client().execute({ sql, args: normalize(args) });
     return rs.rows.map((row) =>
       Object.fromEntries(rs.columns.map((c, i) => [c, (row as unknown as unknown[])[i]])),
     ) as T[];
@@ -509,7 +538,7 @@ export const db = {
 
   async run(sql: string, args?: Args): Promise<{ rowsAffected: number }> {
     await migrate();
-    const rs = await client.execute({ sql, args: normalize(args) });
+    const rs = await client().execute({ sql, args: normalize(args) });
     return { rowsAffected: rs.rowsAffected };
   },
 };

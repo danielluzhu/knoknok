@@ -1619,7 +1619,13 @@ export async function handleApi(req: Request): Promise<Response | null> {
     return withCors(await route(req, url, path), cors);
   } catch (err) {
     console.error("[api]", req.method, path, err);
-    return withCors(fail("Something went wrong on the server.", 500), cors);
+    // A deployment with no database configured fails every request in the same
+    // way, and "something went wrong" sends whoever set it up looking in the
+    // wrong place. Say which thing is missing.
+    const message = err instanceof Error && /TURSO_DATABASE_URL/.test(err.message)
+      ? err.message
+      : "Something went wrong on the server.";
+    return withCors(fail(message, 500), cors);
   }
 }
 
