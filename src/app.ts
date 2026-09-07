@@ -240,8 +240,9 @@ async function handleSignup(req: Request): Promise<Response> {
   let unit: string | null = null;
 
   if (role === "landlord") {
-    const propertyName = String(b.propertyName ?? "").trim();
-    if (!propertyName) return fail("Please name the property you manage.");
+    // Optional at sign-up: a landlord who has not settled on a name yet gets one
+    // derived from their own, which reads fine in the header until they say more.
+    const propertyName = String(b.propertyName ?? "").trim() || `${displayName}'s property`;
     const res = (await db.get<{ id: number }>(
       "INSERT INTO properties (name, join_code) VALUES (?, ?) RETURNING id",
       [propertyName, await makeJoinCode()],

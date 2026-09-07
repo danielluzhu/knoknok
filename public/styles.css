@@ -180,6 +180,12 @@ input, textarea, select { font: inherit; color: inherit; }
 .field input:focus, .field textarea:focus, .field select:focus {
   border-color: var(--accent); box-shadow: var(--ring);
 }
+/* "optional" next to a label: present, but clearly secondary to the field name. */
+.field > span small {
+  font-weight: 400; font-size: 12px; text-transform: none;
+  color: color-mix(in oklab, var(--ink-soft) 70%, transparent);
+}
+
 .field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 
 .error { color: var(--urgent); font-size: 14px; margin: 0 0 10px; }
