@@ -20,7 +20,7 @@ import {
   sweepExpiredSessions,
   verifyPassword,
 } from "./auth";
-import { db, type ChatMessage, type Message, type Ticket, type User } from "./db";
+import { db, uniqueCode, type ChatMessage, type Message, type Ticket, type User } from "./db";
 import { triage, usingClaude } from "./bot";
 
 /* --------------------------------------------------------------- helpers */
@@ -141,17 +141,39 @@ async function visibleTicket(user: User, id: number): Promise<Ticket | null> {
   return t;
 }
 
-async function makeJoinCode(): Promise<string> {
-  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no I/O/0/1
-  for (let attempt = 0; attempt < 50; attempt++) {
-    const code = Array.from(
-      { length: 6 },
-      () => alphabet[Math.floor(Math.random() * alphabet.length)],
-    ).join("");
-    const taken = await db.get("SELECT 1 AS x FROM properties WHERE join_code = ?", [code]);
-    if (!taken) return code;
-  }
-  throw new Error("could not allocate a join code");
+/* ------------------------------------------------------------- properties */
+
+/**
+ * A landlord runs many buildings, so `users.property_id` is only ever "the one
+ * being looked at right now". This answers the real question — is this account
+ * allowed to be looking at it — and every property-scoped route leans on it.
+ */
+function landlordOwns(userId: number, propertyId: number) {
+  return db.get<{ id: number }>(
+    "SELECT id FROM properties WHERE id = ? AND landlord_id = ?",
+    [propertyId, userId],
+  );
+}
+
+/** Every property this landlord may switch to, oldest first, with a little context. */
+async function propertiesFor(user: User) {
+  return await db.all(
+    `SELECT p.id, p.name, p.join_code,
+            (SELECT COUNT(*) FROM users u WHERE u.property_id = p.id AND u.role = 'tenant') AS tenants,
+            (SELECT COUNT(*) FROM tickets t WHERE t.property_id = p.id AND t.status = 'open') AS open
+     FROM properties p WHERE p.landlord_id = $me ORDER BY p.id`,
+    { me: user.id },
+  );
+}
+
+/** Create a property owned by this landlord, and make it the one they are on. */
+async function createProperty(landlord: User, name: string) {
+  const property = (await db.get<{ id: number }>(
+    "INSERT INTO properties (name, join_code, landlord_id) VALUES (?, ?, ?) RETURNING id",
+    [name, await uniqueCode("join_code"), landlord.id],
+  ))!;
+  await db.run("UPDATE users SET property_id = ? WHERE id = ?", [property.id, landlord.id]);
+  return property.id;
 }
 
 async function publicUser(u: User) {
@@ -171,6 +193,8 @@ async function publicUser(u: User) {
       // The join code is a shared secret for the building — landlords only.
       joinCode: u.role === "landlord" ? property.join_code : undefined,
     },
+    // Only a landlord can span several, so only they need the switcher drawn.
+    propertyCount: u.role === "landlord" ? (await propertiesFor(u)).length : 1,
     botEngine: usingClaude ? "claude" : "rules",
   };
 }
@@ -238,6 +262,9 @@ async function handleSignup(req: Request): Promise<Response> {
 
   let propertyId: number;
   let unit: string | null = null;
+  // A landlord's first property cannot name its owner yet — the user row does
+  // not exist until below — so the ownership is stamped on afterwards.
+  let claimProperty = false;
 
   if (role === "landlord") {
     // Optional at sign-up: a landlord who has not settled on a name yet gets one
@@ -245,9 +272,10 @@ async function handleSignup(req: Request): Promise<Response> {
     const propertyName = String(b.propertyName ?? "").trim() || `${displayName}'s property`;
     const res = (await db.get<{ id: number }>(
       "INSERT INTO properties (name, join_code) VALUES (?, ?) RETURNING id",
-      [propertyName, await makeJoinCode()],
+      [propertyName, await uniqueCode("join_code")],
     ))!;
     propertyId = res.id;
+    claimProperty = true;
   } else {
     const joinCode = String(b.joinCode ?? "").trim().toUpperCase();
     unit = String(b.unit ?? "").trim();
@@ -267,6 +295,10 @@ async function handleSignup(req: Request): Promise<Response> {
      VALUES (?, ?, ?, ?, ?, ?) RETURNING *`,
     [username, hash, role, displayName, propertyId, unit],
   ))!;
+
+  if (claimProperty) {
+    await db.run("UPDATE properties SET landlord_id = ? WHERE id = ?", [user.id, propertyId]);
+  }
 
   const token = await createSession(user.id);
   return json({ user: await publicUser(user), token }, 200, {
@@ -557,6 +589,31 @@ async function propertyOverview(user: User): Promise<Response> {
   });
 }
 
+/* -------------------------------------------------- property-list routes */
+
+async function listProperties(user: User): Promise<Response> {
+  return json({ properties: await propertiesFor(user), activeId: user.property_id });
+}
+
+async function addProperty(user: User, req: Request): Promise<Response> {
+  const b = (await req.json().catch(() => null)) as Record<string, string> | null;
+  // Same rule as sign-up: naming it is optional, and the fallback keeps the
+  // header readable until they pick something.
+  const count = (await propertiesFor(user)).length;
+  const name = String(b?.name ?? "").trim() || `${user.display_name}'s property ${count + 1}`;
+  const id = await createProperty(user, name);
+  return json({ properties: await propertiesFor(user), activeId: id });
+}
+
+/** Move this landlord's cursor to another of their properties. */
+async function selectProperty(user: User, propertyId: number): Promise<Response> {
+  if (!(await landlordOwns(user.id, propertyId))) return fail("That property is not yours.", 403);
+
+  await db.run("UPDATE users SET property_id = ? WHERE id = ?", [propertyId, user.id]);
+  const fresh = (await db.get<User>("SELECT * FROM users WHERE id = ?", [user.id]))!;
+  return json({ user: await publicUser(fresh) });
+}
+
 /* ------------------------------------------------------------------ chats */
 
 /**
@@ -569,8 +626,10 @@ async function propertyOverview(user: User): Promise<Response> {
  * no addressing scheme that could name anybody else.
  */
 function landlordOf(propertyId: number): Promise<User | null> {
+  // Via properties.landlord_id, not users.property_id — a landlord's own
+  // property_id names only the building they happen to be looking at.
   return db.get<User>(
-    "SELECT * FROM users WHERE property_id = ? AND role = 'landlord' ORDER BY id LIMIT 1",
+    "SELECT u.* FROM users u JOIN properties p ON p.landlord_id = u.id WHERE p.id = ?",
     [propertyId],
   );
 }
@@ -726,6 +785,17 @@ async function route(req: Request, url: URL, path: string): Promise<Response> {
   if (path === "/api/property" && req.method === "GET") {
     if (user.role !== "landlord") return fail("Landlords only.", 403);
     return await propertyOverview(user);
+  }
+
+  if (path === "/api/properties") {
+    if (user.role !== "landlord") return fail("Landlords only.", 403);
+    if (req.method === "GET") return await listProperties(user);
+    if (req.method === "POST") return await addProperty(user, req);
+  }
+  const selecting = path.match(/^\/api\/properties\/(\d+)\/select$/);
+  if (selecting && req.method === "POST") {
+    if (user.role !== "landlord") return fail("Landlords only.", 403);
+    return await selectProperty(user, Number(selecting[1]));
   }
   if (path === "/api/password" && req.method === "POST") {
     return await changePassword(user, req, currentToken(req));

@@ -591,3 +591,100 @@ describe("access control", () => {
     }
   });
 });
+
+describe("a landlord with several properties", () => {
+  const owner = new Session();
+  let first = 0;
+  let second = 0;
+
+  test("signing up without naming the property still works", async () => {
+    const { status, data } = await owner.post("/api/signup", {
+      role: "landlord", username: uniq("many"), password: "password123",
+      displayName: "Perry M",
+    });
+    expect(status).toBe(200);
+    // Nothing to name it after but the owner, which still reads as a name.
+    expect(data.user.property.name).toBe("Perry M's property");
+    expect(data.user.propertyCount).toBe(1);
+    first = data.user.property.id;
+  });
+
+  test("adding a property switches to it and gives it its own join code", async () => {
+    const { status, data } = await owner.post("/api/properties", { name: "Birch House" });
+    expect(status).toBe(200);
+    expect(data.properties).toHaveLength(2);
+
+    const added = data.properties.find((p: any) => p.id === data.activeId);
+    expect(added.name).toBe("Birch House");
+    second = added.id;
+
+    const codes = data.properties.map((p: any) => p.join_code);
+    expect(new Set(codes).size).toBe(codes.length); // every code distinct
+  });
+
+  test("the name is optional there too", async () => {
+    const { data } = await owner.post("/api/properties", {});
+    expect(data.properties).toHaveLength(3);
+    const added = data.properties.find((p: any) => p.id === data.activeId);
+    expect(added.name).toContain("Perry M's property");
+  });
+
+  test("switching moves what the landlord sees", async () => {
+    const { data } = await owner.post(`/api/properties/${first}/select`);
+    expect(data.user.property.id).toBe(first);
+    expect(data.user.propertyCount).toBe(3);
+    expect((await owner.get("/api/property")).data.tenants).toEqual([]);
+  });
+
+  test("a property belongs to whoever made it, and nobody else", async () => {
+    const outsider = new Session();
+    await outsider.post("/api/signup", {
+      role: "landlord", username: uniq("nosy"), password: "password123", displayName: "Nosy N",
+    });
+    const { status, data } = await outsider.post(`/api/properties/${second}/select`);
+    expect(status).toBe(403);
+    expect(data.error).toContain("not yours");
+  });
+
+  test("tenants have one property and no switcher", async () => {
+    const { data: joined } = await owner.post(`/api/properties/${second}/select`);
+    const code = (await owner.get("/api/properties")).data.properties
+      .find((p: any) => p.id === joined.user.property.id).join_code;
+
+    const resident = new Session();
+    const { data } = await resident.post("/api/signup", {
+      role: "tenant", username: uniq("res"), password: "password123",
+      displayName: "Rae S", joinCode: code, unit: "1A",
+    });
+    expect(data.user.propertyCount).toBe(1);
+    expect((await resident.get("/api/properties")).status).toBe(403);
+  });
+
+  test("work stays scoped to the property it belongs to", async () => {
+    await owner.post(`/api/properties/${second}/select`);
+    await owner.post("/api/tickets", { title: "Fix the gate at Birch" });
+    expect((await owner.get("/api/tickets?status=open")).data.tickets).toHaveLength(1);
+
+    await owner.post(`/api/properties/${first}/select`);
+    expect((await owner.get("/api/tickets?status=open")).data.tickets).toHaveLength(0);
+  });
+
+  test("a tenant's messages still reach the landlord who owns their property", async () => {
+    // landlordOf() now resolves through properties.landlord_id, so it must not
+    // depend on where the landlord's own cursor happens to be pointing.
+    await owner.post(`/api/properties/${second}/select`);
+    const code = (await owner.get("/api/properties")).data.properties
+      .find((p: any) => p.id === second).join_code;
+    const resident = new Session();
+    const { data: who } = await resident.post("/api/signup", {
+      role: "tenant", username: uniq("chat"), password: "password123",
+      displayName: "Chat C", joinCode: code, unit: "9Z",
+    });
+    await owner.post(`/api/properties/${first}/select`); // landlord looks elsewhere
+    const { data } = await resident.get("/api/chats");
+    expect(data.chats).toHaveLength(1);
+    expect(data.chats[0].name).toBe("Perry M");
+    expect((await resident.post(`/api/chats/${who.user.id}/messages`,
+      { body: "Hello from Birch" })).status).toBe(200);
+  });
+});

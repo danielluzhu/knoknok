@@ -26,13 +26,19 @@ if (!isRemote) {
 export const client = createClient(authToken ? { url, authToken } : { url });
 
 const SCHEMA = `
+-- A landlord owns many properties, tracked by landlord_id. join_code is the
+-- invite a tenant redeems to join one of them.
 CREATE TABLE IF NOT EXISTS properties (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   name        TEXT NOT NULL,
   join_code   TEXT NOT NULL UNIQUE,
+  landlord_id INTEGER REFERENCES users(id),
   created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- property_id is the property this account is *currently looking at*. For a
+-- tenant that is the only one they will ever have; a landlord spans several, so
+-- for them it is a cursor and properties.landlord_id is authoritative.
 CREATE TABLE IF NOT EXISTS users (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   username      TEXT NOT NULL UNIQUE COLLATE NOCASE,
@@ -100,9 +106,9 @@ CREATE TABLE IF NOT EXISTS ticket_reads (
 );
 
 -- Direct messages between a tenant and their landlord, separate from the
--- per-request ticket threads. A property has exactly one landlord (a landlord
--- signup always creates its own property), so a conversation is identified by
--- the tenant alone — tenant_id is the conversation key, not the sender.
+-- per-request ticket threads. A property still has exactly one landlord — its
+-- properties.landlord_id — so a conversation is identified by the tenant alone;
+-- tenant_id is the conversation key, not the sender.
 CREATE TABLE IF NOT EXISTS chat_messages (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   property_id INTEGER NOT NULL REFERENCES properties(id),
@@ -140,8 +146,65 @@ export function migrate(): Promise<void> {
       await client.executeMultiple("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON;");
     }
     await client.executeMultiple(SCHEMA);
+    await evolve();
   })();
   return migration;
+}
+
+/* ------------------------------------------------------- schema evolution */
+
+/**
+ * `CREATE TABLE IF NOT EXISTS` does nothing to a table that already exists, so
+ * a database created before a landlord could hold several properties still has
+ * the old shape. These steps bring it forward and are no-ops once applied.
+ *
+ * Everything here goes through `client` rather than `db`, because `db` awaits
+ * `migrate()` and would deadlock on the migration that is running.
+ */
+async function evolve(): Promise<void> {
+  if (!(await tableColumns("properties")).has("landlord_id")) {
+    await client.execute("ALTER TABLE properties ADD COLUMN landlord_id INTEGER REFERENCES users(id)");
+    // Before this column there was exactly one landlord per property, found by
+    // pointing the other way — that is the owner.
+    await client.execute(
+      `UPDATE properties SET landlord_id = (
+         SELECT u.id FROM users u
+         WHERE u.property_id = properties.id AND u.role = 'landlord'
+         ORDER BY u.id LIMIT 1
+       ) WHERE landlord_id IS NULL`,
+    );
+  }
+  // Last, because the index column only exists once the step above has run.
+  await client.execute(
+    "CREATE INDEX IF NOT EXISTS idx_properties_landlord ON properties(landlord_id)",
+  );
+}
+
+async function tableColumns(table: string): Promise<Set<string>> {
+  const rs = await client.execute(`PRAGMA table_info(${table})`);
+  const at = rs.columns.indexOf("name");
+  return new Set(rs.rows.map((r) => String((r as unknown as unknown[])[at])));
+}
+
+/* ------------------------------------------------------------------ codes */
+
+// No I/O/0/1 — these get read off a screen and typed in by hand.
+const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+/** An invite code no other property is using. */
+export async function uniqueCode(column: "join_code"): Promise<string> {
+  for (let attempt = 0; attempt < 50; attempt++) {
+    const code = Array.from(
+      { length: 6 },
+      () => CODE_ALPHABET[Math.floor(Math.random() * CODE_ALPHABET.length)],
+    ).join("");
+    const taken = await client.execute({
+      sql: `SELECT 1 FROM properties WHERE ${column} = ?`,
+      args: [code],
+    });
+    if (!taken.rows.length) return code;
+  }
+  throw new Error(`could not allocate a ${column}`);
 }
 
 export type Args = Record<string, unknown> | unknown[];
@@ -186,6 +249,14 @@ export const db = {
 export type Role = "tenant" | "landlord";
 export type Status = "triage" | "open" | "closed";
 export type Priority = "low" | "normal" | "high" | "urgent";
+
+export interface Property {
+  id: number;
+  name: string;
+  join_code: string;
+  landlord_id: number | null;
+  created_at: string;
+}
 
 export interface User {
   id: number;

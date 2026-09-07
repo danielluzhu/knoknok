@@ -27,7 +27,7 @@
       <div id="signupOnly" class="hidden">
         <div class="role-picker">
           <label class="role selected"><input type="radio" name="role" value="tenant" checked /><span><strong>I'm a tenant</strong><small>Report issues in my home</small></span></label>
-          <label class="role"><input type="radio" name="role" value="landlord" /><span><strong>I'm a landlord</strong><small>Manage a property's to-dos</small></span></label>
+          <label class="role"><input type="radio" name="role" value="landlord" /><span><strong>I'm a landlord</strong><small>Manage properties and their to-dos</small></span></label>
         </div>
         <label class="field"><span>Your name</span><input name="displayName" placeholder="Alex Rivera" /></label>
         <div id="tenantFields">
@@ -36,7 +36,7 @@
         </div>
         <div id="landlordFields" class="hidden">
           <label class="field"><span>Property name <small>optional</small></span><input name="propertyName" placeholder="Maple Court Apartments" /></label>
-          <p class="hint">Leave this blank and we'll name it after you for now.</p>
+          <p class="hint">Leave this blank and we'll name it after you for now. You can add more properties once you're in.</p>
         </div>
       </div>
 
@@ -52,7 +52,14 @@
 <!-- ----------------------------------------------------------------- app -->
 <div id="app" class="app hidden">
   <header class="topbar">
-    <div class="brand"><span class="logo-sm">knoknok</span><span id="propName" class="prop"></span></div>
+    <div class="brand">
+      <span class="logo-sm">knoknok</span>
+      <span id="propName" class="prop"></span>
+      <div id="propSwitch" class="prop-switch hidden">
+        <select id="propSelect" title="Which property you're looking at"></select>
+        <button id="propAdd" class="ghost tiny">+ Property</button>
+      </div>
+    </div>
     <div class="topbar-right">
       <span id="botBadge" class="badge" title="Which engine is answering triage"></span>
       <span id="whoami" class="who"></span>

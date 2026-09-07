@@ -186,6 +186,12 @@ input, textarea, select { font: inherit; color: inherit; }
   color: color-mix(in oklab, var(--ink-soft) 70%, transparent);
 }
 
+/* "optional" next to a label: present, but clearly secondary to the field name. */
+.field > span small {
+  font-weight: 400; font-size: 12px; text-transform: none;
+  color: color-mix(in oklab, var(--ink-soft) 70%, transparent);
+}
+
 .field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 
 .error { color: var(--urgent); font-size: 14px; margin: 0 0 10px; }
@@ -279,6 +285,20 @@ input, textarea, select { font: inherit; color: inherit; }
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   padding-left: 12px; border-left: 1px solid var(--line);
 }
+/* The property switcher sits where the static property name does for a tenant,
+   so the header keeps one shape for both roles. */
+.prop-switch {
+  display: flex; align-items: center; gap: 6px;
+  padding-left: 12px; border-left: 1px solid var(--line); min-width: 0;
+}
+.prop-switch select {
+  max-width: 220px; padding: 5px 8px; font: inherit; font-size: 13.5px;
+  color: var(--ink); background: var(--panel);
+  border: 1px solid var(--line); border-radius: var(--r-sm);
+}
+.prop-switch select:focus { border-color: var(--accent); box-shadow: var(--ring); outline: none; }
+.ghost.tiny { padding: 5px 9px; font-size: 12.5px; white-space: nowrap; }
+
 .topbar-right { display: flex; align-items: center; gap: 10px; }
 .who { font-size: 13.5px; color: var(--ink-soft); }
 .badge {
@@ -628,6 +648,9 @@ input, textarea, select { font: inherit; color: inherit; }
 @media (max-width: 640px) {
   .topbar { padding: 10px 12px; gap: 8px; }
   .prop, .badge { display: none; }
+  .prop-switch { padding-left: 0; border-left: 0; }
+  .prop-switch select { max-width: 130px; }
+  .ghost.tiny { padding: 5px 7px; }
   .who { font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .topbar .ghost { padding: 6px 10px; font-size: 13px; white-space: nowrap; }
   .topbar-right { gap: 8px; min-width: 0; }

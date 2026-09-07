@@ -8,6 +8,9 @@ const state = {
   // per-request ticket threads. Keyed by tenant id on both sides.
   view: "requests", chats: [], chatWith: null, chat: null,
   chatMessages: [], chatLastReadId: 0,
+  // A landlord spans several properties; `properties` is what the header
+  // switcher offers and `me.property` is the one in view.
+  properties: [],
 };
 
 /**
@@ -152,6 +155,12 @@ function enterApp() {
   const me = state.me;
   $("#auth").classList.add("hidden");
   $("#app").classList.remove("hidden");
+
+  // A tenant has one property and no way to change it, so they get plain text
+  // where a landlord gets the switcher.
+  const oneProperty = me.role !== "landlord";
+  $("#propName").classList.toggle("hidden", !oneProperty);
+  $("#propSwitch").classList.toggle("hidden", oneProperty);
   $("#propName").textContent = me.property.name;
   $("#whoami").textContent = me.role === "tenant"
     ? `${me.displayName} · Unit ${me.unit}`
@@ -172,6 +181,7 @@ function enterApp() {
   if (me.role === "landlord") {
     info.classList.remove("hidden");
     loadProperty();
+    loadProperties();
   } else {
     info.classList.add("hidden");
   }
@@ -179,6 +189,69 @@ function enterApp() {
   refresh();
   // Fetched even on the requests view, so the Messages badge is right on arrival.
   refreshChats().catch(() => {});
+}
+
+/* ------------------------------------------------------------- properties */
+
+async function loadProperties() {
+  try {
+    const { properties } = await api("/api/properties");
+    state.properties = properties;
+    renderPropertySwitch();
+  } catch {
+    /* the switcher is a convenience — never block the app on it */
+  }
+}
+
+function renderPropertySwitch() {
+  $("#propSelect").innerHTML = state.properties
+    .map((p) => `<option value="${p.id}"${p.id === state.me.property.id ? " selected" : ""}>${
+      esc(p.name)
+    }${p.open ? ` (${p.open})` : ""}</option>`)
+    .join("") || `<option>${esc(state.me.property.name)}</option>`;
+}
+
+/** Switch which property the landlord is looking at, and reload everything for it. */
+async function selectProperty(id) {
+  const { user } = await api(`/api/properties/${id}/select`, { method: "POST" });
+  state.me = user;
+  state.selected = null;
+  state.ticket = null;
+  state.chatWith = null;
+  state.chat = null;
+  state.tenants = [];
+  $("#propName").textContent = user.property.name;
+  renderPropertySwitch();
+  loadProperty();
+  renderDetail();
+  await refresh(false);
+  refreshChats().catch(() => {});
+}
+
+function wirePropertySwitch() {
+  $("#propSelect").addEventListener("change", async (e) => {
+    try {
+      await selectProperty(Number(e.target.value));
+    } catch (ex) {
+      alert(ex.message);
+      renderPropertySwitch(); // put the dropdown back where it was
+    }
+  });
+
+  $("#propAdd").addEventListener("click", async () => {
+    const name = prompt(
+      "Name the new property (optional — leave blank and we'll name it for you):", "");
+    if (name === null) return; // cancelled
+    try {
+      const { properties, activeId } = await api("/api/properties", {
+        method: "POST", body: { name: name.trim() },
+      });
+      state.properties = properties;
+      await selectProperty(activeId);
+    } catch (ex) {
+      alert(ex.message);
+    }
+  });
 }
 
 /** Landlord-only sidebar footer: workload at a glance, the join code, who's here. */
@@ -769,6 +842,7 @@ function wireAccount() {
 wireAuth();
 wireModal();
 wireAccount();
+wirePropertySwitch();
 setAuthMode("login");
 
 // A static host cannot serve the API, so if this page is on one and nobody told
