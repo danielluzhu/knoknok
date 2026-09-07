@@ -206,7 +206,18 @@ Or import the repository at [vercel.com/new](https://vercel.com/new) and set the
 environment variables in the project settings. No build command and no output directory are
 needed; the defaults are correct.
 
-**3. Seed it, if you want the demo data**
+**3. Bring your existing data across, if there is any**
+
+```bash
+TURSO_DATABASE_URL=libsql://... TURSO_AUTH_TOKEN=... bun run migrate-data.ts
+```
+
+Copies everything from the local SQLite file into the Turso database, keeping row
+ids so foreign keys, sessions and read markers still line up. It refuses to run
+against a database that already has users unless `FORCE=1` is set, and checks
+every table's count and every foreign key afterwards.
+
+**3b. Or seed it, if you want the demo data instead**
 
 ```bash
 TURSO_DATABASE_URL=libsql://... TURSO_AUTH_TOKEN=... bun run seed
