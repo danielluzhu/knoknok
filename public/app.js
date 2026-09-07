@@ -146,22 +146,53 @@ function dueBadge(ticket) {
  * vendors alike. Rendered from the server's own policy rather than written out
  * here, so the page cannot end up describing rules the app no longer follows.
  */
-let standardsLoaded = false;
-
 async function renderStandards() {
-  if (standardsLoaded) return;
   const list = $("#standardsList");
   try {
-    const { standards } = await api("/api/standards");
-    list.innerHTML = standards.map((s) => `
+    // Always refetched: the counts are live, and a page that quietly went stale
+    // while open would be worse than one that says nothing.
+    const { standards, tracking } = await api(`/api/standards?${scopeQuery()}`);
+    list.innerHTML = standards.map((s) => {
+      const open = tracking?.[s.tier] ?? [];
+      const late = open.filter((t) => t.due_at && dueState(t)?.level === "overdue");
+      return `
       <section class="standard standard-${esc(s.tier)}">
-        <div class="standard-when">${esc(s.label)}</div>
+        <div class="standard-head">
+          <div class="standard-when">${esc(s.label)}</div>
+          ${tracking ? `<div class="standard-tally">${
+            open.length
+              ? `<b>${open.length}</b> open${
+                  late.length ? `<span class="tally-late">${late.length} overdue</span>` : ""
+                }`
+              : "nothing open"
+          }</div>` : ""}
+        </div>
         <p class="standard-summary">${esc(s.summary)}</p>
+        ${open.length ? `<ul class="standard-open">${open.map((t) => {
+          const d = dueState(t);
+          return `<li>
+            <button class="standard-open-row" data-ticket="${t.id}">
+              <span class="standard-open-title">${esc(t.title)}</span>
+              <span class="standard-open-meta">
+                ${d ? `<span class="pill due-${d.level}">${esc(d.text)}</span>` : ""}
+                <span>${esc([t.unit, t.property_name].filter(Boolean).join(" · "))}</span>
+              </span>
+            </button></li>`;
+        }).join("")}</ul>` : ""}
+        <div class="standard-rule">What falls under this:</div>
         <ul class="standard-examples">${
           s.examples.map((e) => `<li>${esc(e)}</li>`).join("")
         }</ul>
-      </section>`).join("");
-    standardsLoaded = true;
+      </section>`;
+    }).join("");
+
+    // The rows are a way in, not just a readout.
+    list.querySelectorAll(".standard-open-row").forEach((b) =>
+      b.addEventListener("click", async () => {
+        showStandards(false);
+        if (state.view !== "requests") setView("requests");
+        await openTicket(Number(b.dataset.ticket)).catch(() => {});
+      }));
   } catch {
     list.innerHTML = '<p class="error">The response times could not be loaded.</p>';
   }

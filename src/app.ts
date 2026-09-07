@@ -1064,6 +1064,49 @@ async function propertyOverview(user: User, url: URL): Promise<Response> {
 }
 
 /**
+ * The reader's own open work, grouped by the target it falls under.
+ *
+ * Scoped exactly as their list is — a tenant sees their own requests, a landlord
+ * the portfolio, a vendor the properties they cover — so the page shows the same
+ * world the rest of the app does rather than a second, wider view of it.
+ */
+async function slaTracking(user: User, url: URL) {
+  const scope = await requestedScope(user, url);
+  if (!scope || !scope.length) return { emergency: [], major: [], standard: [] };
+
+  const clauses = [`t.property_id IN (${scope.map((_, i) => `$p${i}`).join(",")})`,
+                   "t.status != 'closed'"];
+  const params: Record<string, unknown> = {};
+  scope.forEach((id, i) => { params[`p${i}`] = id; });
+
+  if (user.role === "tenant") {
+    clauses.push("t.tenant_id = $me");
+    params.me = user.id;
+  } else if (user.role === "vendor") {
+    // Same rule as their list: triage is not work yet.
+    clauses.push("t.status != 'triage'");
+  }
+
+  const rows = await db.all<{
+    id: number; title: string; status: string; sla_tier: string | null;
+    due_at: string | null; property_name: string; unit: string | null;
+  }>(
+    `SELECT t.id, t.title, t.status, t.sla_tier, t.due_at,
+            p.name AS property_name, u.unit
+     FROM tickets t
+     JOIN properties p ON p.id = t.property_id
+     LEFT JOIN users u ON u.id = t.tenant_id
+     WHERE ${clauses.join(" AND ")}
+     ORDER BY t.due_at ASC`,
+    params,
+  );
+
+  const grouped: Record<string, typeof rows> = { emergency: [], major: [], standard: [] };
+  for (const r of rows) grouped[r.sla_tier ?? "standard"]?.push(r);
+  return grouped;
+}
+
+/**
  * Serve one photo.
  *
  * Access is exactly the thread's access: if you cannot open the ticket you
@@ -1372,13 +1415,17 @@ async function route(req: Request, url: URL, path: string): Promise<Response> {
     return json({ ok: true }, 200, { "set-cookie": clearCookie() });
   }
 
-  // Readable without signing in: it is the policy, not anybody's data, and the
-  // page linking to it should work before as well as after sign-in.
+  const user = await currentUser(req);
+  // The rules are readable without signing in — they are the policy, not
+  // anybody's data. Signed in, the same response also carries the reader's own
+  // open work under each target, which is the thing they actually came to check.
   if (path === "/api/standards" && req.method === "GET") {
-    return json({ standards: SLA_POLICY });
+    return json({
+      standards: SLA_POLICY,
+      tracking: user ? await slaTracking(user, url) : null,
+    });
   }
 
-  const user = await currentUser(req);
   if (path === "/api/me") {
     return user ? json({ user: await publicUser(user) }) : json({ user: null });
   }

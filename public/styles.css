@@ -717,6 +717,37 @@ input, textarea, select { font: inherit; color: inherit; }
 .standard-emergency .standard-when { color: var(--urgent); }
 .standard-major .standard-when { color: var(--high); }
 .standard-standard .standard-when { color: var(--ok); }
+.standard-head {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 12px;
+  flex-wrap: wrap; margin-bottom: 4px;
+}
+.standard-tally { color: var(--ink-soft); font-size: 13px; }
+.standard-tally b { color: var(--ink); }
+.tally-late {
+  margin-left: 8px; color: var(--urgent); font-weight: 600;
+}
+
+/* What is actually open under this target — the reason to look at the page
+   rather than just read it once. */
+.standard-open { list-style: none; margin: 0 0 14px; padding: 0; }
+.standard-open li + li { border-top: 1px solid var(--line); }
+.standard-open-row {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 12px;
+  width: 100%; padding: 8px 10px; margin: 0 -10px; border: 0; border-radius: var(--r-sm);
+  background: none; font: inherit; color: inherit; text-align: left; cursor: pointer;
+  transition: background var(--fast);
+}
+.standard-open-row:hover { background: color-mix(in oklab, var(--accent) 7%, transparent); }
+.standard-open-title { font-weight: 500; min-width: 0; }
+.standard-open-meta {
+  display: flex; align-items: center; gap: 8px;
+  color: var(--ink-soft); font-size: 12.5px; white-space: nowrap;
+}
+.standard-rule {
+  color: var(--ink-soft); font-size: 12px; text-transform: uppercase;
+  letter-spacing: .06em; margin-bottom: 5px;
+}
+
 .standard-summary { margin: 0 0 10px; color: var(--ink); }
 .standard-examples { margin: 0; padding-left: 20px; color: var(--ink-soft); line-height: 1.7; }
 

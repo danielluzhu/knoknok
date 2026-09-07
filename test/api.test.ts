@@ -1369,3 +1369,79 @@ describe("a landlord's vendor network", () => {
     expect(data.user.propertyCount).toBe(1);
   });
 });
+
+describe("the response-times page reflects real work", () => {
+  const owner = new Session();
+  const tenant = new Session();
+  const vendor = new Session();
+
+  test("signed out it is the rules and nothing else", async () => {
+    const res = await fetch(`${BASE}/api/standards`);
+    const body = await res.json() as any;
+    expect(body.standards).toHaveLength(3);
+    expect(body.tracking).toBeNull();
+  });
+
+  test("a landlord sees the portfolio grouped by target", async () => {
+    const { data: lord } = await owner.post("/api/signup", {
+      role: "landlord", username: uniq("track"), password: "password123",
+      displayName: "Track T", propertyName: "Tracking House",
+    });
+    await tenant.post("/api/signup", {
+      role: "tenant", username: uniq("res"), password: "password123",
+      displayName: "Res R", joinCode: lord.user.property.joinCode, unit: "2B",
+    });
+    for (const [title, description] of [
+      ["No water at all", "Nothing comes out of any tap."],
+      ["Oven will not heat", "It stays cold."],
+      ["Loose cupboard hinge", "The door hangs at an angle."],
+    ]) {
+      const made = await tenant.post("/api/tickets", { title, description });
+      await tenant.post(`/api/tickets/${made.data.ticket.id}/escalate`);
+    }
+
+    const { data } = await owner.get("/api/standards");
+    expect(data.tracking.emergency).toHaveLength(1);
+    expect(data.tracking.major).toHaveLength(1);
+    expect(data.tracking.standard).toHaveLength(1);
+    // Enough on each row to act on without opening it.
+    expect(data.tracking.emergency[0].title).toBe("No water at all");
+    expect(data.tracking.emergency[0].property_name).toBe("Tracking House");
+    expect(data.tracking.emergency[0].due_at).toBeTruthy();
+  });
+
+  test("a tenant sees only their own", async () => {
+    const other = new Session();
+    const code = (await owner.get("/api/properties")).data.properties[0].join_code;
+    await other.post("/api/signup", {
+      role: "tenant", username: uniq("other"), password: "password123",
+      displayName: "Other O", joinCode: code, unit: "9Z",
+    });
+    const { data } = await other.get("/api/standards");
+    expect(Object.values(data.tracking).flat()).toHaveLength(0);
+  });
+
+  test("a vendor sees the jobs, never anything still in triage", async () => {
+    const portfolioCode = (await owner.get("/api/me")).data.user.portfolioCode;
+    await vendor.post("/api/signup", {
+      role: "vendor", username: uniq("vend"), password: "password123",
+      displayName: "Vend V", vendorCode: portfolioCode,
+    });
+    await tenant.post("/api/tickets", {
+      title: "Still with the assistant", description: "A brand new thing, not escalated.",
+    });
+
+    const { data } = await vendor.get("/api/standards");
+    const seen = Object.values(data.tracking).flat() as any[];
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.some((t) => t.title === "Still with the assistant")).toBe(false);
+    expect(seen.every((t) => t.status !== "triage")).toBe(true);
+  });
+
+  test("closed work drops off it", async () => {
+    const open = (await owner.get("/api/standards")).data.tracking.standard;
+    await owner.post(`/api/tickets/${open[0].id}/close`, { resolution: "Done." });
+    const after = (await owner.get("/api/standards")).data.tracking.standard;
+    expect(after.some((t: any) => t.id === open[0].id)).toBe(false);
+  });
+});
