@@ -40,6 +40,28 @@ export interface TriageResult {
   engine: "claude" | "rules";
 }
 
+/**
+ * What the tenant already told us by tapping buttons, before the assistant was
+ * involved. Passed in rather than left in the message history so the assistant's
+ * "by your third reply" pacing counts real exchanges, not intake taps.
+ */
+export interface IntakeContext {
+  category: Category;
+  /** The category button they tapped, as written on it. */
+  categoryLabel: string;
+  /** The follow-up button they tapped, as written on it. */
+  severityLabel: string;
+}
+
+/** How the intake is described to the model: as answers already given, not as a verdict. */
+function intakeNote(intake: IntakeContext): string {
+  return `Before this conversation started, the tenant answered two multiple-choice questions. They `
+    + `chose "${intake.categoryLabel}" for the kind of problem, and "${intake.severityLabel}" for `
+    + `what is happening. Take those as given and do not ask them again — start from what they `
+    + `narrow it to. They are the tenant's own reading of the problem, so if what they go on to `
+    + `describe does not fit, trust the description.`;
+}
+
 export const usingClaude = Boolean(process.env.ANTHROPIC_API_KEY);
 
 const SYSTEM_PROMPT = `You are the maintenance triage assistant for a residential property
@@ -115,6 +137,7 @@ normal = should be fixed soon, low = cosmetic or convenience.`;
 async function triageWithClaude(
   title: string,
   history: Message[],
+  intake: IntakeContext | null,
 ): Promise<TriageResult> {
   const [{ default: Anthropic }, { z }, { zodOutputFormat }] = await Promise.all([
     import("@anthropic-ai/sdk"),
@@ -143,7 +166,8 @@ async function triageWithClaude(
   // is non-empty and begins with a user turn.
   messages[0] = {
     role: "user",
-    content: `Request title: ${title}\n\n${messages[0]!.content}`,
+    content: `Request title: ${title}\n\n${messages[0]!.content}`
+      + (intake ? `\n\n${intakeNote(intake)}` : ""),
   };
 
   const response = await client.messages.parse({
@@ -528,15 +552,25 @@ function explain(book: Playbook, opening: string): string {
   ].filter(Boolean).join("\n\n");
 }
 
-function triageWithRules(title: string, history: Message[]): TriageResult {
+function triageWithRules(
+  title: string,
+  history: Message[],
+  intake: IntakeContext | null,
+): TriageResult {
   const tenantTurns = history.filter((m) => m.author === "tenant");
   const botTurns = history.filter((m) => m.author === "bot");
   const latest = norm(tenantTurns.at(-1)?.body ?? "");
   const titleText = norm(title);
-  const all = norm([title, ...tenantTurns.map((m) => m.body)].join(" \n "));
+  const all = norm(
+    [title, intake?.categoryLabel ?? "", intake?.severityLabel ?? "",
+      ...tenantTurns.map((m) => m.body)].join(" \n "),
+  );
 
   const book = pickPlaybook(all, titleText);
-  const category: Category = book?.category ?? "other";
+  // The tenant already told us the category with a button, and that is a better
+  // answer than keyword matching. The playbook still supplies the checks, but it
+  // no longer gets to overrule what they said it was.
+  const category: Category = intake?.category ?? book?.category ?? "other";
   const label = title.trim() || "Maintenance request";
 
   // 1. Emergencies short-circuit everything.
@@ -648,13 +682,17 @@ function triageWithRules(title: string, history: Message[]): TriageResult {
 
 /* ------------------------------------------------------------------ Public */
 
-export async function triage(title: string, history: Message[]): Promise<TriageResult> {
+export async function triage(
+  title: string,
+  history: Message[],
+  intake: IntakeContext | null = null,
+): Promise<TriageResult> {
   if (usingClaude) {
     try {
-      return await triageWithClaude(title, history);
+      return await triageWithClaude(title, history, intake);
     } catch (err) {
       console.error("[bot] Claude triage failed, falling back to rules:", err);
     }
   }
-  return triageWithRules(title, history);
+  return triageWithRules(title, history, intake);
 }

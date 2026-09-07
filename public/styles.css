@@ -586,6 +586,39 @@ input, textarea, select { font: inherit; color: inherit; }
   box-shadow: var(--shadow-sm);
 }
 
+/* The assistant's intake buttons. They sit under the question rather than in a
+   bubble of their own: the question and the ways of answering it are one thing,
+   and a bubble around the answers would read as the assistant talking twice.
+   Wide enough to hit with a thumb, wrapping to as many rows as it takes. */
+.choices {
+  display: flex; flex-wrap: wrap; gap: 8px;
+  max-width: 86%;
+  animation: rise 260ms cubic-bezier(.2, .8, .3, 1) both;
+}
+.choice-btn {
+  padding: 9px 14px;
+  border-radius: var(--r-lg);
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: var(--ink);
+  font: inherit; font-size: 13.5px; font-weight: 500;
+  text-align: left;
+  cursor: pointer;
+  box-shadow: var(--shadow-sm);
+  transition: border-color 120ms, background 120ms, transform 120ms;
+}
+.choice-btn:hover {
+  border-color: color-mix(in oklab, var(--accent) 45%, var(--line));
+  background: color-mix(in oklab, var(--accent) 7%, var(--panel));
+}
+.choice-btn:active { transform: translateY(1px); }
+.choice-btn:focus-visible { border-color: var(--accent); box-shadow: var(--ring); }
+/* The buttons are a shortcut, not a gate — say so quietly, once. */
+.choices-note {
+  font-size: 11.5px; color: var(--ink-faint);
+  margin-top: -7px;
+}
+
 /* Mine sits right; the other party's sits left via .mine-left. */
 .msg.tenant, .msg.landlord { align-self: flex-end; }
 .msg.tenant .who-line, .msg.landlord .who-line { text-align: right; }
@@ -623,6 +656,21 @@ input, textarea, select { font: inherit; color: inherit; }
   background: transparent; box-shadow: none; padding: 2px;
   color: var(--ink-faint); font-size: 12.5px; text-align: center;
 }
+/* Operating text for a statutory emergency. A phone number a tenant is meant to
+   ring right now cannot look like the quiet "sent to the landlord" line it sits
+   next to, so this one keeps the centred placement and drops everything else
+   about the system style. */
+.msg.system.emergency { max-width: 100%; }
+.msg.system.emergency .bubble {
+  background: color-mix(in oklab, var(--accent) 12%, var(--panel));
+  border: 1px solid color-mix(in oklab, var(--accent) 45%, var(--line));
+  color: var(--ink);
+  font-size: 15px; font-weight: 600; letter-spacing: .005em;
+  padding: 12px 18px;
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-sm);
+}
+
 .thinking { color: var(--ink-soft); font-size: 13px; font-style: italic; }
 
 .new-line {
@@ -831,6 +879,8 @@ input, textarea, select { font: inherit; color: inherit; }
   .layout { grid-template-columns: 1fr; grid-template-rows: minmax(0, 40%) minmax(0, 60%); }
   .msg { max-width: 88%; }
   .thread { padding: 18px 16px; }
+  .choices { max-width: 100%; }
+  .choice-btn { flex: 1 1 100%; }
   .detail-head, .composer { padding-left: 16px; padding-right: 16px; }
   .resolution { margin-left: 16px; margin-right: 16px; }
   .field-row { grid-template-columns: 1fr; }

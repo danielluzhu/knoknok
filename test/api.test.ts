@@ -6,6 +6,8 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
+import { readSeverity } from "../src/intake";
+import { isStatutoryEmergency } from "../src/sla";
 
 const PORT = 4399;
 const DB = "data/test-knoknok.db";
@@ -156,6 +158,43 @@ describe("accounts", () => {
   });
 });
 
+/* ------------------------------------------------- what counts as an emergency */
+
+describe("the statutory emergency test", () => {
+  const january = new Date("2026-01-15T12:00:00Z");
+  const july = new Date("2026-07-15T12:00:00Z");
+
+  test("heat being off is an emergency in winter and urgent the rest of the year", () => {
+    expect(readSeverity("sev:hvac:noheat", january)?.severity).toBe("emergency");
+    expect(readSeverity("sev:hvac:noheat", july)?.severity).toBe("escalate");
+    // Either way it is never handed to the assistant to troubleshoot.
+    expect(readSeverity("sev:hvac:noheat", july)?.priority).toBe("urgent");
+  });
+
+  test("the four statutory conditions, and nothing else", () => {
+    for (const text of [
+      "no water in the flat", "no power anywhere", "I can smell gas",
+      "there are sparks from the outlet", "the ceiling is collapsing",
+    ]) {
+      expect(isStatutoryEmergency({ text, at: january })).toBe(true);
+    }
+    // Serious, answered just as fast, but not the statutory list.
+    for (const text of [
+      "the front door will not lock", "the flat was broken into",
+      "the hallway is flooding", "sewage backing up into the bath",
+    ]) {
+      expect(isStatutoryEmergency({ text, at: january })).toBe(false);
+    }
+  });
+
+  test("the wider list still earns the fastest response target", () => {
+    // A home that cannot be secured is answered in 24 hours like a gas leak —
+    // what it does not get is the emergency call-out number.
+    expect(readSeverity("sev:locks:wontlock")?.severity).toBe("escalate");
+    expect(readSeverity("sev:locks:wontlock")?.priority).toBe("urgent");
+  });
+});
+
 /* ------------------------------------------------------------------ triage */
 
 describe("tenant triage", () => {
@@ -166,12 +205,18 @@ describe("tenant triage", () => {
     });
     expect(created.status).toBe(200);
     expect(created.data.ticket.status).toBe("triage");
+    // The assistant does not speak first any more — the intake does.
     expect(created.data.messages.at(-1).author).toBe("bot");
-    expect(created.data.messages.at(-1).body).toContain("GFCI");
+    expect(created.data.messages.at(-1).kind).toBe("intake");
 
-    const done = await tenant.post(`/api/tickets/${created.data.ticket.id}/messages`, {
-      body: "That worked, thanks!",
+    const id = created.data.ticket.id;
+    await tenant.post(`/api/tickets/${id}/messages`, { choice: "cat:electrical" });
+    const diagnosed = await tenant.post(`/api/tickets/${id}/messages`, {
+      choice: "sev:electrical:fitting",
     });
+    expect(diagnosed.data.messages.at(-1).body).toContain("GFCI");
+
+    const done = await tenant.post(`/api/tickets/${id}/messages`, { body: "That worked, thanks!" });
     expect(done.data.ticket.status).toBe("closed");
     expect(done.data.ticket.closed_by).toBe("bot");
   });
@@ -182,6 +227,8 @@ describe("tenant triage", () => {
       description: "The kitchen sink is filling up and draining really slowly",
     });
     const id = data.ticket.id;
+    await tenant.post(`/api/tickets/${id}/messages`, { choice: "cat:plumbing" });
+    await tenant.post(`/api/tickets/${id}/messages`, { choice: "sev:plumbing:drip" });
     await tenant.post(`/api/tickets/${id}/messages`, { body: "Tried the plunger, no luck." });
     const last = await tenant.post(`/api/tickets/${id}/messages`, { body: "Cleared the trap too, still blocked." });
     expect(last.data.ticket.status).toBe("open");
@@ -196,9 +243,132 @@ describe("tenant triage", () => {
       title: "Water pouring from ceiling",
       description: "Water is gushing out of the ceiling and flooding the hallway",
     });
-    expect(data.ticket.status).toBe("open");
-    expect(data.ticket.priority).toBe("urgent");
-    expect(data.messages[1].body).toContain("flooding");
+    const id = data.ticket.id;
+    await tenant.post(`/api/tickets/${id}/messages`, { choice: "cat:plumbing" });
+    const out = await tenant.post(`/api/tickets/${id}/messages`, { choice: "sev:plumbing:burst" });
+    expect(out.data.ticket.status).toBe("open");
+    expect(out.data.ticket.priority).toBe("urgent");
+    const reply = out.data.messages.filter((m: any) => m.author === "bot").at(-1).body;
+    expect(reply).toContain("not something to troubleshoot");
+  });
+
+  test("a statutory emergency hands over the emergency number", async () => {
+    const { data } = await tenant.post("/api/tickets", {
+      title: "No power anywhere", description: "Nothing in the flat has any power.",
+    });
+    const id = data.ticket.id;
+    await tenant.post(`/api/tickets/${id}/messages`, { choice: "cat:electrical" });
+    const out = await tenant.post(`/api/tickets/${id}/messages`, {
+      choice: "sev:electrical:nopower",
+    });
+    expect(out.data.ticket.status).toBe("open");
+    expect(out.data.ticket.priority).toBe("urgent");
+    expect(out.data.ticket.sla_tier).toBe("emergency");
+    const said = out.data.messages.map((m: any) => m.body).join("\n");
+    expect(said).toContain("(510) 396-1242");
+  });
+
+  // The number is for water, power, winter heat, and anything life-threatening.
+  // A lock that will not turn is urgent and goes straight over — but giving out
+  // the emergency line for it is how the line stops being answered promptly.
+  test("something urgent but not statutory escalates without the number", async () => {
+    const { data } = await tenant.post("/api/tickets", {
+      title: "Front door will not lock", description: "The latch spins and will not catch.",
+    });
+    const id = data.ticket.id;
+    await tenant.post(`/api/tickets/${id}/messages`, { choice: "cat:locks" });
+    const out = await tenant.post(`/api/tickets/${id}/messages`, { choice: "sev:locks:wontlock" });
+    expect(out.data.ticket.status).toBe("open");
+    expect(out.data.ticket.priority).toBe("urgent");
+    const said = out.data.messages.map((m: any) => m.body).join("\n");
+    expect(said).not.toContain("396-1242");
+  });
+
+  // "Burst pipe" is wording the response-time rules read as water being off. The
+  // tenant was asked directly and picked something narrower, and their answer is
+  // the better evidence.
+  test("a button answer overrules what the title sounds like", async () => {
+    const { data } = await tenant.post("/api/tickets", {
+      title: "Burst pipe in the wall", description: "Water is spraying from a pipe.",
+    });
+    const id = data.ticket.id;
+    await tenant.post(`/api/tickets/${id}/messages`, { choice: "cat:plumbing" });
+    const out = await tenant.post(`/api/tickets/${id}/messages`, { choice: "sev:plumbing:burst" });
+    expect(out.data.ticket.priority).toBe("urgent");
+    const said = out.data.messages.map((m: any) => m.body).join("\n");
+    expect(said).not.toContain("396-1242");
+  });
+
+  test("the emergency number is given once, not on every reply", async () => {
+    const { data } = await tenant.post("/api/tickets", {
+      title: "No water", description: "No water from any tap in the flat.",
+    });
+    const id = data.ticket.id;
+    await tenant.post(`/api/tickets/${id}/messages`, { choice: "cat:plumbing" });
+    await tenant.post(`/api/tickets/${id}/messages`, { choice: "sev:plumbing:nowater" });
+    const after = await tenant.post(`/api/tickets/${id}/messages`, { body: "Still nothing." });
+    const times = after.data.messages
+      .filter((m: any) => String(m.body).includes("396-1242")).length;
+    expect(times).toBe(1);
+  });
+
+  test("the intake asks a category first, then narrows it", async () => {
+    const { data } = await tenant.post("/api/tickets", {
+      title: "Sink drips", description: "The kitchen tap drips overnight.",
+    });
+    expect(data.ticket.intake_stage).toBe("category");
+    const first = JSON.parse(data.messages.at(-1).choices);
+    expect(first.stage).toBe("category");
+    expect(first.options.map((o: any) => o.value)).toContain("cat:plumbing");
+
+    const picked = await tenant.post(`/api/tickets/${data.ticket.id}/messages`, {
+      choice: "cat:plumbing",
+    });
+    expect(picked.data.ticket.intake_stage).toBe("severity");
+    // Filed under the tenant's own answer before anything else has happened.
+    expect(picked.data.ticket.category).toBe("plumbing");
+    const second = JSON.parse(picked.data.messages.at(-1).choices);
+    expect(second.stage).toBe("severity");
+    expect(second.options.every((o: any) => o.value.startsWith("sev:plumbing:"))).toBe(true);
+  });
+
+  test("typing instead of tapping leaves the buttons behind", async () => {
+    const { data } = await tenant.post("/api/tickets", {
+      title: "Radiator cold", description: "The radiator in the bedroom stays cold.",
+    });
+    const out = await tenant.post(`/api/tickets/${data.ticket.id}/messages`, {
+      body: "It is only the one radiator, the rest are warm.",
+    });
+    expect(out.data.ticket.intake_stage).toBe("done");
+    // The assistant picked it up rather than the intake asking a second question.
+    expect(out.data.messages.at(-1).kind).toBeFalsy();
+  });
+
+  test("a button that was not offered is refused", async () => {
+    const { data } = await tenant.post("/api/tickets", {
+      title: "Window stuck", description: "The bedroom window will not open.",
+    });
+    const id = data.ticket.id;
+    // A severity answer before the category question has been asked.
+    const early = await tenant.post(`/api/tickets/${id}/messages`, {
+      choice: "sev:plumbing:drip",
+    });
+    expect(early.status).toBe(400);
+
+    await tenant.post(`/api/tickets/${id}/messages`, { choice: "cat:structural" });
+    await tenant.post(`/api/tickets/${id}/messages`, { choice: "sev:structural:cracks" });
+    const late = await tenant.post(`/api/tickets/${id}/messages`, { choice: "cat:plumbing" });
+    expect(late.status).toBe(400);
+  });
+
+  test("the intake belongs to the tenant, not the landlord", async () => {
+    const { data } = await tenant.post("/api/tickets", {
+      title: "Hallway light out", description: "The bulb in the hallway does nothing.",
+    });
+    const out = await landlord.post(`/api/tickets/${data.ticket.id}/messages`, {
+      choice: "cat:electrical",
+    });
+    expect(out.status).toBe(403);
   });
 
   test("the tenant can bypass the bot", async () => {
@@ -307,6 +477,8 @@ describe("landlord to-do list", () => {
       title: "Disposal dead", description: "garbage disposal is completely dead, no sound",
     });
     const id = made.data.ticket.id;
+    await tenant.post(`/api/tickets/${id}/messages`, { choice: "cat:appliance" });
+    await tenant.post(`/api/tickets/${id}/messages`, { choice: "sev:appliance:dead" });
     await tenant.post(`/api/tickets/${id}/messages`, { body: "yes that fixed it" });
     const reopened = await tenant.post(`/api/tickets/${id}/reopen`);
     expect(reopened.data.ticket.status).toBe("triage");
@@ -1639,9 +1811,23 @@ describe("triage quality", () => {
   const tenant = new Session();
   let joinCode = "";
 
+  /**
+   * File a request and get the assistant's diagnosis back.
+   *
+   * A new request now opens with the button-led intake, so the assistant does
+   * not speak until that is out of the way. These tests are about what it says
+   * once it does, and about the categorising it does for itself — so they take
+   * the documented way past the buttons, which is to type instead of tapping.
+   * Tapping a category would hand the engine the answer to half of what is
+   * being tested here.
+   */
   const report = async (title: string, description: string) => {
-    const { data } = await tenant.post("/api/tickets", { title, description });
-    const reply = data.messages.find((m: any) => m.author === "bot")?.body ?? "";
+    const { data: created } = await tenant.post("/api/tickets", { title, description });
+    const { data } = await tenant.post(`/api/tickets/${created.ticket.id}/messages`, {
+      body: description,
+    });
+    const reply = [...data.messages].reverse()
+      .find((m: any) => m.author === "bot" && m.kind !== "intake")?.body ?? "";
     return { ticket: data.ticket, reply, id: data.ticket.id };
   };
 

@@ -1352,6 +1352,7 @@ function renderDetail(scroll = true) {
     ${closed && t.resolution ? `<div class="resolution" style="margin-top:14px"><b>Resolved:</b> ${esc(t.resolution)}</div>` : ""}
     <div class="thread" id="thread">${renderThread()}
       ${state.busy ? '<div class="msg bot"><div class="bubble thinking">The assistant is thinking…</div></div>' : ""}
+      ${renderChoices()}
     </div>
     ${closed ? "" : `
     <div class="photo-strip hidden" id="photoStrip"></div>
@@ -1375,6 +1376,8 @@ function renderDetail(scroll = true) {
   // thumbnail size, which is the whole reason for sending it.
   el.querySelectorAll(".shot-wrap").forEach((b) =>
     b.addEventListener("click", () => openPhoto(Number(b.dataset.open))));
+  el.querySelectorAll(".choice-btn").forEach((b) =>
+    b.addEventListener("click", () => choose(b.dataset.choice)));
   $("#photoBtn")?.addEventListener("click", () => $("#photoInput").click());
   $("#photoInput")?.addEventListener("change", async (e) => {
     await stagePhotos(e.target.files, () => renderPhotoStrip($("#photoStrip")));
@@ -1413,6 +1416,67 @@ function renderDetail(scroll = true) {
   if (thread) thread.scrollTop = wasAtBottom ? thread.scrollHeight : prevScroll;
 }
 
+/**
+ * The buttons under the assistant's current question, if it asked one.
+ *
+ * Only the newest prompt is live — earlier ones stay in the thread as the
+ * question-and-answer pair they became, which is what makes the transcript read
+ * back sensibly. Nothing renders once the intake is done, or for anyone but the
+ * tenant whose request it is.
+ */
+function renderChoices() {
+  const t = state.ticket;
+  if (!t || state.busy || state.me.role !== "tenant") return "";
+  if (t.status !== "triage" || t.intake_stage === "done") return "";
+
+  const prompt = [...state.messages].reverse().find((m) => m.author === "bot" && m.choices);
+  if (!prompt) return "";
+  let options;
+  try {
+    options = JSON.parse(prompt.choices).options;
+  } catch {
+    return ""; // unreadable prompt: fall back to the text box, which always works
+  }
+  if (!options?.length) return "";
+
+  return `<div class="choices">${
+    options.map((o) => `<button class="choice-btn" data-choice="${esc(o.value)}">${
+      esc(o.label)}</button>`).join("")
+  }</div>
+  <div class="choices-note">or just describe it below</div>`;
+}
+
+/** Answer the assistant's current question by tapping one of its buttons. */
+async function choose(value) {
+  if (state.busy) return;
+  const option = $(`.choice-btn[data-choice="${CSS.escape(value)}"]`);
+  const label = option?.textContent.trim();
+
+  // Echo the tap straight away and hold the thread busy: picking a category is
+  // one round trip, but picking a severity may run the assistant behind it.
+  if (label) {
+    state.messages.push({ author: "tenant", author_name: state.me.displayName, body: label });
+  }
+  state.busy = true;
+  renderDetail(false);
+
+  try {
+    const res = await api(`/api/tickets/${state.ticket.id}/messages`, {
+      method: "POST", body: { choice: value },
+    });
+    state.ticket = res.ticket;
+    state.messages = res.messages;
+  } catch (ex) {
+    alert(ex.message);
+    // Drop the echo and re-sync, so a refused tap does not leave a phantom answer.
+    if (state.selected) await openTicket(state.selected, false);
+  } finally {
+    state.busy = false;
+    renderDetail(false);
+    refresh();
+  }
+}
+
 /** The thread, with a divider at the point this user last left off. */
 function renderThread() {
   const firstNew = state.messages.find(
@@ -1435,7 +1499,7 @@ function renderMessage(m) {
     : m.author_name || ROLE_FALLBACK[m.author] || "";
   // My own messages sit on the right; the other party's on the left.
   const mine = m.author === state.me.role;
-  const cls = m.author === "system" ? "system"
+  const cls = m.author === "system" ? `system${m.kind === "emergency" ? " emergency" : ""}`
     : m.author === "bot" ? "bot"
     : mine ? m.author : `${m.author} mine-left`;
   return `<div class="msg ${cls}">

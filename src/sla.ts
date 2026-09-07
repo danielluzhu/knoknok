@@ -54,20 +54,39 @@ const matches = (text: string, patterns: RegExp[]) => patterns.some((p) => p.tes
 const DEAD = String.raw`(?:off|out|dead|gone|shut off|cut off|not working|stopped|`
   + String.raw`will not work|does not work|cannot|no longer works?)`;
 
-/** Danger to a person, whatever it is attached to. */
-const LIFE_THREATENING = [
+/**
+ * Danger to life, in the statutory sense — the repair itself is what could hurt
+ * someone. This is the narrow list, and it is the one that decides whether the
+ * tenant is handed the emergency service number.
+ */
+const DANGER_TO_LIFE = [
   /\bgas\b[^.]{0,20}\b(leak|leaking)\b|\bsmell(?:s|ing)?\b[^.]{0,12}\bgas\b/,
   /\bcarbon monoxide\b|\bco alarm\b|\bco detector\b/,
   /\bfire\b|\bsmoke\b(?![^.]{0,10}\balarm (?:battery|chirp)) |\bburning smell\b|\bsmells? (?:of )?burning\b/,
   /\bspark(?:s|ing)\b|\bexposed wir|\blive wire\b|\belectric(?:al)? shock\b|\belectrocut/,
-  /\bflood(?:ed|ing)?\b|\bsewage\b|\bsewer backing\b/,
   /\bcollaps(?:e|ed|ing)\b|\bceiling (?:is )?(?:falling|coming down)\b/,
+  /\basbestos\b|\bblack mold\b/,
+];
+
+/**
+ * Serious, and answered just as fast, but not a danger to life: a home that
+ * cannot be secured, or water where it should not be.
+ *
+ * These earn the 24-hour target and they skip troubleshooting — what they do not
+ * earn is the emergency call-out number, which is reserved for the four
+ * statutory conditions. A line that rings for a stuck window is a line that goes
+ * unanswered for a gas leak.
+ */
+const URGENT_NOT_STATUTORY = [
+  /\bflood(?:ed|ing)?\b|\bsewage\b|\bsewer backing\b/,
   /\bbroke(?:n)? into\b|\bbreak[- ]in\b/,
   // A door that will not lock is a security emergency, not a repair.
   /\b(?:door|window|lock)\b[^.]{0,24}\b(?:cannot|will not|does not|not)\b[^.]{0,8}\block\b/,
   /\bcannot\b[^.]{0,12}\block\b[^.]{0,16}\b(?:door|window|flat|apartment|house)\b/,
-  /\basbestos\b|\bblack mold\b/,
 ];
+
+/** Everything that earns the fastest response target, whatever the reason. */
+const LIFE_THREATENING = [...DANGER_TO_LIFE, ...URGENT_NOT_STATUTORY];
 
 /** A utility that is off, rather than merely misbehaving. */
 const NO_WATER = [
@@ -105,6 +124,35 @@ const MAJOR_PLUMBING = [
  */
 const HEATING_SEASON = new Set([10, 11, 12, 1, 2, 3, 4]);
 
+/** Whether heat being off counts as an emergency on a given date. */
+export function inHeatingSeason(at: Date = new Date()): boolean {
+  return HEATING_SEASON.has(at.getUTCMonth() + 1);
+}
+
+/**
+ * Whether this is an emergency in the strict, statutory sense: water,
+ * electricity, or heating-season heat off, or something life-threatening.
+ *
+ * Kept separate from `slaTier` because the two answer different questions. The
+ * tier is a promise about response time, and a landlord marking something urgent
+ * moves it. This decides whether the tenant is handed the emergency service
+ * number, and nothing but the four conditions below should do that — a line that
+ * rings for a stuck window is a line that goes unanswered for a gas leak.
+ */
+export function isStatutoryEmergency(input: {
+  category?: string | null;
+  text?: string | null;
+  at?: Date;
+}): boolean {
+  const text = normalize(input.text ?? "");
+  const category = String(input.category ?? "other").toLowerCase();
+  if (matches(text, DANGER_TO_LIFE)) return true;
+  if (matches(text, NO_WATER) || matches(text, NO_POWER)) return true;
+  // Heat only counts during the heating season.
+  return inHeatingSeason(input.at ?? new Date())
+    && (matches(text, NO_HEAT) || (category === "hvac" && /\bcold\b|\bfreezing\b/.test(text)));
+}
+
 /**
  * Which target applies. `at` is when the request was raised, which decides
  * whether heat counts as a winter problem.
@@ -117,18 +165,16 @@ export function slaTier(input: {
 }): SlaTier {
   const text = normalize(input.text ?? "");
   const category = String(input.category ?? "other").toLowerCase();
-  const month = (input.at ?? new Date()).getUTCMonth() + 1;
 
   // The bot and the landlord both get a say: something marked urgent is treated
-  // as urgent even when none of the patterns below match.
+  // as urgent even when none of the patterns below match. This is a response
+  // time, not a legal finding — which is why the emergency call-out line is
+  // gated on isStatutoryEmergency below rather than on this tier.
   if (input.priority === "urgent") return "emergency";
+  // The wider list here: a home that cannot be secured gets the same response
+  // time as a gas leak, even though only one of them gets the call-out number.
   if (matches(text, LIFE_THREATENING)) return "emergency";
-  if (matches(text, NO_WATER) || matches(text, NO_POWER)) return "emergency";
-  // Heat only counts as an emergency during the heating season.
-  if (HEATING_SEASON.has(month) &&
-      (matches(text, NO_HEAT) || (category === "hvac" && /\bcold\b|\bfreezing\b/.test(text)))) {
-    return "emergency";
-  }
+  if (isStatutoryEmergency(input)) return "emergency";
   if (matches(text, APPLIANCE) || category === "appliance") return "major";
   if (matches(text, MAJOR_PLUMBING)) return "major";
   return "standard";
