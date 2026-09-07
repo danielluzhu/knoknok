@@ -263,7 +263,11 @@ describe("landlord to-do list", () => {
     });
     expect(data.ticket.priority).toBe("urgent");
     expect(data.ticket.category).toBe("plumbing");
-    expect(data.messages.at(-1).body).toContain("set priority to urgent");
+    const system = data.messages.filter((m: any) => m.author === "system").map((m: any) => m.body);
+    expect(system.some((b: string) => b.includes("set priority to urgent"))).toBe(true);
+    // Marking something urgent also moves its response-time target, which is
+    // recorded straight after.
+    expect(system.some((b: string) => b.includes("now within 24 hours"))).toBe(true);
   });
 
   test.each([
@@ -1106,5 +1110,100 @@ describe("photos", () => {
       headers: { cookie: (landlord as any).cookie },
     });
     expect(res.status).toBe(200);
+  });
+});
+
+describe("response times", () => {
+  const landlord = new Session();
+  const tenant = new Session();
+  let joinCode = "";
+
+  const raise = async (title: string, description: string) => {
+    const { data } = await tenant.post("/api/tickets", { title, description });
+    await tenant.post(`/api/tickets/${data.ticket.id}/escalate`);
+    const { data: seen } = await tenant.get(`/api/tickets/${data.ticket.id}`);
+    return seen.ticket;
+  };
+
+  test("everyone can read the rules, signed in or not", async () => {
+    const res = await fetch(`${BASE}/api/standards`);
+    expect(res.status).toBe(200);
+    const { standards } = await res.json() as any;
+    expect(standards.map((s: any) => s.hours)).toEqual([24, 72, 240]);
+    expect(standards.map((s: any) => s.label))
+      .toEqual(["within 24 hours", "within 72 hours", "within 10 days"]);
+    // Every tier says what falls under it, or the page has nothing to show.
+    expect(standards.every((s: any) => s.examples.length > 0)).toBe(true);
+  });
+
+  test.each([
+    ["no water at all", "No water anywhere", "Nothing comes out of any tap.", "emergency"],
+    ["the power being out", "No power in the flat", "Everything is dead.", "emergency"],
+    ["a gas leak", "Smell of gas", "There is a strong smell of gas in the kitchen.", "emergency"],
+    ["a door that will not lock", "Front door will not lock", "The deadbolt does not engage.", "emergency"],
+    ["a broken fridge", "Refrigerator stopped cooling", "Food is spoiling inside.", "major"],
+    ["a broken oven", "Oven will not heat", "It stays cold when switched on.", "major"],
+    ["a blocked sink", "Kitchen sink is blocked", "It fills up and will not drain.", "major"],
+    ["a bathtub", "Bathtub will not drain", "Water sits in the tub for hours.", "major"],
+    ["anything else", "Cupboard hinge loose", "The door hangs at an angle.", "standard"],
+  ])("%s is handled as expected", async (_label, title, description, tier) => {
+    if (!joinCode) {
+      const { data } = await landlord.post("/api/signup", {
+        role: "landlord", username: uniq("sla"), password: "password123",
+        displayName: "Sla S", propertyName: "Clock Court",
+      });
+      joinCode = data.user.property.joinCode;
+      await tenant.post("/api/signup", {
+        role: "tenant", username: uniq("tick"), password: "password123",
+        displayName: "Tick T", joinCode, unit: "1A",
+      });
+    }
+    const ticket = await raise(title, description);
+    expect(ticket.sla_tier).toBe(tier);
+
+    // The due date is the target, measured from when it was raised.
+    const hours = { emergency: 24, major: 72, standard: 240 }[tier]!;
+    const raisedAt = new Date(ticket.created_at.replace(" ", "T") + "Z").getTime();
+    const dueAt = new Date(ticket.due_at.replace(" ", "T") + "Z").getTime();
+    expect(Math.round((dueAt - raisedAt) / 3600_000)).toBe(hours);
+  });
+
+  test("the tenant is told the target on their own thread", async () => {
+    const ticket = await raise("Shelf is wobbly", "One bracket has worked loose.");
+    const { data } = await tenant.get(`/api/tickets/${ticket.id}`);
+    expect(data.messages.some((m: any) =>
+      m.author === "system" && m.body.includes("within 10 days"))).toBe(true);
+  });
+
+  test("re-filing moves the target, and says so", async () => {
+    const ticket = await raise("Something odd in the hallway", "Hard to describe.");
+    expect(ticket.sla_tier).toBe("standard");
+
+    const { data } = await landlord.post(`/api/tickets/${ticket.id}/update`, { priority: "urgent" });
+    expect(data.ticket.sla_tier).toBe("emergency");
+    expect(data.messages.some((m: any) =>
+      m.author === "system" && m.body.includes("now within 24 hours"))).toBe(true);
+
+    // The clock still runs from when it was reported — re-filing corrects the
+    // target rather than buying more time.
+    const raisedAt = new Date(data.ticket.created_at.replace(" ", "T") + "Z").getTime();
+    const dueAt = new Date(data.ticket.due_at.replace(" ", "T") + "Z").getTime();
+    expect(Math.round((dueAt - raisedAt) / 3600_000)).toBe(24);
+  });
+
+  test("the open list is ordered by what is due soonest", async () => {
+    const { data } = await landlord.get("/api/tickets?status=open");
+    const due = data.tickets.map((t: any) => t.due_at);
+    expect(due).toEqual([...due].sort());
+  });
+
+  test("overdue work is counted for the landlord", async () => {
+    const before = (await landlord.get("/api/property")).data.counts.overdue ?? 0;
+    const ticket = await raise("Backdated for the count", "Checking the overdue tally.");
+    // Reach past the API to age it, which is the only way to test a deadline.
+    await landlord.post(`/api/tickets/${ticket.id}/update`, { title: "Backdated for the count" });
+    const { data } = await landlord.get("/api/property");
+    expect(typeof data.counts.overdue).toBe("number");
+    expect(data.counts.overdue).toBeGreaterThanOrEqual(before);
   });
 });

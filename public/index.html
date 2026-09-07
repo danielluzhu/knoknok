@@ -66,6 +66,7 @@
       </div>
     </div>
     <div class="topbar-right">
+      <button id="standardsBtn" class="ghost">Response times</button>
       <span id="botBadge" class="badge" title="Which engine is answering triage"></span>
       <span id="whoami" class="who"></span>
       <button id="accountBtn" class="ghost">Account</button>
@@ -132,6 +133,28 @@
       </div>
     </form>
   </div>
+</div>
+
+<!-- ------------------------------------------------------ response times -->
+<div id="standards" class="page hidden">
+  <header class="topbar">
+    <div class="brand"><span class="logo-sm">knoknok</span><span class="prop">Response times</span></div>
+    <div class="topbar-right"><button id="standardsBack" class="ghost">Back</button></div>
+  </header>
+  <main class="page-body">
+    <h1 class="page-title">How quickly repairs get dealt with</h1>
+    <p class="page-lede">
+      Every maintenance request falls under one of three targets. The clock starts
+      when the request is raised — not when it reaches the landlord — so time spent
+      working through it with the assistant counts.
+    </p>
+    <div id="standardsList" class="standards"></div>
+    <p class="page-note">
+      A request's target is worked out from what it says and how it is filed. If a
+      landlord re-files a request, its target is recalculated and the change is
+      recorded on the request's own thread.
+    </p>
+  </main>
 </div>
 
 <!-- --------------------------------------------------------- photo viewer -->

@@ -22,6 +22,7 @@ import {
 } from "./auth";
 import { db, uniqueCode, type ChatMessage, type Message, type Ticket, type User } from "./db";
 import { triage, usingClaude } from "./bot";
+import { dueAt, slaTier, SLA_LABEL, SLA_POLICY } from "./sla";
 
 /* --------------------------------------------------------------- helpers */
 
@@ -69,6 +70,42 @@ const CATEGORIES = new Set([
   "structural", "locks_security", "common_area", "other",
 ]);
 const PRIORITIES = new Set(["low", "normal", "high", "urgent"]);
+
+/* -------------------------------------------------------- response times */
+
+/**
+ * Work out a ticket's response-time target from what it says, and store it.
+ *
+ * Called when a request is raised and again whenever the landlord re-files it —
+ * moving something into `appliance`, or marking it urgent, changes what it is
+ * promised. The clock still runs from when the tenant reported it, so re-filing
+ * corrects the target without quietly buying more time.
+ */
+async function applySla(ticketId: number) {
+  const t = await db.get<{
+    title: string; summary: string; category: string; priority: string; created_at: string;
+  }>("SELECT title, summary, category, priority, created_at FROM tickets WHERE id = ?", [ticketId]);
+  if (!t) return null;
+
+  const tier = slaTier({
+    category: t.category,
+    priority: t.priority,
+    text: `${t.title} ${t.summary}`,
+    at: new Date(t.created_at.replace(" ", "T") + "Z"),
+  });
+  const due = dueAt(t.created_at, tier);
+  await db.run("UPDATE tickets SET sla_tier = ?, due_at = ? WHERE id = ?", [tier, due, ticketId]);
+  return { tier, due };
+}
+
+/** Put the target on the thread, so the tenant is told rather than left guessing. */
+async function noteResponseTime(ticketId: number) {
+  const row = await db.get<{ sla_tier: keyof typeof SLA_LABEL | null }>(
+    "SELECT sla_tier FROM tickets WHERE id = ?", [ticketId]);
+  const tier = row?.sla_tier;
+  if (!tier || !SLA_LABEL[tier]) return;
+  await addMessage(ticketId, "system", `Response time for this: ${SLA_LABEL[tier]}.`);
+}
 
 /* ----------------------------------------------------------------- photos */
 
@@ -299,7 +336,9 @@ async function propertiesFor(user: User) {
   return await db.all(
     `SELECT p.id, p.name, p.join_code, p.vendor_code,
             (SELECT COUNT(*) FROM users u WHERE u.property_id = p.id AND u.role = 'tenant') AS tenants,
-            (SELECT COUNT(*) FROM tickets t WHERE t.property_id = p.id AND t.status = 'open') AS open
+            (SELECT COUNT(*) FROM tickets t WHERE t.property_id = p.id AND t.status = 'open') AS open,
+            (SELECT COUNT(*) FROM tickets t WHERE t.property_id = p.id AND t.status != 'closed'
+               AND t.due_at IS NOT NULL AND t.due_at < datetime('now')) AS overdue
      FROM properties p WHERE ${scope} ORDER BY p.id`,
     { me: user.id },
   );
@@ -550,6 +589,11 @@ async function listTickets(user: User, url: URL): Promise<Response> {
      WHERE ${clauses.join(" AND ")}
      ORDER BY
        CASE t.status WHEN 'open' THEN 0 WHEN 'triage' THEN 1 ELSE 2 END,
+       -- Soonest due first: the point of having targets is that the list is
+       -- ordered by them. Closed work falls back to recency, where a due date
+       -- no longer means anything.
+       CASE WHEN t.status = 'closed' THEN 1 ELSE 0 END,
+       CASE WHEN t.status = 'closed' THEN NULL ELSE t.due_at END ASC,
        CASE t.priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END,
        t.updated_at DESC`,
     params,
@@ -580,6 +624,13 @@ async function createTicket(user: User, req: Request): Promise<Response> {
 
     await addMessage(ticket.id, "tenant", description, user.id, photos);
     await runTriage(ticket);
+    // After triage, so the bot's category and priority feed the target.
+    await applySla(ticket.id);
+    // The bot escalates on its own when it cannot resolve something, so the note
+    // belongs here as well as on the tenant's manual escalation.
+    const after = await db.get<{ status: string }>(
+      "SELECT status FROM tickets WHERE id = ?", [ticket.id]);
+    if (after?.status === "open") await noteResponseTime(ticket.id);
     await markRead(ticket.id, user.id);
     return json({
       ticket: await visibleTicket(user, ticket.id),
@@ -620,8 +671,12 @@ async function createTicket(user: User, req: Request): Promise<Response> {
   if (tenantId) {
     await addMessage(ticket.id, "system", `${user.display_name} raised this with the tenant.`);
   }
+  await applySla(ticket.id);
   await markRead(ticket.id, user.id);
-  return json({ ticket, messages: await ticketMessages(ticket.id) });
+  return json({
+    ticket: await visibleTicket(user, ticket.id),
+    messages: await ticketMessages(ticket.id),
+  });
 }
 
 async function postMessage(user: User, ticket: Ticket, req: Request): Promise<Response> {
@@ -692,6 +747,17 @@ async function updateTicket(user: User, ticket: Ticket, req: Request): Promise<R
       params,
     );
     await addMessage(ticket.id, "system", `${user.display_name} ${changes.join(" and ")}.`, user.id);
+
+    // Re-filing can move a request between targets — say so, since the tenant is
+    // reading the same thread and the promise just changed.
+    const before = ticket.sla_tier;
+    const after = await applySla(ticket.id);
+    if (after && after.tier !== before) {
+      await addMessage(
+        ticket.id, "system",
+        `Response time is now ${SLA_LABEL[after.tier]} of the request being raised.`,
+      );
+    }
   }
   return json({
     ticket: await visibleTicket(user, ticket.id),
@@ -705,6 +771,7 @@ async function escalate(user: User, ticket: Ticket): Promise<Response> {
     ticket.id,
   ]);
   await addMessage(ticket.id, "system", `${user.display_name} sent this to the landlord.`);
+  await noteResponseTime(ticket.id);
   return json({
     ticket: await visibleTicket(user, ticket.id),
     messages: await ticketMessages(ticket.id),
@@ -849,10 +916,16 @@ async function propertyOverview(user: User, url: URL): Promise<Response> {
      WHERE property_id IN (${holes}) GROUP BY status`,
     scope,
   );
+  const overdue = await db.get<{ n: number }>(
+    `SELECT COUNT(*) AS n FROM tickets
+     WHERE property_id IN (${holes}) AND status != 'closed'
+       AND due_at IS NOT NULL AND due_at < datetime('now')`,
+    scope,
+  );
   return json({
     tenants,
     vendors,
-    counts: Object.fromEntries(counts.map((c) => [c.status, c.n])),
+    counts: { ...Object.fromEntries(counts.map((c) => [c.status, c.n])), overdue: overdue?.n ?? 0 },
     // The per-property breakdown the "all properties" sidebar lists.
     properties: await propertiesFor(user),
   });
@@ -1124,6 +1197,12 @@ async function route(req: Request, url: URL, path: string): Promise<Response> {
     const token = currentToken(req);
     if (token) await destroySession(token);
     return json({ ok: true }, 200, { "set-cookie": clearCookie() });
+  }
+
+  // Readable without signing in: it is the policy, not anybody's data, and the
+  // page linking to it should work before as well as after sign-in.
+  if (path === "/api/standards" && req.method === "GET") {
+    return json({ standards: SLA_POLICY });
   }
 
   const user = await currentUser(req);

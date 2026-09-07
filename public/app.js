@@ -101,6 +101,88 @@ function when(iso) {
   return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
 }
 
+/* ---------------------------------------------------------- response times */
+
+const SLA_LABEL = {
+  emergency: "within 24 hours",
+  major: "within 72 hours",
+  standard: "within 10 days",
+};
+
+/**
+ * How long is left, in words. Returns null for anything closed or undated, so
+ * callers can leave the badge off entirely rather than print something empty.
+ */
+function dueState(ticket) {
+  if (!ticket.due_at || ticket.status === "closed") return null;
+  const due = new Date(String(ticket.due_at).replace(" ", "T") + "Z");
+  const mins = Math.round((due.getTime() - Date.now()) / 60000);
+  const span = (m) => {
+    const abs = Math.abs(m);
+    if (abs < 60) return `${abs}m`;
+    if (abs < 60 * 24) return `${Math.round(abs / 60)}h`;
+    return `${Math.round(abs / 1440)}d`;
+  };
+  if (mins < 0) return { level: "overdue", text: `${span(mins)} overdue` };
+  // Inside a quarter of the shortest target, which is the point at which "due
+  // tomorrow" stops being reassuring.
+  if (mins <= 6 * 60) return { level: "soon", text: `due in ${span(mins)}` };
+  return { level: "ok", text: `due in ${span(mins)}` };
+}
+
+function dueBadge(ticket) {
+  const d = dueState(ticket);
+  if (!d) return "";
+  const target = ticket.sla_tier ? SLA_LABEL[ticket.sla_tier] : "";
+  return `<span class="pill due-${d.level}"${
+    target ? ` title="Target: ${esc(target)} of being raised"` : ""
+  }>${esc(d.text)}</span>`;
+}
+
+/**
+ * The response-time page — the same rules, readable by tenants, landlords and
+ * vendors alike. Rendered from the server's own policy rather than written out
+ * here, so the page cannot end up describing rules the app no longer follows.
+ */
+let standardsLoaded = false;
+
+async function renderStandards() {
+  if (standardsLoaded) return;
+  const list = $("#standardsList");
+  try {
+    const { standards } = await api("/api/standards");
+    list.innerHTML = standards.map((s) => `
+      <section class="standard standard-${esc(s.tier)}">
+        <div class="standard-when">${esc(s.label)}</div>
+        <p class="standard-summary">${esc(s.summary)}</p>
+        <ul class="standard-examples">${
+          s.examples.map((e) => `<li>${esc(e)}</li>`).join("")
+        }</ul>
+      </section>`).join("");
+    standardsLoaded = true;
+  } catch {
+    list.innerHTML = '<p class="error">The response times could not be loaded.</p>';
+  }
+}
+
+function showStandards(show) {
+  $("#standards").classList.toggle("hidden", !show);
+  if (show) {
+    renderStandards();
+    // A real address, so the page can be linked to and survives a reload.
+    if (location.hash !== "#response-times") location.hash = "response-times";
+  } else if (location.hash === "#response-times") {
+    history.replaceState(null, "", location.pathname + location.search);
+  }
+}
+
+function wireStandards() {
+  $("#standardsBtn").addEventListener("click", () => showStandards(true));
+  $("#standardsBack").addEventListener("click", () => showStandards(false));
+  addEventListener("hashchange", () => showStandards(location.hash === "#response-times"));
+  if (location.hash === "#response-times") showStandards(true);
+}
+
 /* ------------------------------------------------------------------ photos */
 
 const MAX_PHOTOS = 4;
@@ -848,7 +930,7 @@ function renderList() {
     return `<div class="row ${state.selected === t.id ? "active" : ""} ${t.unread > 0 ? "has-unread" : ""}" data-id="${t.id}">
       <div class="row-top"><span class="row-title">${esc(t.title)}</span>
         <span class="row-marks">${unread}<span class="dot p-${t.priority}" title="priority: ${t.priority}"></span></span></div>
-      <div class="row-meta">${statusPill}${where}${claim}${
+      <div class="row-meta">${statusPill}${dueBadge(t)}${where}${claim}${
         fromLandlord ? '<span class="pill from">from landlord</span>' : ""
       }<span>${who}</span><span>${when(t.updated_at)}</span></div>
       <div class="row-snippet">${esc(t.last_message || t.summary)}</div>
@@ -961,6 +1043,10 @@ function renderDetail(scroll = true) {
           : '<span class="pill closed">closed</span>'}
         ${meta}
         ${party}
+        ${dueBadge(t)}
+        ${t.sla_tier && t.status !== "closed"
+          ? `<span class="sla-note">target: ${esc(SLA_LABEL[t.sla_tier])} of being raised</span>`
+          : ""}
         ${state.scope === "all" && t.property_name
           ? `<span class="pill where">${esc(t.property_name)}</span>` : ""}
         ${t.assigned_vendor_id
@@ -1266,6 +1352,7 @@ wireModal();
 wireAccount();
 wirePropertySwitch();
 wirePhotoViewer();
+wireStandards();
 setAuthMode("login");
 
 // A static host cannot serve the API, so if this page is on one and nobody told

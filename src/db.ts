@@ -9,6 +9,7 @@
  *   production   TURSO_DATABASE_URL + TURSO_AUTH_TOKEN
  */
 import { createClient } from "@libsql/client";
+import { dueAt, slaTier } from "./sla";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
@@ -99,6 +100,12 @@ CREATE TABLE IF NOT EXISTS tickets (
   -- The vendor who claimed this job, if any. Vendors browse every open job on a
   -- property and claim what they will do, rather than waiting to be assigned.
   assigned_vendor_id INTEGER REFERENCES users(id),
+  -- The response-time target this request falls under, and when it comes due.
+  -- Stored rather than derived on read so the target cannot quietly change under
+  -- a request that is already running — notably when the seasons turn and heat
+  -- stops being a winter emergency.
+  sla_tier    TEXT,
+  due_at      TEXT,
   created_at  TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
   closed_at   TEXT
@@ -274,9 +281,39 @@ async function evolve(): Promise<void> {
     });
   }
 
+  // Response-time targets. Existing requests get one worked out from what they
+  // already say, so the list is not split between tickets that have a target and
+  // tickets that do not.
+  const tickets = await tableColumns("tickets");
+  if (!tickets.has("sla_tier")) {
+    await client.execute("ALTER TABLE tickets ADD COLUMN sla_tier TEXT");
+    await client.execute("ALTER TABLE tickets ADD COLUMN due_at TEXT");
+  }
+  const undated = await client.execute(
+    "SELECT id, title, summary, category, priority, created_at FROM tickets WHERE due_at IS NULL",
+  );
+  const at = (row: unknown, i: number) => (row as unknown as unknown[])[i];
+  for (const row of undated.rows) {
+    const id = at(row, 0) as number;
+    const createdAt = String(at(row, 5));
+    const tier = slaTier({
+      category: String(at(row, 3) ?? ""),
+      priority: String(at(row, 4) ?? ""),
+      text: `${at(row, 1) ?? ""} ${at(row, 2) ?? ""}`,
+      at: new Date(createdAt.replace(" ", "T") + "Z"),
+    });
+    await client.execute({
+      sql: "UPDATE tickets SET sla_tier = ?, due_at = ? WHERE id = ?",
+      args: [tier, dueAt(createdAt, tier), id],
+    });
+  }
+
   // Last, because these index columns only exist once the steps above have run.
   await client.execute(
     "CREATE INDEX IF NOT EXISTS idx_properties_landlord ON properties(landlord_id)",
+  );
+  await client.execute(
+    "CREATE INDEX IF NOT EXISTS idx_tickets_due ON tickets(property_id, status, due_at)",
   );
 }
 
@@ -405,6 +442,8 @@ export interface User {
   created_at: string;
 }
 
+export type SlaTierName = "emergency" | "major" | "standard";
+
 export interface Ticket {
   id: number;
   property_id: number;
@@ -418,6 +457,8 @@ export interface Ticket {
   resolution: string | null;
   closed_by: string | null;
   assigned_vendor_id: number | null;
+  sla_tier: SlaTierName | null;
+  due_at: string | null;
   created_at: string;
   updated_at: string;
   closed_at: string | null;

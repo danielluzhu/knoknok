@@ -681,6 +681,48 @@ input, textarea, select { font: inherit; color: inherit; }
   border-radius: var(--r-sm); box-shadow: 0 18px 50px rgba(0,0,0,.5);
 }
 
+/* A full page in its own right, over the app — the response-time rules. */
+.page {
+  position: fixed; inset: 0; z-index: 30;
+  display: flex; flex-direction: column;
+  background: var(--bg); overflow-y: auto;
+}
+.page-body { max-width: 720px; width: 100%; margin: 0 auto; padding: 40px 26px 64px; }
+.page-title {
+  font-family: var(--font-display); font-weight: 600; font-size: 30px;
+  letter-spacing: -.02em; margin: 0 0 12px;
+}
+.page-lede { color: var(--ink-soft); margin: 0 0 30px; max-width: 60ch; line-height: 1.6; }
+.page-note {
+  color: var(--ink-soft); font-size: 13.5px; line-height: 1.6;
+  margin: 28px 0 0; padding-top: 18px; border-top: 1px solid var(--line);
+  max-width: 60ch;
+}
+
+.standards { display: flex; flex-direction: column; gap: 14px; }
+.standard {
+  border: 1px solid var(--line); border-left: 3px solid var(--line);
+  border-radius: var(--r-md); background: var(--panel); padding: 18px 20px;
+}
+/* The three targets read as a scale, so they are coloured as one. */
+.standard-emergency { border-left-color: var(--urgent); }
+.standard-major { border-left-color: var(--high); }
+.standard-standard { border-left-color: var(--ok); }
+.standard-when {
+  font-family: var(--font-display); font-weight: 600; font-size: 19px; margin-bottom: 4px;
+}
+.standard-emergency .standard-when { color: var(--urgent); }
+.standard-major .standard-when { color: var(--high); }
+.standard-standard .standard-when { color: var(--ok); }
+.standard-summary { margin: 0 0 10px; color: var(--ink); }
+.standard-examples { margin: 0; padding-left: 20px; color: var(--ink-soft); line-height: 1.7; }
+
+/* How long a request has left. Overdue is the only one that shouts. */
+.pill.due-ok { background: color-mix(in oklab, var(--ink-soft) 10%, var(--panel)); color: var(--ink-soft); }
+.pill.due-soon { background: color-mix(in oklab, var(--high) 16%, var(--panel)); color: var(--high); }
+.pill.due-overdue { background: color-mix(in oklab, var(--urgent) 16%, var(--panel)); color: var(--urgent); }
+.sla-note { color: var(--ink-soft); font-size: 12.5px; }
+
 /* A secondary action that fills its field, like "Add a photo". */
 .block-soft { display: block; width: 100%; }
 /* Inside the new-request form the strip is already within the field's padding. */
