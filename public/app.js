@@ -8,10 +8,15 @@ const state = {
   // per-request ticket threads. Keyed by tenant id on both sides.
   view: "requests", chats: [], chatWith: null, chat: null,
   chatMessages: [], chatLastReadId: 0,
-  // Landlords and vendors both span several properties; `properties` is what the
-  // header switcher offers and `me.property` is the one in view.
-  properties: [],
+  // Landlords and vendors both span several properties. `properties` is what the
+  // header switcher offers; `scope` is what is being looked at — "all" (the
+  // default) or one property id. `me.property` stays the cursor the server uses
+  // when something has to land somewhere specific.
+  properties: [], scope: "all",
 };
+
+/** The `?property=` every scoped request carries. */
+const scopeQuery = () => `property=${state.scope}`;
 
 /**
  * Where the API lives. Empty means same origin — the case when the server also
@@ -161,6 +166,7 @@ function enterApp() {
   // A tenant has one property and no way to change it, so they get plain text
   // where the other two roles get the switcher.
   const oneProperty = me.role === "tenant";
+  state.scope = oneProperty ? me.property.id : "all";
   $("#propName").classList.toggle("hidden", !oneProperty);
   $("#propSwitch").classList.toggle("hidden", oneProperty);
   $("#propName").textContent = me.property.name;
@@ -210,29 +216,44 @@ async function loadProperties() {
 
 function renderPropertySwitch() {
   const landlord = state.me.role === "landlord";
-  $("#propSelect").innerHTML = state.properties
-    .map((p) => `<option value="${p.id}"${p.id === state.me.property.id ? " selected" : ""}>${
+  // Everything at once is the default, and the first thing in the list — a
+  // landlord's day starts with "what needs doing", not "which building".
+  const total = state.properties.reduce((n, p) => n + (p.open || 0), 0);
+  const all = `<option value="all"${state.scope === "all" ? " selected" : ""}>All properties${
+    total ? ` (${total})` : ""
+  }</option>`;
+  $("#propSelect").innerHTML = all + state.properties
+    .map((p) => `<option value="${p.id}"${String(p.id) === String(state.scope) ? " selected" : ""}>${
       esc(p.name)
     }${p.open ? ` (${p.open})` : ""}</option>`)
-    .join("") || `<option>${esc(state.me.property.name)}</option>`;
+    .join("");
   $("#propAdd").textContent = landlord ? "+ Property" : "+ Join";
   $("#propAdd").title = landlord
     ? "Add another property you manage"
     : "Join another property with a vendor code";
 }
 
-/** Switch which property this account is looking at, and reload everything for it. */
-async function selectProperty(id) {
-  const { user } = await api(`/api/properties/${id}/select`, { method: "POST" });
-  state.me = user;
+/**
+ * Point the view at one property, or at all of them.
+ *
+ * "all" is a client-side scope: the server still keeps a cursor per account, so
+ * picking a single property also moves that cursor — it is where a new to-do
+ * lands when nothing else says otherwise.
+ */
+async function selectProperty(scope) {
+  if (scope !== "all") {
+    const { user } = await api(`/api/properties/${scope}/select`, { method: "POST" });
+    state.me = user;
+    $("#propName").textContent = user.property.name;
+  }
+  state.scope = scope;
   state.selected = null;
   state.ticket = null;
   state.chatWith = null;
   state.chat = null;
   state.tenants = [];
-  $("#propName").textContent = user.property.name;
   renderPropertySwitch();
-  if (user.role === "landlord") loadProperty();
+  if (state.me.role === "landlord") loadProperty();
   renderDetail();
   await refresh(false);
   refreshChats().catch(() => {});
@@ -240,9 +261,9 @@ async function selectProperty(id) {
 
 function wirePropertySwitch() {
   $("#propSelect").addEventListener("change", async (e) => {
-    const id = Number(e.target.value);
+    const chosen = e.target.value === "all" ? "all" : Number(e.target.value);
     try {
-      await selectProperty(id);
+      await selectProperty(chosen);
     } catch (ex) {
       alert(ex.message);
       renderPropertySwitch(); // put the dropdown back where it was
@@ -266,6 +287,7 @@ function wirePropertySwitch() {
         });
         state.properties = properties;
         await selectProperty(activeId);
+        await loadProperties();
       } else {
         const { user } = await api("/api/properties/join", {
           method: "POST", body: { vendorCode: answer.trim().toUpperCase() },
@@ -283,32 +305,53 @@ function wirePropertySwitch() {
 /** Landlord-only sidebar footer: workload at a glance, the join code, who's here. */
 async function loadProperty() {
   try {
-    const { tenants, vendors, counts } = await api("/api/property");
+    const { tenants, vendors, counts, properties } = await api(`/api/property?${scopeQuery()}`);
     state.tenants = tenants;
+    if (properties) state.properties = properties;
     const open = counts.open ?? 0;
     const done = counts.closed ?? 0;
+    const everything = state.scope === "all";
+
+    // Invite codes belong to one property, so across the portfolio the sidebar
+    // shows the breakdown instead and the codes appear once a property is picked.
+    const codes = everything
+      ? `<div class="prop-breakdown">${
+          (properties || []).map((p) => `
+            <button class="prop-line" data-id="${p.id}">
+              <span class="prop-line-name">${esc(p.name)}</span>
+              <span class="prop-line-meta">${p.open || 0} open · ${p.tenants || 0} tenant${
+                p.tenants === 1 ? "" : "s"
+              }</span>
+            </button>`).join("") || "No properties yet."
+        }</div>`
+      : `Tenants join with:<br>
+         <span class="code">${esc(state.me.property.joinCode)}</span>
+         <div style="margin-top:14px">Vendors join with:<br>
+         <span class="code">${esc(state.me.property.vendorCode || "—")}</span></div>`;
+
     $("#landlordInfo").innerHTML = `
       <div class="counts">
         <span><b>${open}</b> open</span>
         <span><b>${done}</b> done</span>
         <span><b>${tenants.length}</b> tenant${tenants.length === 1 ? "" : "s"}</span>
       </div>
-      Tenants join with:<br>
-      <span class="code">${esc(state.me.property.joinCode)}</span>
+      ${codes}
       <div style="margin-top:10px">${
         tenants.length
           ? tenants.map((t) => `${esc(t.display_name)} (${esc(t.unit || "—")})`).join(", ")
           : "No tenants have joined yet."
       }</div>
-      <div style="margin-top:14px">Vendors join with:<br>
-      <span class="code">${esc(state.me.property.vendorCode || "—")}</span></div>
       <div style="margin-top:10px">${
         vendors && vendors.length
           ? vendors.map((v) =>
               `${esc(v.display_name)}${v.jobs ? ` (${v.jobs} job${v.jobs === 1 ? "" : "s"})` : ""}`
             ).join(", ")
-          : "No vendors yet — share the vendor code with a contractor."
+          : "No vendors yet — share a property's vendor code with a contractor."
       }</div>`;
+
+    // The breakdown doubles as a way in: clicking a building narrows to it.
+    $("#landlordInfo").querySelectorAll(".prop-line").forEach((b) =>
+      b.addEventListener("click", () => selectProperty(Number(b.dataset.id)).catch(() => {})));
   } catch {
     /* sidebar extras are optional — never block the list on them */
   }
@@ -352,7 +395,7 @@ function setView(view) {
 }
 
 async function refreshChats() {
-  const { chats } = await api("/api/chats");
+  const { chats } = await api(`/api/chats?${scopeQuery()}`);
   state.chats = chats;
   renderViews();
   if (state.view !== "messages") return;
@@ -386,7 +429,9 @@ function renderChatList() {
               c.unread ? `<span class="unread">${c.unread}</span>` : ""
             }<span class="row-meta">${c.last_at ? when(c.last_at) : ""}</span></span>
           </div>
-          <div class="chat-sub">${esc(c.subtitle || "")}</div>
+          <div class="chat-sub">${esc(
+            [c.subtitle, state.scope === "all" ? c.property_name : null].filter(Boolean).join(" · ")
+          )}</div>
           <div class="row-snippet ${c.last_message ? "" : "chat-empty"}">${
             c.last_message ? esc(c.last_message) : "No messages yet"
           }</div>
@@ -524,7 +569,7 @@ function renderFilters() {
 async function refresh(keepSelection = true) {
   // "Mine" is not a status — it is every job this vendor has picked up.
   const query = state.filter === "mine" ? "status=all&assigned=me" : `status=${state.filter}`;
-  const { tickets } = await api(`/api/tickets?${query}`);
+  const { tickets } = await api(`/api/tickets?${query}&${scopeQuery()}`);
   state.tickets = tickets;
   renderList();
   if (keepSelection && state.selected && !tickets.some((t) => t.id === state.selected)) {
@@ -559,6 +604,10 @@ function renderList() {
       : CATEGORY_LABEL[t.category] || "Other";
     // Vendors are choosing what to pick up, so who already has a job is the
     // single most useful thing on the row.
+    // Only worth saying when more than one building is in view; inside a single
+    // property it would be the same word on every row.
+    const where = state.scope === "all" && t.property_name
+      ? `<span class="pill where">${esc(t.property_name)}</span>` : "";
     const claim = state.me.role === "vendor" && t.assigned_vendor_id
       ? `<span class="pill ${t.assigned_vendor_id === state.me.id ? "mine-job" : "taken"}">${
           t.assigned_vendor_id === state.me.id ? "yours" : esc(t.vendor_name || "taken")
@@ -572,7 +621,7 @@ function renderList() {
     return `<div class="row ${state.selected === t.id ? "active" : ""} ${t.unread > 0 ? "has-unread" : ""}" data-id="${t.id}">
       <div class="row-top"><span class="row-title">${esc(t.title)}</span>
         <span class="row-marks">${unread}<span class="dot p-${t.priority}" title="priority: ${t.priority}"></span></span></div>
-      <div class="row-meta">${statusPill}${claim}${
+      <div class="row-meta">${statusPill}${where}${claim}${
         fromLandlord ? '<span class="pill from">from landlord</span>' : ""
       }<span>${who}</span><span>${when(t.updated_at)}</span></div>
       <div class="row-snippet">${esc(t.last_message || t.summary)}</div>
@@ -683,6 +732,8 @@ function renderDetail(scroll = true) {
           : '<span class="pill closed">closed</span>'}
         ${meta}
         ${party}
+        ${state.scope === "all" && t.property_name
+          ? `<span class="pill where">${esc(t.property_name)}</span>` : ""}
         ${t.assigned_vendor_id
           ? `<span class="pill ${mineToWork ? "mine-job" : "taken"}">${
               mineToWork ? "yours" : esc(t.vendor_name || "vendor")
@@ -831,17 +882,37 @@ function wireModal() {
     document.querySelectorAll(".landlord-field").forEach((f) => f.classList.toggle("hidden", tenant));
     if (!tenant) {
       $("#newCategory").innerHTML = options(CATEGORY_LABEL, "other");
-      $("#newTenant").innerHTML =
-        '<option value="">Just me — internal to-do</option>' +
-        state.tenants.map((t) =>
-          `<option value="${t.id}">${esc(t.display_name)}${t.unit ? " · " + esc(t.unit) : ""}</option>`
-        ).join("");
+      // Looking at one building, the to-do belongs to it and there is nothing to
+      // ask. Looking at all of them, it has to be told which — defaulting to the
+      // one last opened rather than to whichever sorts first.
+      const several = state.scope === "all" && state.properties.length > 1;
+      $("#newPropertyField").classList.toggle("hidden", !several);
+      $("#newProperty").innerHTML = state.properties
+        .map((p) => `<option value="${p.id}"${
+          p.id === state.me.property.id ? " selected" : ""
+        }>${esc(p.name)}</option>`).join("");
+      if (!several) $("#newProperty").value = String(state.me.property.id);
+      fillTenantOptions();
     }
     $("#newDesc").required = tenant;
     $("#modalError").classList.add("hidden");
     modal.classList.remove("hidden");
     $("#newTitle").focus();
   };
+  // A to-do can only be raised with a tenant who actually lives at the property
+  // it is for, so this list follows the property picker.
+  function fillTenantOptions() {
+    const forProperty = Number($("#newProperty").value || state.me.property.id);
+    $("#newTenant").innerHTML =
+      '<option value="">Just me — internal to-do</option>' +
+      state.tenants
+        .filter((t) => t.property_id === undefined || t.property_id === forProperty)
+        .map((t) =>
+          `<option value="${t.id}">${esc(t.display_name)}${t.unit ? " · " + esc(t.unit) : ""}</option>`
+        ).join("");
+  }
+  $("#newProperty").addEventListener("change", fillTenantOptions);
+
   $("#newBtn").addEventListener("click", open);
   $("#modalCancel").addEventListener("click", () => modal.classList.add("hidden"));
   modal.addEventListener("click", (e) => { if (e.target === modal) modal.classList.add("hidden"); });

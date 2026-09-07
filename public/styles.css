@@ -293,6 +293,19 @@ input, textarea, select { font: inherit; color: inherit; }
 .prop-switch select:focus { border-color: var(--accent); box-shadow: var(--ring); outline: none; }
 .ghost.tiny { padding: 5px 9px; font-size: 12.5px; white-space: nowrap; }
 
+/* The per-property breakdown in the landlord sidebar: a list that is also a
+   set of shortcuts into each building. */
+.prop-breakdown { display: flex; flex-direction: column; gap: 2px; margin: 4px 0 2px; }
+.prop-line {
+  display: flex; justify-content: space-between; align-items: baseline; gap: 10px;
+  width: 100%; padding: 6px 8px; margin: 0 -8px; border: 0; border-radius: var(--r-sm);
+  background: none; font: inherit; color: inherit; text-align: left; cursor: pointer;
+  transition: background var(--fast);
+}
+.prop-line:hover { background: color-mix(in oklab, var(--accent) 8%, transparent); }
+.prop-line-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.prop-line-meta { color: var(--ink-soft); font-size: 12px; white-space: nowrap; }
+
 .topbar-right { display: flex; align-items: center; gap: 10px; }
 .who { font-size: 13.5px; color: var(--ink-soft); }
 .badge {
@@ -415,6 +428,9 @@ input, textarea, select { font: inherit; color: inherit; }
 /* Who holds a job. "yours" carries the accent so a vendor can pick their own
    work out of the list at a glance; "taken" stays quiet — it is a reason to
    scroll past, not something to draw the eye. */
+/* Which building a row belongs to. Only drawn in the all-properties view, and
+   kept neutral — it is orientation, not status. */
+.pill.where { background: color-mix(in oklab, var(--ink-soft) 10%, var(--panel)); color: var(--ink-soft); }
 .pill.mine-job { background: color-mix(in oklab, var(--accent) 16%, var(--panel)); color: var(--accent); }
 .pill.taken { background: color-mix(in oklab, var(--ink-soft) 12%, var(--panel)); color: var(--ink-soft); }
 

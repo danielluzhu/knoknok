@@ -112,11 +112,42 @@ async function readMarker(ticketId: number, userId: number): Promise<number> {
   return row?.last_read_id ?? 0;
 }
 
-/** Anyone on this property who is a tenant — used to target a landlord to-do. */
-function propertyTenant(user: User, tenantId: number): Promise<User | null> {
+/**
+ * Every property this account may look at. A tenant has one; a landlord has the
+ * ones they own; a vendor has the ones they hold a code for. This is the set the
+ * "all properties" view spans, and the set any single-property request must fall
+ * inside — `users.property_id` alone is a cursor, never a permission.
+ */
+async function accessibleProperties(user: User): Promise<number[]> {
+  if (user.role === "tenant") return [user.property_id];
+  const rows = user.role === "landlord"
+    ? await db.all<{ id: number }>("SELECT id FROM properties WHERE landlord_id = ?", [user.id])
+    : await db.all<{ id: number }>(
+        "SELECT property_id AS id FROM property_vendors WHERE vendor_id = ?", [user.id]);
+  return rows.map((r) => r.id);
+}
+
+/**
+ * Which properties a request is about. `?property=all` — the default the front
+ * end sends — means every one of them; a specific id narrows to that one, and is
+ * refused unless it is theirs.
+ */
+async function requestedScope(user: User, url: URL): Promise<number[] | null> {
+  const all = await accessibleProperties(user);
+  const asked = url.searchParams.get("property");
+  if (!asked || asked === "all") return all;
+  const id = Number(asked);
+  return all.includes(id) ? [id] : null;
+}
+
+/** Anyone a landlord may target a to-do at: a tenant on a property they own. */
+async function propertyTenant(user: User, tenantId: number): Promise<User | null> {
+  const scope = await accessibleProperties(user);
+  if (!scope.length) return null;
   return db.get<User>(
-    "SELECT * FROM users WHERE id = ? AND property_id = ? AND role = 'tenant'",
-    [tenantId, user.property_id],
+    `SELECT * FROM users
+     WHERE id = ? AND role = 'tenant' AND property_id IN (${scope.map(() => "?").join(",")})`,
+    [tenantId, ...scope],
   );
 }
 
@@ -129,16 +160,17 @@ async function visibleTicket(user: User, id: number): Promise<Ticket | null> {
   const t = await db.get<Ticket>(
     `SELECT t.*, u.display_name AS tenant_name, u.unit AS tenant_unit,
             c.display_name AS creator_name, c.role AS creator_role,
-            v.display_name AS vendor_name
+            v.display_name AS vendor_name, pr.name AS property_name
      FROM tickets t
      LEFT JOIN users u ON u.id = t.tenant_id
      LEFT JOIN users c ON c.id = t.created_by
      LEFT JOIN users v ON v.id = t.assigned_vendor_id
+     JOIN properties pr ON pr.id = t.property_id
      WHERE t.id = ?`,
     [id],
   );
   if (!t) return null;
-  if (t.property_id !== user.property_id) return null;
+  if (!(await accessibleProperties(user)).includes(t.property_id)) return null;
   if (user.role === "tenant" && t.tenant_id !== user.id) return null;
   // Triage is the tenant working through it with the bot in private. It is not
   // work yet, and it is not a contractor's to read.
@@ -378,8 +410,13 @@ async function handleLogin(req: Request): Promise<Response> {
 
 async function listTickets(user: User, url: URL): Promise<Response> {
   const status = url.searchParams.get("status"); // open | closed | triage | all
-  const clauses: string[] = ["t.property_id = $property"];
-  const params: Record<string, unknown> = { property: user.property_id, me: user.id };
+  const scope = await requestedScope(user, url);
+  if (!scope) return fail("That property is not yours.", 403);
+  if (!scope.length) return json({ tickets: [] });
+
+  const clauses: string[] = [`t.property_id IN (${scope.map((_, i) => `$p${i}`).join(",")})`];
+  const params: Record<string, unknown> = { me: user.id };
+  scope.forEach((id, i) => { params[`p${i}`] = id; });
 
   if (user.role === "tenant") {
     clauses.push("t.tenant_id = $tenant");
@@ -401,7 +438,7 @@ async function listTickets(user: User, url: URL): Promise<Response> {
   const tickets = await db.all(
     `SELECT t.*, u.display_name AS tenant_name, u.unit AS tenant_unit,
             c.display_name AS creator_name, c.role AS creator_role,
-            v.display_name AS vendor_name,
+            v.display_name AS vendor_name, pr.name AS property_name,
             (SELECT m.body FROM messages m WHERE m.ticket_id = t.id ORDER BY m.id DESC LIMIT 1) AS last_message,
             (SELECT COUNT(*) FROM messages m
                WHERE m.ticket_id = t.id
@@ -413,6 +450,7 @@ async function listTickets(user: User, url: URL): Promise<Response> {
      LEFT JOIN users u ON u.id = t.tenant_id
      LEFT JOIN users c ON c.id = t.created_by
      LEFT JOIN users v ON v.id = t.assigned_vendor_id
+     JOIN properties pr ON pr.id = t.property_id
      WHERE ${clauses.join(" AND ")}
      ORDER BY
        CASE t.status WHEN 'open' THEN 0 WHEN 'triage' THEN 1 ELSE 2 END,
@@ -456,17 +494,25 @@ async function createTicket(user: User, req: Request): Promise<Response> {
   const priority = PRIORITIES.has(String(b?.priority)) ? String(b?.priority) : "normal";
   const category = CATEGORIES.has(String(b?.category)) ? String(b?.category) : "other";
 
+  // Viewing every property at once, a to-do has to say which one it is for.
+  // Falling back to the cursor keeps the single-property case a no-op.
+  const owned = await accessibleProperties(user);
+  const propertyId = b?.propertyId ? Number(b.propertyId) : user.property_id;
+  if (!owned.includes(propertyId)) return fail("That property is not yours.", 403);
+
   let tenantId: number | null = null;
   if (b?.tenantId) {
     const tenant = await propertyTenant(user, Number(b.tenantId));
-    if (!tenant) return fail("That tenant is not on this property.");
+    if (!tenant || tenant.property_id !== propertyId) {
+      return fail("That tenant is not on this property.");
+    }
     tenantId = tenant.id;
   }
 
   const ticket = (await db.get<Ticket>(
     `INSERT INTO tickets (property_id, tenant_id, created_by, title, summary, category, priority, status)
      VALUES (?, ?, ?, ?, ?, ?, ?, 'open') RETURNING *`,
-    [user.property_id, tenantId, user.id, title, description || title, category, priority],
+    [propertyId, tenantId, user.id, title, description || title, category, priority],
   ))!;
 
   if (description) await addMessage(ticket.id, "landlord", description, user.id);
@@ -660,29 +706,51 @@ async function changePassword(
   return json({ ok: true });
 }
 
-async function propertyOverview(user: User): Promise<Response> {
+/**
+ * The landlord's sidebar. Across the whole portfolio or one property, depending
+ * on `?property=` — the shape of the answer is the same either way, so the
+ * sidebar does not need two code paths. Each tenant and vendor carries the
+ * property they belong to, which is what lets the "all" view group them and the
+ * new-to-do form filter them.
+ */
+async function propertyOverview(user: User, url: URL): Promise<Response> {
+  const scope = await requestedScope(user, url);
+  if (!scope) return fail("That property is not yours.", 403);
+  if (!scope.length) {
+    return json({ tenants: [], vendors: [], counts: {}, properties: [] });
+  }
+  const holes = scope.map(() => "?").join(",");
+
   const tenants = await db.all(
-    `SELECT id, display_name, unit, username FROM users
-     WHERE property_id = ? AND role = 'tenant' ORDER BY unit, display_name`,
-    [user.property_id],
+    `SELECT u.id, u.display_name, u.unit, u.username, u.property_id, p.name AS property_name
+     FROM users u JOIN properties p ON p.id = u.property_id
+     WHERE u.property_id IN (${holes}) AND u.role = 'tenant'
+     ORDER BY p.name, u.unit, u.display_name`,
+    scope,
   );
+  // A vendor working three of these buildings is one person, so they are folded
+  // into a single row with their total open jobs across the scope.
   const vendors = await db.all(
     `SELECT u.id, u.display_name, u.username,
             (SELECT COUNT(*) FROM tickets t
-              WHERE t.assigned_vendor_id = u.id AND t.property_id = pv.property_id
-                AND t.status = 'open') AS jobs
-     FROM property_vendors pv JOIN users u ON u.id = pv.vendor_id
-     WHERE pv.property_id = ? ORDER BY u.display_name`,
-    [user.property_id],
+              WHERE t.assigned_vendor_id = u.id AND t.status = 'open'
+                AND t.property_id IN (${holes})) AS jobs
+     FROM users u
+     WHERE u.id IN (SELECT vendor_id FROM property_vendors WHERE property_id IN (${holes}))
+     ORDER BY u.display_name`,
+    [...scope, ...scope],
   );
   const counts = await db.all<{ status: string; n: number }>(
-    "SELECT status, COUNT(*) AS n FROM tickets WHERE property_id = ? GROUP BY status",
-    [user.property_id],
+    `SELECT status, COUNT(*) AS n FROM tickets
+     WHERE property_id IN (${holes}) GROUP BY status`,
+    scope,
   );
   return json({
     tenants,
     vendors,
     counts: Object.fromEntries(counts.map((c) => [c.status, c.n])),
+    // The per-property breakdown the "all properties" sidebar lists.
+    properties: await propertiesFor(user),
   });
 }
 
@@ -761,6 +829,8 @@ async function chatPartner(user: User, tenantId: number): Promise<User | null> {
     if (tenantId !== user.id) return null;
     return landlordOf(user.property_id);
   }
+  if (user.role === "vendor") return null;
+  // Any tenant on any property this landlord owns, not just the one in view.
   return propertyTenant(user, tenantId);
 }
 
@@ -796,23 +866,32 @@ function chatMessages(tenantId: number): Promise<ChatMessage[]> {
  * nobody has messaged yet, so there is something to click to start. A tenant
  * gets the single row for their landlord.
  */
-async function listChats(user: User): Promise<Response> {
+async function listChats(user: User, url: URL): Promise<Response> {
   // Direct messages are a tenant<->landlord channel. A vendor's conversation
   // belongs on the ticket, where everyone involved can see it.
   if (user.role === "vendor") return json({ chats: [] });
   if (user.role === "landlord") {
+    const scope = await requestedScope(user, url);
+    if (!scope) return fail("That property is not yours.", 403);
+    if (!scope.length) return json({ chats: [] });
+    // This query binds by name, so the IN list needs named holes too.
+    const holes = scope.map((_, i) => `$s${i}`).join(",");
+    // Across every property in scope, so a landlord is not made to hunt for a
+    // message by first guessing which building it came from. The property rides
+    // along on each row, because "Unit 4B" alone is ambiguous across buildings.
     const rows = await db.all(
       `SELECT u.id AS id, u.display_name AS name, u.unit AS subtitle,
+              p.name AS property_name,
               (SELECT body FROM chat_messages m WHERE m.tenant_id = u.id ORDER BY m.id DESC LIMIT 1) AS last_message,
               (SELECT created_at FROM chat_messages m WHERE m.tenant_id = u.id ORDER BY m.id DESC LIMIT 1) AS last_at,
               (SELECT COUNT(*) FROM chat_messages m
                  WHERE m.tenant_id = u.id AND m.sender_id != $me
                    AND m.id > COALESCE((SELECT r.last_read_id FROM chat_reads r
                                         WHERE r.tenant_id = u.id AND r.user_id = $me), 0)) AS unread
-       FROM users u
-       WHERE u.property_id = $property AND u.role = 'tenant'
-       ORDER BY (last_at IS NULL), last_at DESC, u.unit, u.display_name`,
-      { me: user.id, property: user.property_id },
+       FROM users u JOIN properties p ON p.id = u.property_id
+       WHERE u.property_id IN (${holes}) AND u.role = 'tenant'
+       ORDER BY (last_at IS NULL), last_at DESC, p.name, u.unit, u.display_name`,
+      { me: user.id, ...Object.fromEntries(scope.map((id, i) => [`s${i}`, id])) },
     );
     return json({ chats: rows });
   }
@@ -839,11 +918,15 @@ async function openChat(user: User, tenantId: number): Promise<Response> {
   const messages = await chatMessages(tenantId);
   const lastReadId = await chatReadMarker(tenantId, user.id);
   await markChatRead(tenantId, user.id);
+  const property = user.role === "tenant" ? null : await db.get<{ name: string }>(
+    "SELECT name FROM properties WHERE id = ?", [partner.property_id]);
   return json({
     conversation: {
       id: tenantId,
       name: partner.display_name,
-      subtitle: user.role === "tenant" ? "your landlord" : partner.unit,
+      subtitle: user.role === "tenant"
+        ? "your landlord"
+        : [partner.unit, property?.name].filter(Boolean).join(" · "),
     },
     messages,
     lastReadId,
@@ -859,9 +942,12 @@ async function sendChat(user: User, tenantId: number, req: Request): Promise<Res
   if (!body) return fail("Message is empty.");
   if (body.length > 4000) return fail("Message is too long.");
 
+  // The conversation belongs to the tenant's property — a landlord viewing
+  // another building must not stamp this message with that one.
+  const propertyId = user.role === "tenant" ? user.property_id : partner.property_id;
   await db.run(
     "INSERT INTO chat_messages (property_id, tenant_id, sender_id, body) VALUES (?, ?, ?, ?)",
-    [user.property_id, tenantId, user.id, body],
+    [propertyId, tenantId, user.id, body],
   );
   await markChatRead(tenantId, user.id);
   return json({ messages: await chatMessages(tenantId) });
@@ -907,7 +993,7 @@ async function route(req: Request, url: URL, path: string): Promise<Response> {
 
   if (path === "/api/property" && req.method === "GET") {
     if (user.role !== "landlord") return fail("Landlords only.", 403);
-    return await propertyOverview(user);
+    return await propertyOverview(user, url);
   }
 
   if (path === "/api/properties") {
@@ -931,7 +1017,7 @@ async function route(req: Request, url: URL, path: string): Promise<Response> {
     return await changePassword(user, req, currentToken(req));
   }
   if (path === "/api/chats" && req.method === "GET") {
-    return await listChats(user);
+    return await listChats(user, url);
   }
   const chat = path.match(/^\/api\/chats\/(\d+)(?:\/(messages))?$/);
   if (chat) {

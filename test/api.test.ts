@@ -664,13 +664,86 @@ describe("a landlord with several properties", () => {
     expect((await resident.get("/api/properties")).status).toBe(403);
   });
 
-  test("work stays scoped to the property it belongs to", async () => {
+  test("the default view spans every property, and ?property= narrows it", async () => {
     await owner.post(`/api/properties/${second}/select`);
     await owner.post("/api/tickets", { title: "Fix the gate at Birch" });
-    expect((await owner.get("/api/tickets?status=open")).data.tickets).toHaveLength(1);
-
     await owner.post(`/api/properties/${first}/select`);
-    expect((await owner.get("/api/tickets?status=open")).data.tickets).toHaveLength(0);
+    await owner.post("/api/tickets", { title: "Chase the roofer" });
+
+    // No ?property= means all of them — what a landlord lands on.
+    const all = (await owner.get("/api/tickets?status=open")).data.tickets;
+    expect(all).toHaveLength(2);
+    expect(all.map((t: any) => t.property_name).sort())
+      .toEqual(["Birch House", "Perry M's property"]);
+
+    const birch = (await owner.get(`/api/tickets?status=open&property=${second}`)).data.tickets;
+    expect(birch).toHaveLength(1);
+    expect(birch[0].title).toBe("Fix the gate at Birch");
+  });
+
+  test("a to-do says which property it is for", async () => {
+    await owner.post(`/api/properties/${first}/select`);
+    const made = await owner.post("/api/tickets", {
+      title: "Repaint the Birch stairwell", propertyId: second,
+    });
+    // Raised from the all-properties view while the cursor sat elsewhere.
+    expect(made.data.ticket.property_id).toBe(second);
+  });
+
+  test("a to-do cannot be aimed at a property that is not theirs", async () => {
+    const outsider = new Session();
+    const { data } = await outsider.post("/api/signup", {
+      role: "landlord", username: uniq("else"), password: "password123", displayName: "Else E",
+    });
+    const { status } = await owner.post("/api/tickets", {
+      title: "Not mine to schedule", propertyId: data.user.property.id,
+    });
+    expect(status).toBe(403);
+  });
+
+  test("narrowing to someone else's property is refused", async () => {
+    const outsider = new Session();
+    const { data } = await outsider.post("/api/signup", {
+      role: "landlord", username: uniq("peek"), password: "password123", displayName: "Peek P",
+    });
+    expect((await owner.get(`/api/tickets?property=${data.user.property.id}`)).status).toBe(403);
+  });
+
+  test("the conversation list spans every property, and says which", async () => {
+    // Put a resident in the other building, so there is something to span.
+    const codes = (await owner.get("/api/properties")).data.properties;
+    const firstCode = codes.find((p: any) => p.id === first).join_code;
+    await new Session().post("/api/signup", {
+      role: "tenant", username: uniq("across"), password: "password123",
+      displayName: "Across A", joinCode: firstCode, unit: "1B",
+    });
+
+    // A landlord should not have to guess the building before finding a message.
+    await owner.post(`/api/properties/${first}/select`);
+    const { data } = await owner.get("/api/chats");
+    const names = data.chats.map((c: any) => c.property_name);
+    expect(new Set(names).size).toBe(2);
+    expect(data.chats.every((c: any) => c.property_name)).toBe(true);
+
+    // Narrowing to one building shows only its residents.
+    const narrowed = (await owner.get(`/api/chats?property=${first}`)).data.chats;
+    expect(narrowed.every((c: any) => c.property_name === "Perry M's property")).toBe(true);
+  });
+
+  test("a reply is filed under the tenant's property, not the landlord's cursor", async () => {
+    const code = (await owner.get("/api/properties")).data.properties
+      .find((p: any) => p.id === second).join_code;
+    const resident = new Session();
+    const { data: who } = await resident.post("/api/signup", {
+      role: "tenant", username: uniq("filed"), password: "password123",
+      displayName: "Filed F", joinCode: code, unit: "7Q",
+    });
+    await owner.post(`/api/properties/${first}/select`); // looking at the other building
+    expect((await owner.post(`/api/chats/${who.user.id}/messages`,
+      { body: "Replying from elsewhere" })).status).toBe(200);
+    // The tenant sees it on their own thread, which is the whole point.
+    const seen = await resident.get(`/api/chats/${who.user.id}`);
+    expect(seen.data.messages.at(-1).body).toBe("Replying from elsewhere");
   });
 
   test("a tenant's messages still reach the landlord who owns their property", async () => {
@@ -804,8 +877,14 @@ describe("vendors", () => {
     expect(joined.status).toBe(200);
     expect(joined.data.user.property.name).toBe("Cedar Annex");
     expect(joined.data.user.propertyCount).toBe(2);
-    // Cedar Annex has no work, so the list is empty there.
-    expect((await ace.get("/api/tickets?status=all")).data.tickets).toHaveLength(0);
+    // The default spans both properties they hold codes for...
+    const across = (await ace.get("/api/tickets?status=all")).data.tickets;
+    expect(across).toHaveLength(1);
+    expect(across[0].property_name).toBe("Cedar Flats");
+    // ...and Cedar Annex on its own has no work yet.
+    const annex = joined.data.user.property.id;
+    expect((await ace.get(`/api/tickets?status=all&property=${annex}`)).data.tickets)
+      .toHaveLength(0);
     expect((await ace.post("/api/properties/join", { vendorCode: secondCode })).status).toBe(400);
   });
 
@@ -832,18 +911,18 @@ describe("vendors", () => {
     expect((await ace.get("/api/chats")).data.chats).toEqual([]);
   });
 
-  test("a job on another property is simply not there", async () => {
-    // Ace is on Cedar Annex after the join above; the job lives on Cedar Flats.
-    // It 404s rather than 403s, which is the right way round — being told
-    // "not allowed" would confirm the job exists.
-    expect((await ace.post(`/api/tickets/${jobId}/update`, { priority: "urgent" })).status)
-      .toBe(404);
+  test("a job on a property they hold no code for is simply not there", async () => {
+    // 404 rather than 403 is the right way round — being told "not allowed"
+    // would confirm the job exists.
+    const stranger = new Session();
+    await stranger.post("/api/signup", {
+      role: "landlord", username: uniq("other"), password: "password123", displayName: "Other O",
+    });
+    const theirs = await stranger.post("/api/tickets", { title: "Nothing to do with Ace" });
+    expect((await ace.get(`/api/tickets/${theirs.data.ticket.id}`)).status).toBe(404);
   });
 
   test("a vendor cannot re-file a task", async () => {
-    const flats = (await ace.get("/api/properties")).data.properties
-      .find((p: any) => p.name === "Cedar Flats");
-    await ace.post(`/api/properties/${flats.id}/select`);
     const { status, data } = await ace.post(`/api/tickets/${jobId}/update`, { priority: "urgent" });
     expect(status).toBe(403);
     expect(data.error).toContain("Landlords only");
