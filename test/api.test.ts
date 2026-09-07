@@ -186,7 +186,9 @@ describe("tenant triage", () => {
     const last = await tenant.post(`/api/tickets/${id}/messages`, { body: "Cleared the trap too, still blocked." });
     expect(last.data.ticket.status).toBe("open");
     expect(last.data.ticket.category).toBe("plumbing");
-    expect(last.data.ticket.summary).toContain("self-help");
+    // The summary carries what was eliminated, so the landlord does not send
+    // someone to try the two things the tenant already tried.
+    expect(last.data.ticket.summary).toContain("ruled out");
   });
 
   test("an emergency skips troubleshooting entirely", async () => {
@@ -1629,5 +1631,114 @@ describe("recurring upkeep", () => {
     });
     expect((await vendor.get("/api/schedules")).status).toBe(403);
     expect((await vendor.post("/api/schedules", { title: "x", intervalDays: 7 })).status).toBe(403);
+  });
+});
+
+describe("triage quality", () => {
+  const landlord = new Session();
+  const tenant = new Session();
+  let joinCode = "";
+
+  const report = async (title: string, description: string) => {
+    const { data } = await tenant.post("/api/tickets", { title, description });
+    const reply = data.messages.find((m: any) => m.author === "bot")?.body ?? "";
+    return { ticket: data.ticket, reply, id: data.ticket.id };
+  };
+
+  test("setup", async () => {
+    const { data } = await landlord.post("/api/signup", {
+      role: "landlord", username: uniq("diag"), password: "password123",
+      displayName: "Diag D", propertyName: "Diagnostic House",
+    });
+    joinCode = data.user.property.joinCode;
+    await tenant.post("/api/signup", {
+      role: "tenant", username: uniq("dt"), password: "password123",
+      displayName: "Dee T", joinCode, unit: "1A",
+    });
+  });
+
+  // The word "attached" contains "ac", which used to match the air-conditioning
+  // playbook and answer a ceiling leak with instructions about the thermostat.
+  test("a keyword buried inside another word does not match", async () => {
+    const { ticket, reply } = await report(
+      "Ceiling stain above the shower",
+      "A brown ring has appeared on the bathroom ceiling and it is spreading. Photos attached.",
+    );
+    expect(ticket.category).toBe("structural");
+    expect(reply.toLowerCase()).not.toContain("thermostat");
+    expect(reply.toLowerCase()).not.toContain("air filter");
+  });
+
+  test.each([
+    ["Kitchen sink drains slowly", "Water pools in the basin and takes minutes to go down.", "plumbing"],
+    ["No power in the bathroom", "The outlets are dead but the lights work.", "electrical"],
+    ["Radiators are cold", "The heating came on and now nothing is warm.", "hvac"],
+    ["Fridge is not cold", "Everything in it has gone warm since yesterday.", "appliance"],
+    ["Front door will not lock", "The deadbolt does not engage any more.", "locks_security"],
+  ])("%s is filed as the right kind of problem", async (title, description, category) => {
+    const { ticket } = await report(title, description);
+    expect(ticket.category).toBe(category);
+  });
+
+  test("the first reply explains what is likely, what to check, and why", async () => {
+    const { reply } = await report(
+      "Kitchen sink drains slowly",
+      "Water pools in the basin and takes several minutes to go down.",
+    );
+    // A diagnosis, not just a question: it should say what is usually wrong...
+    expect(reply.toLowerCase()).toContain("trap");
+    // ...lay out what to check...
+    expect(reply).toContain("Worth checking:");
+    expect(reply).toMatch(/1\..+\n.+\n2\./s);
+    // ...and end on exactly one question.
+    expect(reply.trimEnd().endsWith("?")).toBe(true);
+    expect(reply.split("?").length - 1).toBe(1);
+    // Long enough to be useful, short enough to read on a phone.
+    expect(reply.length).toBeGreaterThan(400);
+    expect(reply.length).toBeLessThan(1600);
+  });
+
+  test("it says where the line is rather than just refusing", async () => {
+    const { reply } = await report(
+      "No power in the bathroom",
+      "The outlets in the bathroom are all dead but the lights still work.",
+    );
+    expect(reply.toLowerCase()).toContain("gfci");
+    // The panel is the boundary, and it should be named as one.
+    expect(reply.toLowerCase()).toContain("electrician");
+  });
+
+  test("an emergency is never given troubleshooting steps", async () => {
+    const { ticket, reply } = await report(
+      "Smell of gas in the kitchen",
+      "There is a strong smell of gas near the cooker.",
+    );
+    expect(ticket.priority).toBe("urgent");
+    expect(ticket.status).toBe("open"); // straight past triage
+    expect(reply.toLowerCase()).toContain("emergency services");
+    expect(reply).not.toContain("Worth checking:");
+  });
+
+  test("what was ruled out reaches the landlord's summary", async () => {
+    const { id } = await report(
+      "Bathroom sink drains slowly",
+      "It pools and drains very slowly, other taps are fine.",
+    );
+    await tenant.post(`/api/tickets/${id}/messages`, { body: "Only this one is slow." });
+    await tenant.post(`/api/tickets/${id}/messages`, { body: "Plunged it hard, no change." });
+    const { data } = await tenant.post(`/api/tickets/${id}/messages`, {
+      body: "Still nothing, can someone come out?",
+    });
+    expect(data.ticket.status).toBe("open");
+    // The landlord should see what has already been eliminated, not just a title.
+    expect(data.ticket.summary).toMatch(/ruled out/);
+  });
+
+  test("a tenant asking for a person is not argued with", async () => {
+    const { id } = await report("Oven door hinge", "The door drops open on its own.");
+    const { data } = await tenant.post(`/api/tickets/${id}/messages`, {
+      body: "I would rather someone just came out to look at it.",
+    });
+    expect(data.ticket.status).toBe("open");
   });
 });
