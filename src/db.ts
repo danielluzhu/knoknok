@@ -44,13 +44,17 @@ CREATE TABLE IF NOT EXISTS properties (
 -- tenant that is the only one they will ever have. Landlords and vendors both
 -- span several, so for them it is a cursor, and the authoritative list lives in
 -- properties.landlord_id / property_vendors respectively.
+--
+-- It is nullable because a vendor can hold an account before holding any work:
+-- a contractor signs up first and is given codes afterwards, so there is a real
+-- state where there is nothing to point at.
 CREATE TABLE IF NOT EXISTS users (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   username      TEXT NOT NULL UNIQUE COLLATE NOCASE,
   password_hash TEXT NOT NULL,
   role          TEXT NOT NULL CHECK (role IN ('tenant','landlord','vendor')),
   display_name  TEXT NOT NULL,
-  property_id   INTEGER NOT NULL REFERENCES properties(id),
+  property_id   INTEGER REFERENCES properties(id),
   unit          TEXT,
   created_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -281,6 +285,25 @@ async function evolve(): Promise<void> {
     });
   }
 
+  // A vendor may now sign up before they hold any property code, so the cursor
+  // has to be allowed to be empty. SQLite cannot drop a NOT NULL in place.
+  if (/property_id\s+INTEGER NOT NULL/.test(await tableDdl("users"))) {
+    await rebuild(
+      "users",
+      `CREATE TABLE users__next (
+         id            INTEGER PRIMARY KEY AUTOINCREMENT,
+         username      TEXT NOT NULL UNIQUE COLLATE NOCASE,
+         password_hash TEXT NOT NULL,
+         role          TEXT NOT NULL CHECK (role IN ('tenant','landlord','vendor')),
+         display_name  TEXT NOT NULL,
+         property_id   INTEGER REFERENCES properties(id),
+         unit          TEXT,
+         created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+       )`,
+      "id, username, password_hash, role, display_name, property_id, unit, created_at",
+    );
+  }
+
   // Response-time targets. Existing requests get one worked out from what they
   // already say, so the list is not split between tickets that have a target and
   // tickets that do not.
@@ -437,7 +460,8 @@ export interface User {
   password_hash: string;
   role: Role;
   display_name: string;
-  property_id: number;
+  /** Null only for a vendor who has not been given a property code yet. */
+  property_id: number | null;
   unit: string | null;
   created_at: string;
 }

@@ -247,7 +247,8 @@ async function readMarker(ticketId: number, userId: number): Promise<number> {
  * inside — `users.property_id` alone is a cursor, never a permission.
  */
 async function accessibleProperties(user: User): Promise<number[]> {
-  if (user.role === "tenant") return [user.property_id];
+  // A tenant always has exactly one; a vendor may have none yet.
+  if (user.role === "tenant") return user.property_id ? [user.property_id] : [];
   const rows = user.role === "landlord"
     ? await db.all<{ id: number }>("SELECT id FROM properties WHERE landlord_id = ?", [user.id])
     : await db.all<{ id: number }>(
@@ -361,10 +362,12 @@ async function createProperty(landlord: User, name: string) {
 }
 
 async function publicUser(u: User) {
-  const property = (await db.get<{ name: string; join_code: string; vendor_code: string | null }>(
-    "SELECT name, join_code, vendor_code FROM properties WHERE id = ?",
-    [u.property_id],
-  ))!;
+  const property = u.property_id
+    ? await db.get<{ name: string; join_code: string; vendor_code: string | null }>(
+        "SELECT name, join_code, vendor_code FROM properties WHERE id = ?",
+        [u.property_id],
+      )
+    : null;
   const landlord = u.role === "landlord";
   return {
     id: u.id,
@@ -372,7 +375,8 @@ async function publicUser(u: User) {
     role: u.role,
     displayName: u.display_name,
     unit: u.unit,
-    property: {
+    // Null for a vendor who has signed up but holds no property code yet.
+    property: property && {
       id: u.property_id,
       name: property.name,
       // Both codes are shared secrets for the building — landlords only. They
@@ -447,7 +451,8 @@ async function handleSignup(req: Request): Promise<Response> {
     return fail("That username is taken.");
   }
 
-  let propertyId: number;
+  // Null only for a vendor signing up before they hold any property code.
+  let propertyId: number | null = null;
   let unit: string | null = null;
   // A landlord's first property cannot name its owner yet — the user row does
   // not exist until below — so the ownership is stamped on afterwards.
@@ -465,18 +470,25 @@ async function handleSignup(req: Request): Promise<Response> {
     propertyId = res.id;
     claimProperty = true;
   } else if (role === "vendor") {
+    // A code is optional here. A contractor signs up when they decide to use the
+    // app, which is not the same moment a landlord gets round to sending them a
+    // code — requiring one would mean the account cannot exist until the work
+    // does. Without it they land in an empty state that asks for one.
     const vendorCode = String(b.vendorCode ?? "").trim().toUpperCase();
-    if (!vendorCode) return fail("Enter the vendor code the landlord gave you.");
-    const property = await db.get<{ id: number }>(
-      "SELECT id FROM properties WHERE vendor_code = ?",
-      [vendorCode],
-    );
-    // Deliberately not "that is a tenant code" — the two code spaces are
-    // separate on purpose, and saying which one was typed helps nobody but a
-    // guesser.
-    if (!property) return fail("No property matches that vendor code.");
-    propertyId = property.id;
-    joinAsVendor = true;
+    if (vendorCode) {
+      const property = await db.get<{ id: number }>(
+        "SELECT id FROM properties WHERE vendor_code = ?",
+        [vendorCode],
+      );
+      // Deliberately not "that is a tenant code" — the two code spaces are
+      // separate on purpose, and saying which one was typed helps nobody but a
+      // guesser.
+      if (!property) return fail("No property matches that vendor code.");
+      propertyId = property.id;
+      joinAsVendor = true;
+    } else {
+      propertyId = null;
+    }
   } else {
     const joinCode = String(b.joinCode ?? "").trim().toUpperCase();
     unit = String(b.unit ?? "").trim();
@@ -500,7 +512,7 @@ async function handleSignup(req: Request): Promise<Response> {
   if (claimProperty) {
     await db.run("UPDATE properties SET landlord_id = ? WHERE id = ?", [user.id, propertyId]);
   }
-  if (joinAsVendor) {
+  if (joinAsVendor && propertyId) {
     await db.run(
       "INSERT INTO property_vendors (property_id, vendor_id) VALUES (?, ?)",
       [propertyId, user.id],
@@ -648,7 +660,9 @@ async function createTicket(user: User, req: Request): Promise<Response> {
   // Falling back to the cursor keeps the single-property case a no-op.
   const owned = await accessibleProperties(user);
   const propertyId = b?.propertyId ? Number(b.propertyId) : user.property_id;
-  if (!owned.includes(propertyId)) return fail("That property is not yours.", 403);
+  if (!propertyId || !owned.includes(propertyId)) {
+    return fail("That property is not yours.", 403);
+  }
 
   let tenantId: number | null = null;
   if (b?.tenantId) {
@@ -1007,11 +1021,17 @@ async function joinPropertyAsVendor(user: User, req: Request): Promise<Response>
     "INSERT INTO property_vendors (property_id, vendor_id) VALUES (?, ?)",
     [property.id, user.id],
   );
-  // Same as adding one: redeeming a code widens what you can see, it does not
-  // say you want to look only at the property you just joined.
+  // Redeeming a code widens what you can see; it does not say you want to look
+  // only at the property you just joined. The exception is a vendor who had no
+  // cursor at all — there is nothing to preserve, and leaving it empty would
+  // leave them with a property but no property in view.
+  if (!user.property_id) {
+    await db.run("UPDATE users SET property_id = ? WHERE id = ?", [property.id, user.id]);
+  }
+  const fresh = (await db.get<User>("SELECT * FROM users WHERE id = ?", [user.id]))!;
   return json({
-    user: await publicUser(user),
-    properties: await propertiesFor(user),
+    user: await publicUser(fresh),
+    properties: await propertiesFor(fresh),
     created: property.id,
   });
 }
@@ -1041,7 +1061,7 @@ async function chatPartner(user: User, tenantId: number): Promise<User | null> {
   if (user.role === "tenant") {
     // Tenants have exactly one conversation: their own, with their landlord.
     if (tenantId !== user.id) return null;
-    return landlordOf(user.property_id);
+    return user.property_id ? landlordOf(user.property_id) : null;
   }
   if (user.role === "vendor") return null;
   // Any tenant on any property this landlord owns, not just the one in view.
@@ -1110,7 +1130,7 @@ async function listChats(user: User, url: URL): Promise<Response> {
     return json({ chats: rows });
   }
 
-  const landlord = await landlordOf(user.property_id);
+  const landlord = user.property_id ? await landlordOf(user.property_id) : null;
   if (!landlord) return json({ chats: [] }); // property with no landlord: nothing to show
   const row = await db.get(
     `SELECT $id AS id, $name AS name, 'your landlord' AS subtitle,

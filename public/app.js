@@ -404,12 +404,13 @@ function enterApp() {
   $("#app").classList.remove("hidden");
 
   // A tenant has one property and no way to change it, so they get plain text
-  // where the other two roles get the switcher.
+  // where the other two roles get the switcher. A vendor may have none at all
+  // yet, in which case there is nothing to name.
   const oneProperty = me.role === "tenant";
-  state.scope = oneProperty ? me.property.id : "all";
+  state.scope = oneProperty && me.property ? me.property.id : "all";
   $("#propName").classList.toggle("hidden", !oneProperty);
   $("#propSwitch").classList.toggle("hidden", oneProperty);
-  $("#propName").textContent = me.property.name;
+  $("#propName").textContent = me.property?.name ?? "";
 
   $("#whoami").textContent = me.role === "tenant"
     ? `${me.displayName} · Unit ${me.unit}`
@@ -458,6 +459,12 @@ function renderPropertySwitch() {
   const landlord = state.me.role === "landlord";
   // Everything at once is the default, and the first thing in the list — a
   // landlord's day starts with "what needs doing", not "which building".
+  if (!state.properties.length) {
+    // A vendor who has signed up but holds no code yet.
+    $("#propSelect").innerHTML = "<option>No properties yet</option>";
+    $("#propAdd").textContent = landlord ? "+ Property" : "+ Join";
+    return;
+  }
   const total = state.properties.reduce((n, p) => n + (p.open || 0), 0);
   const all = `<option value="all"${state.scope === "all" ? " selected" : ""}>All properties${
     total ? ` (${total})` : ""
@@ -484,7 +491,7 @@ async function selectProperty(scope) {
   if (scope !== "all") {
     const { user } = await api(`/api/properties/${scope}/select`, { method: "POST" });
     state.me = user;
-    $("#propName").textContent = user.property.name;
+    $("#propName").textContent = user.property?.name ?? "";
   }
   state.scope = scope;
   state.selected = null;
@@ -528,6 +535,13 @@ function wirePropertySwitch() {
           });
       if (user) state.me = user;
       state.properties = properties;
+      // Nothing was on screen before the first property, so show it.
+      if (!landlord && state.properties.length === 1) {
+        state.scope = state.properties[0].id;
+        renderPropertySwitch();
+        await refresh(false);
+        return;
+      }
       // Land on everything rather than on the property just added — the point
       // of adding one is that the portfolio grew, and the new building is empty
       // so tunnelling into it would show a blank list.
@@ -896,9 +910,11 @@ function renderList() {
       state.me.role === "tenant"
         ? "Nothing here yet.<br>Tap <b>+ New request</b> when something needs fixing."
         : state.me.role === "vendor"
-          ? (state.filter === "mine"
-              ? "You haven't picked up any jobs here.<br>Check <b>Open jobs</b> for work going spare."
-              : "No open jobs on this property right now.")
+          ? (!state.properties.length
+              ? "You're not on any properties yet.<br>Tap <b>+ Join</b> and enter the vendor code a landlord sent you."
+              : state.filter === "mine"
+                ? "You haven't picked up any jobs here.<br>Check <b>Open jobs</b> for work going spare."
+                : "No open jobs here right now.")
           : "Nothing on the list.<br>Tenant requests land here once the assistant escalates them."
     }</div>`;
     return;

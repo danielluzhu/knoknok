@@ -1207,3 +1207,58 @@ describe("response times", () => {
     expect(data.counts.overdue).toBeGreaterThanOrEqual(before);
   });
 });
+
+describe("a vendor without a code", () => {
+  const solo = new Session();
+  const landlord = new Session();
+  let vendorCode = "";
+
+  test("can create an account and sign in", async () => {
+    const { status, data } = await solo.post("/api/signup", {
+      role: "vendor", username: uniq("solo"), password: "password123",
+      displayName: "Solo Plumbing",
+    });
+    expect(status).toBe(200);
+    expect(data.user.role).toBe("vendor");
+    // Nothing to point at yet, and that is a real state rather than an error.
+    expect(data.user.property).toBeNull();
+    expect(data.user.propertyCount).toBe(0);
+  });
+
+  test("their empty account works rather than erroring", async () => {
+    expect((await solo.get("/api/me")).data.user.property).toBeNull();
+    expect((await solo.get("/api/properties")).data.properties).toEqual([]);
+    expect((await solo.get("/api/tickets?status=open")).data.tickets).toEqual([]);
+    expect((await solo.get("/api/chats")).data.chats).toEqual([]);
+  });
+
+  test("a bad code is still refused", async () => {
+    const { status } = await solo.post("/api/properties/join", { vendorCode: "V-NOPE12" });
+    expect(status).toBe(400);
+  });
+
+  test("redeeming a code later puts them to work", async () => {
+    const { data: lord } = await landlord.post("/api/signup", {
+      role: "landlord", username: uniq("late"), password: "password123",
+      displayName: "Late L", propertyName: "Latecomer House",
+    });
+    vendorCode = lord.user.property.vendorCode;
+    await landlord.post("/api/tickets", { title: "Fix the gate" });
+
+    const { status, data } = await solo.post("/api/properties/join", { vendorCode });
+    expect(status).toBe(200);
+    // Their first property becomes the one in view — there was nothing to keep.
+    expect(data.user.property.name).toBe("Latecomer House");
+    expect(data.user.propertyCount).toBe(1);
+    expect((await solo.get("/api/tickets?status=open")).data.tickets).toHaveLength(1);
+  });
+
+  test("a signup with a bad code is still rejected outright", async () => {
+    const { status, data } = await new Session().post("/api/signup", {
+      role: "vendor", username: uniq("wrong"), password: "password123",
+      displayName: "Wrong W", vendorCode: "V-BOGUS1",
+    });
+    expect(status).toBe(400);
+    expect(data.error).toContain("No property");
+  });
+});
