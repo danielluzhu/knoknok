@@ -305,7 +305,36 @@ describe("structured intake", () => {
     const reply = data.messages.at(-1);
     expect(reply.author).toBe("bot");
     expect(reply.body).toContain("plunger");
-    expect(reply.body).not.toContain("Where exactly");
+    expect(reply.body).not.toContain("Whereabouts");
+  });
+
+  // Reported: plumbing > drain clogged > "sink won't drain", Kitchen, today —
+  // and the assistant asked where in the kitchen. A kitchen has one sink, and
+  // the tenant had just named it. Asking anyway reads as not having listened.
+  test("a one-per-room fixture is not asked to be located again", async () => {
+    const { data } = await tenant.post("/api/tickets", {
+      intake: { issue: "clog", what: "sink won't drain", room: "Kitchen", when: "Today" },
+    });
+    const first = data.messages.at(-1).body;
+    expect(first).not.toContain("Whereabouts");
+    expect(first).not.toContain("kitchen?");
+    // It moves on to something it genuinely does not know.
+    expect(first).toContain("tried anything");
+  });
+
+  test("the exact spot is still asked when it would actually help", async () => {
+    // "A leak" names nothing a plumber could walk to, so where in the room is
+    // the difference between arriving with the right part and hunting for it.
+    const vague = await tenant.post("/api/tickets", {
+      intake: { issue: "leak", what: "a leak", room: "Bathroom", when: "Today" },
+    });
+    expect(vague.data.messages.at(-1).body).toContain("Whereabouts in the bathroom");
+
+    // Nor is there a spot to give when the whole unit is affected.
+    const unit = await tenant.post("/api/tickets", {
+      intake: { issue: "noac", what: "no cool air anywhere", room: "Whole unit", when: "Today" },
+    });
+    expect(unit.data.messages.at(-1).body).not.toContain("Whereabouts");
   });
 
   test("the assistant asks for the missing basics before it troubleshoots", async () => {
@@ -315,7 +344,8 @@ describe("structured intake", () => {
     });
     const id = made.data.ticket.id;
     const first = made.data.messages.at(-1).body;
-    expect(first).toContain("Where exactly in the bathroom");
+    // An outlet is not a one-per-room fixture, so where in the room still matters.
+    expect(first).toContain("Whereabouts in the bathroom");
     expect(first).not.toContain("GFCI");
 
     const second = await tenant.post(`/api/tickets/${id}/messages`, {

@@ -82,14 +82,22 @@ Aim for about 150 words. Go longer only when the extra words genuinely save a vi
 BEFORE YOU DECIDE
 
 You may not resolve or escalate until you know all four of these: WHAT is broken (the specific
-fixture or appliance), WHERE it is (the room and the exact spot), WHEN it started and whether it
-is constant or intermittent (skip this only when timing clearly cannot change the diagnosis), and
+fixture or appliance), WHERE it is (enough to walk to it), WHEN it started and whether it is
+constant or intermittent (skip this only when timing clearly cannot change the diagnosis), and
 OTHER relevant facts — what the tenant has already tried, whether it is getting worse, any damage.
 
+Knowing something and being told it in so many words are not the same thing. A kitchen sink is
+the kitchen sink: "sink" plus "kitchen" is a location, and asking which part of the kitchen it is
+in reads as not having listened. Ask where in the room only when it would change what someone
+brings or where they look — an outlet among several, a stain on one wall, a radiator in a room
+with two. Treat the other three the same way: if what the tenant wrote already answers an item,
+it is answered.
+
 Most requests arrive with a structured intake that covers some or all of these; it is quoted at
-the top of the first message along with which items are still missing. If any are missing or too
-vague to act on, ask for those first — one item per reply, folded into your closing question —
-before any diagnostic check. Never re-ask something the tenant has already given.
+the top of the first message along with which items are still missing. If any are genuinely
+missing or too vague to act on, ask for those first — one item per reply, folded into your
+closing question — before any diagnostic check. Never re-ask something the tenant has already
+given, or already made plain.
 
 WHAT NOT TO DO
 
@@ -702,8 +710,13 @@ function triageWithRules(title: string, history: Message[], intake: Intake | nul
   // 3. Fill the gaps first: no decision until what, where, when and what was
   //    tried are all known.
   if (botReplies < gaps.length && !wantsHuman) {
+    // "A couple of things" when there is one thing left is the same failure as
+    // asking something already answered: it tells the tenant the reply was
+    // assembled rather than written to them.
     const opening = botReplies === 0
-      ? "Thanks — a couple of quick things before we work out what this is.\n\n"
+      ? (gaps.length > 1
+          ? "Thanks — a couple of quick things before we work out what this is.\n\n"
+          : "Thanks — one thing before we work out what this is.\n\n")
       : "Got it. ";
     return {
       reply: opening + gaps[botReplies]!.ask,

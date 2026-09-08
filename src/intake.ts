@@ -524,6 +524,41 @@ export type GapKey = "what" | "where" | "when" | "other";
  * before it troubleshoots. `what` and `room` are required by the form, so in
  * practice the gaps are the exact spot, the timing, and what was tried.
  */
+/**
+ * Fixtures a room normally has exactly one of.
+ *
+ * Naming one of these in WHAT locates the problem as precisely as a spot would.
+ * A kitchen sink is the kitchen sink, and asking which part of the kitchen it is
+ * in reads as not having listened — which is worse than not asking, because the
+ * tenant has just been made to repeat themselves to something that was supposed
+ * to be paying attention.
+ */
+const PINPOINTS = [
+  "sink", "basin", "faucet", "tap", "toilet", "tub", "bathtub", "shower",
+  "oven", "stove", "cooker", "range", "hob", "microwave",
+  "refrigerator", "fridge", "freezer", "dishwasher", "disposal",
+  "washer", "washing machine", "dryer",
+  "thermostat", "water heater", "boiler", "furnace",
+];
+
+/** A room you cannot point at a spot within. */
+const UNPOINTABLE = new Set(["whole unit"]);
+
+/**
+ * Whether the exact spot would actually add anything.
+ *
+ * False when the tenant has already pinned it — either by naming a one-per-room
+ * fixture, or by saying the problem is the whole unit. True when WHAT is vague
+ * ("a leak", "a smell") or names something a room can hold several of (an
+ * outlet, a window, a radiator), where the spot is the difference between
+ * arriving with the right part and hunting for it.
+ */
+function spotWouldHelp(d: Intake): boolean {
+  if (UNPOINTABLE.has(d.room.trim().toLowerCase())) return false;
+  const what = ` ${d.what.toLowerCase().replace(/[^a-z ]+/g, " ").replace(/\s+/g, " ")} `;
+  return !PINPOINTS.some((fixture) => what.includes(` ${fixture} `));
+}
+
 export function intakeGaps(d: Intake): { key: GapKey; ask: string }[] {
   const issue = findIssue(d.issue);
   const gaps: { key: GapKey; ask: string }[] = [];
@@ -532,10 +567,11 @@ export function intakeGaps(d: Intake): { key: GapKey; ask: string }[] {
   }
   if (!d.room) {
     gaps.push({ key: "where", ask: "Which room is it in?" });
-  } else if (!d.spot) {
+  } else if (!d.spot && spotWouldHelp(d)) {
     gaps.push({
       key: "where",
-      ask: `Where exactly in the ${d.room.toLowerCase()}? Under the sink, by the window, the back-left burner — that sort of thing.`,
+      ask: `Whereabouts in the ${d.room.toLowerCase()} is it? Anything that narrows it down — `
+        + "which wall, which fixture, how far off the floor.",
     });
   }
   if (!d.when && issue?.whenMatters) {
