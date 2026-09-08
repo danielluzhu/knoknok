@@ -6,6 +6,9 @@
  * same interface, same three possible actions.
  */
 import type { Message, Priority } from "./db";
+import {
+  findIssue, intakeGaps, whenText, whereText, type Intake, type Issue,
+} from "./intake";
 
 export const CATEGORIES = [
   "plumbing",
@@ -38,28 +41,6 @@ export interface TriageResult {
   summary: string;
   /** Which engine produced this result. */
   engine: "claude" | "rules";
-}
-
-/**
- * What the tenant already told us by tapping buttons, before the assistant was
- * involved. Passed in rather than left in the message history so the assistant's
- * "by your third reply" pacing counts real exchanges, not intake taps.
- */
-export interface IntakeContext {
-  category: Category;
-  /** The category button they tapped, as written on it. */
-  categoryLabel: string;
-  /** The follow-up button they tapped, as written on it. */
-  severityLabel: string;
-}
-
-/** How the intake is described to the model: as answers already given, not as a verdict. */
-function intakeNote(intake: IntakeContext): string {
-  return `Before this conversation started, the tenant answered two multiple-choice questions. They `
-    + `chose "${intake.categoryLabel}" for the kind of problem, and "${intake.severityLabel}" for `
-    + `what is happening. Take those as given and do not ask them again — start from what they `
-    + `narrow it to. They are the tenant's own reading of the problem, so if what they go on to `
-    + `describe does not fit, trust the description.`;
 }
 
 export const usingClaude = Boolean(process.env.ANTHROPIC_API_KEY);
@@ -98,6 +79,18 @@ Close with the single question whose answer decides what happens next. One quest
 
 Aim for about 150 words. Go longer only when the extra words genuinely save a visit.
 
+BEFORE YOU DECIDE
+
+You may not resolve or escalate until you know all four of these: WHAT is broken (the specific
+fixture or appliance), WHERE it is (the room and the exact spot), WHEN it started and whether it
+is constant or intermittent (skip this only when timing clearly cannot change the diagnosis), and
+OTHER relevant facts — what the tenant has already tried, whether it is getting worse, any damage.
+
+Most requests arrive with a structured intake that covers some or all of these; it is quoted at
+the top of the first message along with which items are still missing. If any are missing or too
+vague to act on, ask for those first — one item per reply, folded into your closing question —
+before any diagnostic check. Never re-ask something the tenant has already given.
+
 WHAT NOT TO DO
 
 - Never send anyone inside an electrical panel, onto a gas line or appliance, into a water heater,
@@ -105,7 +98,8 @@ WHAT NOT TO DO
 - Never guess at a diagnosis you have no basis for. If what they said fits several causes and you
   cannot narrow it, say which ones and ask the question that separates them.
 - No markdown headers, no bold. Plain sentences and simple dashes or numbers.
-- Do not stall. By your third reply you are either resolved or escalating.
+- Do not stall. By your third reply after the basics below are covered, you are either resolved
+  or escalating.
 
 WHEN TO STOP TROUBLESHOOTING IMMEDIATELY
 
@@ -134,10 +128,46 @@ normal = should be fixed soon, low = cosmetic or convenience.`;
 
 /* ------------------------------------------------------------------ Claude */
 
+/**
+ * The structured intake, written out for the model: what was picked, what was
+ * filled in, and — the part that matters — what is still missing.
+ */
+function intakeBrief(intake: Intake): string {
+  const issue = findIssue(intake.issue);
+  if (!issue) return "";
+  const gaps = intakeGaps(intake);
+  const lines = [
+    "Structured intake (what the tenant filled in before this conversation):",
+    `Issue: ${issue.name} (filed under ${issue.category}).`
+      + (issue.urgent
+        ? " EMERGENCY: the tenant has already been shown what to do right now. "
+          + "Confirm they are safe, escalate as urgent, do not troubleshoot."
+        : ""),
+    `What: ${intake.what}`,
+    `Where: ${whereText(intake)}`,
+    `When: ${whenText(intake)
+      || `not given${issue.whenMatters ? "" : " (timing does not matter for this issue)"}`}`,
+    `Other: ${intake.notes || "not given"}`,
+    gaps.length
+      ? `Still missing before you may decide: ${gaps.map((g) => g.key.toUpperCase()).join(", ")}. `
+        + "Ask for these first, one per reply."
+      : "All four basics are covered. Go straight to working out what it is.",
+  ];
+  if (issue.questions.length) {
+    lines.push(`Issue-specific follow-ups worth asking: ${issue.questions.join(" | ")}`);
+  }
+  lines.push(
+    issue.tips.length
+      ? `Safe fixes you may suggest for this issue: ${issue.tips.join(" | ")}`
+      : "There is no safe self-fix for this issue; once the basics are covered it needs a person.",
+  );
+  return lines.join("\n");
+}
+
 async function triageWithClaude(
   title: string,
   history: Message[],
-  intake: IntakeContext | null,
+  intake: Intake | null,
 ): Promise<TriageResult> {
   const [{ default: Anthropic }, { z }, { zodOutputFormat }] = await Promise.all([
     import("@anthropic-ai/sdk"),
@@ -164,10 +194,10 @@ async function triageWithClaude(
 
   // The stored history always starts with the tenant's description, so messages
   // is non-empty and begins with a user turn.
+  const brief = intake ? intakeBrief(intake) : "";
   messages[0] = {
     role: "user",
-    content: `Request title: ${title}\n\n${messages[0]!.content}`
-      + (intake ? `\n\n${intakeNote(intake)}` : ""),
+    content: `Request title: ${title}\n\n${brief ? `${brief}\n\nTenant's message:\n` : ""}${messages[0]!.content}`,
   };
 
   const response = await client.messages.parse({
@@ -552,49 +582,109 @@ function explain(book: Playbook, opening: string): string {
   ].filter(Boolean).join("\n\n");
 }
 
-function triageWithRules(
-  title: string,
-  history: Message[],
-  intake: IntakeContext | null,
-): TriageResult {
+/**
+ * A playbook built from the issue the tenant picked, so the offline engine
+ * answers about the thing they chose rather than guessing from keywords.
+ */
+function issuePlaybook(issue: Issue): Playbook {
+  return {
+    category: issue.category,
+    keywords: [],
+    likely: "",
+    checks: issue.tips.map((t) => ({ do: t })),
+    question: issue.questions[0]
+      ?? "Is there anything else worth knowing before this goes on the list?",
+    priority: issue.priority,
+  };
+}
+
+/** Never more than this many basics asked in the chat; the form covers the rest. */
+const MAX_GAP_QUESTIONS = 2;
+
+/**
+ * The landlord's one-liner, from the intake plus whatever the gap questions
+ * drew out. The tenant's answer to gap question k is their (k+1)th message —
+ * the first one is the intake itself.
+ */
+function intakeSummary(
+  intake: Intake,
+  issue: Issue,
+  gaps: { key: string; ask: string }[],
+  tenantTurns: Message[],
+  ruledOut: number,
+): string {
+  const answer = (k: number) => tenantTurns[k + 1]?.body?.trim().replace(/\s+/g, " ") ?? "";
+  const extra: Record<string, string> = {};
+  gaps.forEach((g, k) => { if (answer(k)) extra[g.key] = answer(k); });
+
+  const parts = [`${issue.name}: ${intake.what}`];
+  parts.push([whereText(intake), extra.where].filter(Boolean).join(", "));
+  const when = [whenText(intake), extra.when].filter(Boolean).join("; ");
+  if (when) parts.push(`since: ${when}`);
+  const other = [intake.notes, extra.other].filter(Boolean).join("; ");
+  if (other) parts.push(`tenant notes: ${other}`);
+  if (ruledOut > 0) {
+    parts.push(`ruled out ${ruledOut} common cause${ruledOut === 1 ? "" : "s"} in triage`);
+  }
+  return parts.join(" — ").slice(0, 400);
+}
+
+function triageWithRules(title: string, history: Message[], intake: Intake | null): TriageResult {
   const tenantTurns = history.filter((m) => m.author === "tenant");
   const botTurns = history.filter((m) => m.author === "bot");
   const latest = norm(tenantTurns.at(-1)?.body ?? "");
   const titleText = norm(title);
-  const all = norm(
-    [title, intake?.categoryLabel ?? "", intake?.severityLabel ?? "",
-      ...tenantTurns.map((m) => m.body)].join(" \n "),
-  );
+  const all = norm([title, ...tenantTurns.map((m) => m.body)].join(" \n "));
 
-  const book = pickPlaybook(all, titleText);
-  // The tenant already told us the category with a button, and that is a better
-  // answer than keyword matching. The playbook still supplies the checks, but it
-  // no longer gets to overrule what they said it was.
-  const category: Category = intake?.category ?? book?.category ?? "other";
+  // With a structured intake the tenant has told us which issue this is, so
+  // the answer comes from that issue rather than from keyword matching. The
+  // one exception is "not listed here", where the keywords are all we have.
+  const issue = intake ? findIssue(intake.issue) : null;
+  const book = issue && issue.id !== "unlisted"
+    ? issuePlaybook(issue)
+    : pickPlaybook(all, titleText);
+  const category: Category = book?.category ?? issue?.category ?? "other";
   const label = title.trim() || "Maintenance request";
 
   // 1. Emergencies short-circuit everything.
-  const emergency = EMERGENCY.find((e) => hits(all, e.kw));
+  const emergency = issue?.urgent
+    ? { why: issue.name.toLowerCase(), steps: issue.emergency?.steps ?? [] }
+    : EMERGENCY.find((e) => hits(all, e.kw));
   if (emergency) {
+    const steps = "steps" in emergency && emergency.steps.length
+      ? emergency.steps.map((s, i) => `${i + 1}. ${s}`).join("\n")
+      : `If anyone is in danger, leave and call emergency services — that comes before anything `
+        + `here. If you can do it safely on your way out, shut off the valve or breaker feeding `
+        + `whatever is causing it.`;
     return {
       reply: [
         `This reads like ${emergency.why}, so I am not going to have you troubleshoot it. `
         + `I have marked it urgent and put it at the top of your landlord's list.`,
-        `If anyone is in danger, leave and call emergency services — that comes before anything `
-        + `here. If you can do it safely on your way out, shut off the valve or breaker feeding `
-        + `whatever is causing it.`,
+        steps,
         `Tell me what is happening now and I will pass it straight on.`,
       ].join("\n\n"),
       action: "escalate",
       category: category === "other" ? "structural" : category,
       priority: "urgent",
-      summary: `URGENT (${emergency.why}): ${label}`,
+      summary: `URGENT (${emergency.why}): ${
+        intake && issue ? intakeSummary(intake, issue, [], tenantTurns, 0) : label
+      }`,
       engine: "rules",
     };
   }
 
-  // 2. Tenant confirmed a fix worked.
-  if (botTurns.length > 0 && hits(latest, YES) && !hits(latest, NO)) {
+  // The basics the form left open. These are asked before any troubleshooting,
+  // and they are always the first replies on the thread — so how many have been
+  // asked is simply how many replies there have been, capped at the gap count.
+  const gaps = intake ? intakeGaps(intake).slice(0, MAX_GAP_QUESTIONS) : [];
+  const botReplies = botTurns.length;
+  const wantsHuman = hits(latest, WANTS_HUMAN);
+  const summarize = (ruledOut: number) =>
+    intake && issue ? intakeSummary(intake, issue, gaps, tenantTurns, ruledOut) : label;
+
+  // 2. Tenant confirmed a fix worked. Only once a fix has actually been offered
+  //    — "yes" in answer to "is it getting worse?" means the opposite.
+  if (botReplies > gaps.length && hits(latest, YES) && !hits(latest, NO)) {
     return {
       reply:
         "Good — that is one that did not need a visit. I will close it out.\n\n"
@@ -609,21 +699,52 @@ function triageWithRules(
     };
   }
 
-  const botReplies = botTurns.length;
-  const wantsHuman = hits(latest, WANTS_HUMAN);
+  // 3. Fill the gaps first: no decision until what, where, when and what was
+  //    tried are all known.
+  if (botReplies < gaps.length && !wantsHuman) {
+    const opening = botReplies === 0
+      ? "Thanks — a couple of quick things before we work out what this is.\n\n"
+      : "Got it. ";
+    return {
+      reply: opening + gaps[botReplies]!.ask,
+      action: "ask",
+      category,
+      priority: book?.priority ?? issue?.priority ?? "normal",
+      summary: summarize(0),
+      engine: "rules",
+    };
+  }
+  // How far into the troubleshooting we are, gap questions aside.
+  const phase = botReplies - gaps.length;
 
-  // 3. First reply: say what is probably going on and what would confirm it.
-  if (botReplies === 0 && !wantsHuman) {
-    if (book) {
+  // 4. First real reply: say what is probably going on and what would confirm it.
+  if (phase === 0 && !wantsHuman) {
+    if (book && book.checks.length) {
       return {
         reply: explain(
           book,
-          "Thanks — let me see if we can work out what this is before anyone has to come out.",
+          gaps.length
+            ? "That is everything I need. Let me see if we can work this out before anyone has to come out."
+            : "Thanks — let me see if we can work out what this is before anyone has to come out.",
         ),
         action: "ask",
         category,
         priority: book.priority,
-        summary: label,
+        summary: summarize(0),
+        engine: "rules",
+      };
+    }
+    // The basics are covered and there is nothing safe to try — straight on the list.
+    if (intake) {
+      return {
+        reply:
+          "That is everything I need, and this is not one with a reset button — it needs your "
+          + "landlord.\n\nIt is on their list with these details attached, so you will not have to "
+          + "explain it again. Their replies come back in this same thread.",
+        action: "escalate",
+        category,
+        priority: book?.priority ?? issue?.priority ?? "normal",
+        summary: summarize(0),
         engine: "rules",
       };
     }
@@ -641,26 +762,28 @@ function triageWithRules(
     };
   }
 
-  // 4. They answered but it is not fixed — give the reasoning behind what is left.
-  if (book && !wantsHuman && botReplies === 1 && book.checks.length > 1) {
+  // 5. They answered but it is not fixed — give the reasoning behind what is left.
+  if (book && !wantsHuman && phase === 1 && book.checks.length > 1) {
     const rest = book.checks.slice(1)
       .map((c, i) => `${i + 1}. ${c.do}${c.means ? `\n   ${c.means}` : ""}`)
       .join("\n");
+    // The issue's second follow-up, when the intake gave us one.
+    const followUp = issue?.questions[1] ? `\n\n${issue.questions[1]}` : "";
     return {
       reply:
         `Right — that rules out the easy one. What is left before this needs someone:\n\n${rest}`
         + `\n\nIf neither changes anything, say so and I will hand it over with everything we have `
-        + `ruled out, so nobody starts from scratch.`,
+        + `ruled out, so nobody starts from scratch.${followUp}`,
       action: "ask",
       category,
       priority: book.priority,
-      summary: label,
+      summary: summarize(1),
       engine: "rules",
     };
   }
 
-  // 5. Out of road — hand it over with what was learned.
-  const ruledOut = Math.min(botReplies, book?.checks.length ?? 0);
+  // 6. Out of road — hand it over with what was learned.
+  const ruledOut = Math.min(Math.max(phase, 0), book?.checks.length ?? 0);
   const tried = ruledOut > 0
     ? ` We ruled out ${ruledOut === 1 ? "the usual cause" : `the ${ruledOut} usual causes`} first, `
       + `so nobody will start there.`
@@ -672,27 +795,45 @@ function triageWithRules(
       + "explain it again. Their replies come back in this same thread.",
     action: "escalate",
     category,
-    priority: book?.priority ?? "normal",
-    summary: ruledOut > 0
-      ? `${label} — tenant ruled out ${ruledOut} common cause${ruledOut === 1 ? "" : "s"}, still unresolved`
-      : label,
+    priority: book?.priority ?? issue?.priority ?? "normal",
+    summary: intake
+      ? summarize(ruledOut)
+      : ruledOut > 0
+        ? `${label} — tenant ruled out ${ruledOut} common cause${ruledOut === 1 ? "" : "s"}, still unresolved`
+        : label,
     engine: "rules",
   };
 }
 
 /* ------------------------------------------------------------------ Public */
 
+/**
+ * Triage one turn of a request.
+ *
+ * `intake` is the structured form the tenant filled in when they raised it, if
+ * they raised it that way. Both engines use it the same way: the four basics it
+ * covers are not asked again, the ones it left open are asked before anything
+ * else, and an issue the tenant flagged as an emergency stays urgent whatever
+ * the engine says.
+ */
 export async function triage(
   title: string,
   history: Message[],
-  intake: IntakeContext | null = null,
+  intake: Intake | null = null,
 ): Promise<TriageResult> {
+  let result: TriageResult | null = null;
   if (usingClaude) {
     try {
-      return await triageWithClaude(title, history, intake);
+      result = await triageWithClaude(title, history, intake);
     } catch (err) {
       console.error("[bot] Claude triage failed, falling back to rules:", err);
     }
   }
-  return triageWithRules(title, history, intake);
+  result ??= triageWithRules(title, history, intake);
+
+  const issue = intake ? findIssue(intake.issue) : null;
+  if (issue?.urgent && result.action !== "resolved") {
+    result = { ...result, priority: "urgent", category: issue.category };
+  }
+  return result;
 }

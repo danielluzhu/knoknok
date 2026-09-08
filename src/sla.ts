@@ -50,8 +50,15 @@ function normalize(text: string): string {
 
 const matches = (text: string, patterns: RegExp[]) => patterns.some((p) => p.test(text));
 
-/** Words meaning "this thing is not working at all". */
-const DEAD = String.raw`(?:off|out|dead|gone|shut off|cut off|not working|stopped|`
+/**
+ * Words meaning "this thing is not working at all".
+ *
+ * `out` refuses to match "out of": water gushing out of a ceiling is a leak, not
+ * a supply that has been cut, and the difference decides whether the tenant is
+ * handed the emergency number. No phrasing here loses its dead sense to the
+ * exclusion — "the water is out" still matches, "pouring out of" no longer does.
+ */
+const DEAD = String.raw`(?:off|out(?! of)|dead|gone|shut off|cut off|not working|stopped|`
   + String.raw`will not work|does not work|cannot|no longer works?)`;
 
 /**

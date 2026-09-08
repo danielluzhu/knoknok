@@ -24,18 +24,10 @@ import {
   db, uniqueCode,
   type ChatMessage, type Message, type RecurringTask, type Ticket, type User,
 } from "./db";
-import { triage, usingClaude, type IntakeContext } from "./bot";
+import { triage, usingClaude } from "./bot";
 import {
-  CATEGORY_PROMPT,
-  categoryPrompt,
-  EMERGENCY_CONTACT,
-  emergencyReply,
-  escalateReply,
-  readCategory,
-  readSeverity,
-  severityPrompt,
-  severityQuestion,
-  type ChoicePrompt,
+  EMERGENCY_CONTACT, findIssue, intakeForClient, intakeMessage, intakeTitle, isStatutoryIssue,
+  parseIntake, type Intake,
 } from "./intake";
 import { dueAt, isStatutoryEmergency, slaTier, SLA_LABEL, SLA_POLICY } from "./sla";
 
@@ -412,19 +404,10 @@ async function addMessage(
   body: string,
   userId: number | null = null,
   photos: { mime: string; bytes: Buffer }[] = [],
-  extra: { kind?: string; choices?: ChoicePrompt; choice?: string } | null = null,
 ) {
-  // Anything carrying buttons or an answer to them is intake unless it says
-  // otherwise; `kind` is what the client styles on.
-  const kind = extra?.kind ?? (extra?.choices || extra?.choice ? "intake" : null);
   const message = (await db.get<{ id: number }>(
-    `INSERT INTO messages (ticket_id, author, user_id, body, kind, choices, choice)
-     VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id`,
-    [
-      ticketId, author, userId, body.trim(), kind,
-      extra?.choices ? JSON.stringify(extra.choices) : null,
-      extra?.choice ?? null,
-    ],
+    "INSERT INTO messages (ticket_id, author, user_id, body) VALUES (?, ?, ?, ?) RETURNING id",
+    [ticketId, author, userId, body.trim()],
   ))!;
   for (const photo of photos) {
     await db.run(
@@ -669,41 +652,24 @@ async function publicUser(u: User) {
   };
 }
 
+/** The structured intake a ticket was raised with, if it was raised that way. */
+function storedIntake(ticket: Ticket): Intake | null {
+  if (!ticket.intake) return null;
+  try {
+    const parsed = parseIntake(JSON.parse(ticket.intake));
+    return typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Run the bot over a ticket in triage and apply whatever it decided.
  * Returns the bot's own message plus any status change.
  */
-/**
- * Rebuild what the tenant told us with buttons, for the assistant's benefit.
- *
- * Returns null when a ticket never went through the intake — a thread from
- * before it existed, or one where the tenant typed instead of tapping.
- */
-async function intakeContext(ticketId: number): Promise<IntakeContext | null> {
-  const picks = await db.all<{ choice: string }>(
-    "SELECT choice FROM messages WHERE ticket_id = ? AND choice IS NOT NULL ORDER BY id",
-    [ticketId],
-  );
-  let category = null as ReturnType<typeof readCategory>;
-  let severity = null as ReturnType<typeof readSeverity>;
-  for (const { choice } of picks) {
-    category = readCategory(choice) ?? category;
-    severity = readSeverity(choice) ?? severity;
-  }
-  if (!category || !severity) return null;
-  return {
-    category: category.category,
-    categoryLabel: category.label,
-    severityLabel: severity.label,
-  };
-}
-
 async function runTriage(ticket: Ticket) {
-  // Intake messages are dropped rather than replayed. They are two taps, not two
-  // turns of conversation, and counting them as turns would have the assistant
-  // reaching its escalate-by-the-third-reply point before it had said anything.
-  const history = (await ticketMessages(ticket.id)).filter((m) => m.kind !== "intake");
-  const result = await triage(ticket.title, history, await intakeContext(ticket.id));
+  const history = await ticketMessages(ticket.id);
+  const result = await triage(ticket.title, history, storedIntake(ticket));
 
   await addMessage(ticket.id, "bot", result.reply);
 
@@ -736,137 +702,6 @@ async function runTriage(ticket: Ticket) {
     );
   }
   return result;
-}
-
-/**
- * Set the response-time target and say so, once triage has settled what this is.
- *
- * Both callers reach here with the category and priority already decided, which
- * is what the target is derived from — running it any earlier would file every
- * request under the same default.
- */
-async function settleSla(ticketId: number, verdict: boolean | null = null) {
-  await applySla(ticketId);
-  const after = await db.get<{ status: string }>(
-    "SELECT status FROM tickets WHERE id = ?", [ticketId]);
-  if (after?.status === "open") await noteResponseTime(ticketId);
-
-  // The emergency line, for a statutory emergency only — water, electricity or
-  // heating-season heat off, or something life-threatening. Deliberately not the
-  // SLA tier, which also catches anything a landlord marked urgent.
-  //
-  // The buttons are not the only way in: a tenant who types "there is no water"
-  // reaches the same place through the assistant and must be told the same
-  // thing. Said once per thread, since a number repeated on every reply reads as
-  // an error rather than as emphasis.
-  // When the tenant answered with a button, that answer decides it. Reading the
-  // title instead would let a phrase like "burst pipe" — which the wording rules
-  // treat as water being off — overrule the tenant, who was asked the question
-  // directly and said something narrower.
-  let statutory = verdict;
-  if (statutory === null) {
-    const t = await db.get<{ title: string; summary: string; category: string; created_at: string }>(
-      "SELECT title, summary, category, created_at FROM tickets WHERE id = ?", [ticketId]);
-    if (!t) return;
-    statutory = isStatutoryEmergency({
-      category: t.category,
-      text: `${t.title} ${t.summary}`,
-      at: new Date(t.created_at.replace(" ", "T") + "Z"),
-    });
-  }
-  if (!statutory) return;
-  const already = await db.get<{ id: number }>(
-    "SELECT id FROM messages WHERE ticket_id = ? AND body LIKE ? LIMIT 1",
-    [ticketId, `%${EMERGENCY_CONTACT}%`],
-  );
-  if (!already) {
-    await addMessage(ticketId, "system", EMERGENCY_CONTACT, null, [], { kind: "emergency" });
-  }
-}
-
-/**
- * Ask the next intake question, or run the assistant once they are answered.
- *
- * `choice` is the button the tenant just tapped, validated against what the last
- * prompt actually offered — a button from an older prompt, or one invented by
- * hand, is refused rather than quietly accepted as an answer to a question it
- * was not asked for.
- */
-async function runIntake(ticket: Ticket, user: User, choice: string): Promise<string | null> {
-  const last = await db.get<{ choices: string | null }>(
-    `SELECT choices FROM messages
-     WHERE ticket_id = ? AND author = 'bot' AND choices IS NOT NULL
-     ORDER BY id DESC LIMIT 1`,
-    [ticket.id],
-  );
-  const offered = last?.choices ? (JSON.parse(last.choices) as ChoicePrompt) : null;
-  const option = offered?.options.find((o) => o.value === choice);
-  if (!option) return "That option is no longer on offer — say what is going on instead.";
-
-  if (offered!.stage === "category") {
-    const pick = readCategory(choice);
-    if (!pick) return "That option is no longer on offer — say what is going on instead.";
-
-    await addMessage(ticket.id, "tenant", option.label, user.id, [], { choice });
-    // Filed straight away. Even if the tenant abandons the thread here, the
-    // landlord sees it under the right heading rather than under "other".
-    await db.run(
-      "UPDATE tickets SET category = ?, intake_stage = 'severity', updated_at = datetime('now') WHERE id = ?",
-      [pick.category, ticket.id],
-    );
-    await addMessage(
-      ticket.id, "bot", severityQuestion(pick.key), null, [],
-      { choices: severityPrompt(pick.key) },
-    );
-    return null;
-  }
-
-  const pick = readSeverity(choice);
-  if (!pick) return "That option is no longer on offer — say what is going on instead.";
-  await addMessage(ticket.id, "tenant", option.label, user.id, [], { choice });
-  await db.run("UPDATE tickets SET intake_stage = 'done' WHERE id = ?", [ticket.id]);
-
-  if (pick.severity !== "standard") {
-    // Nothing is asked and nothing is diagnosed. The tenant said it is one of
-    // the things we never troubleshoot, and taking them at their word is the
-    // whole point of putting it on a button. Only the statutory set — water,
-    // electricity, or winter heat off, or something life-threatening — is given
-    // the emergency service number.
-    const emergency = pick.severity === "emergency";
-    const fresh = (await db.get<Ticket>("SELECT * FROM tickets WHERE id = ?", [ticket.id]))!;
-    await addMessage(ticket.id, "bot", emergency ? emergencyReply(pick) : escalateReply(pick));
-    await db.run(
-      `UPDATE tickets
-       SET status = 'open', priority = ?, summary = ?, updated_at = datetime('now')
-       WHERE id = ?`,
-      [
-        pick.priority,
-        `${emergency ? "EMERGENCY" : "URGENT"}: ${fresh.title} — ${
-          option.label.replace(/^\S+\s/, "")}`,
-        ticket.id,
-      ],
-    );
-    await addMessage(
-      ticket.id,
-      "system",
-      emergency
-        ? "Emergency repair — sent to the landlord and the emergency line given to the tenant."
-        : "Sent to the landlord's to-do list.",
-    );
-    await settleSla(ticket.id, emergency);
-    return null;
-  }
-
-  // Standard: a starting priority, then the assistant takes over with both
-  // answers already in hand.
-  await db.run(
-    "UPDATE tickets SET priority = ?, updated_at = datetime('now') WHERE id = ?",
-    [pick.priority, ticket.id],
-  );
-  const fresh = (await db.get<Ticket>("SELECT * FROM tickets WHERE id = ?", [ticket.id]))!;
-  await runTriage(fresh);
-  await settleSla(ticket.id);
-  return null;
 }
 
 /* ---------------------------------------------------------------- routes */
@@ -1087,10 +922,9 @@ async function listTickets(user: User, url: URL): Promise<Response> {
 }
 
 async function createTicket(user: User, req: Request): Promise<Response> {
-  const b = (await req.json().catch(() => null)) as Record<string, string> | null;
-  const title = String(b?.title ?? "").trim();
-  const description = String(b?.description ?? "").trim();
-  if (!title) return fail("Give the request a short title.");
+  const b = (await req.json().catch(() => null)) as Record<string, unknown> | null;
+  let title = String(b?.title ?? "").trim();
+  let description = String(b?.description ?? "").trim();
 
   const photos = takePhotos(b);
   if (typeof photos === "string") return fail(photos);
@@ -1099,26 +933,54 @@ async function createTicket(user: User, req: Request): Promise<Response> {
   }
 
   if (user.role === "tenant") {
+    // The structured path: the tenant picked an issue and filled in the
+    // basics. The title and the opening message are composed from those, so
+    // every request of this shape reads the same way on the landlord's list.
+    // The free-text path (title + description) still works for older clients
+    // and for the API tests.
+    const intake = parseIntake(b?.intake);
+    if (typeof intake === "string") return fail(intake);
+    if (intake) {
+      title ||= intakeTitle(intake);
+      description = intakeMessage(intake);
+    }
+    if (!title) return fail("Give the request a short title.");
     if (!description) return fail("Describe what is going on so the assistant can help.");
+
+    const issue = intake ? findIssue(intake.issue) : null;
     const ticket = (await db.get<Ticket>(
-      `INSERT INTO tickets (property_id, tenant_id, created_by, title, summary, status)
-       VALUES (?, ?, ?, ?, ?, 'triage') RETURNING *`,
-      [user.property_id, user.id, user.id, title, title],
+      `INSERT INTO tickets
+         (property_id, tenant_id, created_by, title, summary, category, priority, status, intake)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'triage', ?) RETURNING *`,
+      [user.property_id, user.id, user.id, title, title,
+       issue?.category ?? "other", issue?.priority ?? "normal",
+       intake ? JSON.stringify(intake) : null],
     ))!;
 
     await addMessage(ticket.id, "tenant", description, user.id, photos);
-    // Two buttons before the assistant. They cost a tenant four seconds and they
-    // settle the category and whether this is an emergency, which is exactly
-    // what the assistant would otherwise spend its first reply guessing at.
-    await db.run("UPDATE tickets SET intake_stage = 'category' WHERE id = ?", [ticket.id]);
-    await addMessage(
-      ticket.id, "bot", CATEGORY_PROMPT, null, [], { choices: categoryPrompt() },
-    );
-    // A provisional target, from the title and description alone. The two taps
-    // that follow will usually sharpen it, but a request must never sit on the
-    // list with no target at all — that is how something goes quietly unnoticed
-    // while it waits for someone to finish tapping.
+    // A statutory emergency — water, electricity or heating-season heat off, or
+    // something life-threatening — gets the call-out number on the thread as
+    // well as in the form. The form block is gone the moment the request is
+    // sent, and a number the tenant can no longer see has not been given to
+    // them. Nothing else gets it: a line that rings for a stuck lock is a line
+    // that goes unanswered for a gas leak.
+    // A free-text request has no issue to read, so its wording is tested
+    // instead — someone typing "no water in the whole unit" is owed the same
+    // number as someone who picked it off the tree.
+    const statutory = issue
+      ? isStatutoryIssue(issue)
+      : isStatutoryEmergency({ text: `${title} ${description}` });
+    if (statutory) {
+      await addMessage(ticket.id, "system", EMERGENCY_CONTACT);
+    }
+    await runTriage(ticket);
+    // After triage, so the bot's category and priority feed the target.
     await applySla(ticket.id);
+    // The bot escalates on its own when it cannot resolve something, so the note
+    // belongs here as well as on the tenant's manual escalation.
+    const after = await db.get<{ status: string }>(
+      "SELECT status FROM tickets WHERE id = ?", [ticket.id]);
+    if (after?.status === "open") await noteResponseTime(ticket.id);
     await markRead(ticket.id, user.id);
     return json({
       ticket: await visibleTicket(user, ticket.id),
@@ -1129,6 +991,7 @@ async function createTicket(user: User, req: Request): Promise<Response> {
   // Landlords add to-dos straight to the list — no triage. A to-do can be kept
   // internal (tenant_id NULL) or raised with a specific tenant, who then sees it
   // in their own list and can talk it through in the same thread.
+  if (!title) return fail("Give the request a short title.");
   const priority = PRIORITIES.has(String(b?.priority)) ? String(b?.priority) : "normal";
   const category = CATEGORIES.has(String(b?.category)) ? String(b?.category) : "other";
 
@@ -1172,43 +1035,18 @@ async function createTicket(user: User, req: Request): Promise<Response> {
 async function postMessage(user: User, ticket: Ticket, req: Request): Promise<Response> {
   const b = (await req.json().catch(() => null)) as Record<string, unknown> | null;
   const body = String(b?.body ?? "").trim();
-  const choice = String(b?.choice ?? "").trim();
   const photos = takePhotos(b);
   if (typeof photos === "string") return fail(photos);
-  if (ticket.status === "closed") return fail("This request is closed. Reopen it to keep talking.");
-
-  // A tapped button is its own kind of message: no free text, no photos, and the
-  // stage machine writes both sides of the exchange.
-  if (choice) {
-    if (user.role !== "tenant") return fail("Those buttons are the tenant's.", 403);
-    if (ticket.intake_stage === "done") return fail("That question has already been answered.");
-    const problem = await runIntake(ticket, user, choice);
-    if (problem) return fail(problem);
-    await markRead(ticket.id, user.id);
-    return json({
-      ticket: await visibleTicket(user, ticket.id),
-      messages: await ticketMessages(ticket.id),
-    });
-  }
-
   // A photo on its own says plenty — this is often the whole point of sending one.
   if (!body && !photos.length) return fail("Message is empty.");
+  if (ticket.status === "closed") return fail("This request is closed. Reopen it to keep talking.");
 
   await addMessage(ticket.id, user.role, body, user.id, photos);
-
-  // Typing rather than tapping ends the intake. Someone who is describing the
-  // problem in their own words is past the point where a menu helps, and leaving
-  // the buttons up would ask them to answer a question they have overtaken.
-  const skippedIntake = ticket.intake_stage !== "done" && user.role === "tenant";
-  if (skippedIntake) {
-    await db.run("UPDATE tickets SET intake_stage = 'done' WHERE id = ?", [ticket.id]);
-  }
 
   // While a request is in triage the bot owns the conversation.
   let botResult = null;
   if (ticket.status === "triage" && user.role === "tenant") {
     botResult = await runTriage(ticket);
-    if (skippedIntake) await settleSla(ticket.id);
   }
   await markRead(ticket.id, user.id);
 
@@ -1863,6 +1701,10 @@ async function route(req: Request, url: URL, path: string): Promise<Response> {
     return user ? json({ user: await publicUser(user) }) : json({ user: null });
   }
   if (!user) return fail("Please sign in.", 401);
+
+  // The decision tree behind a new request. Served rather than copied into the
+  // front end, so the form and the bot always agree on what an issue is called.
+  if (path === "/api/intake" && req.method === "GET") return json(intakeForClient());
 
   if (path === "/api/property" && req.method === "GET") {
     if (user.role !== "landlord") return fail("Landlords only.", 403);

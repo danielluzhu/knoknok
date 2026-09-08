@@ -1,10 +1,9 @@
 # knoknok
 
 A small web app where tenants raise maintenance requests and landlords work them off a to-do
-list. New tenant requests go through triage first: two tapped questions sort the request and
-catch anything dangerous, then a bot asks a couple of diagnostic questions, walks the tenant
-through a safe fix where one exists, and only escalates to the landlord when it actually
-needs them.
+list. New tenant requests go through a triage bot first: it asks a couple of diagnostic
+questions, walks the tenant through a safe fix where one exists, and only escalates to the
+landlord when it actually needs them.
 
 Bun + libSQL + vanilla JS. No build step, no framework. Runs locally against a SQLite file
 and deploys to Vercel against Turso, with the same code and the same SQL.
@@ -51,41 +50,43 @@ same property. Passwords are hashed with argon2id (`Bun.password`); sessions are
 That's why a landlord's own to-do ("clear the gutters") and an escalated tenant request sit
 in one list and close the same way.
 
-**Intake, before the bot.** A new request opens with two questions answered by tapping, not
-typing: what sort of thing is broken (💦 Plumbing, ⚡ Electrical, 🔥 Heating / AC, 🔑 Locks,
-and so on), then which shape it takes within that category. Two taps settle the category
-without inferring it from wording, and catch anything that must not be troubleshooted before
-a paragraph is spent trying. `tickets.intake_stage` tracks how far it has got.
+**Raising a request.** A tenant does not start from a blank box. They pick a category
+(plumbing, electrical, heating & cooling, appliance, doors & locks, pests, walls & floors,
+other), narrow it to an issue ("drain clogged or slow", "no heat", "gas smell"), and then give
+the four basics every diagnosis needs: **what** is broken, **where** it is (room plus the exact
+spot), **when** it started (asked only where timing matters), and **anything else** — what
+they have tried, whether it is getting worse. Every step can be gone back to. The tree lives in
+`src/intake.ts` and is served from `GET /api/intake`, so the form and the bot never disagree
+about what an issue is called. Issues flagged as emergencies show what to do right now and
+skip the bot entirely. The old free-text shape (`title` + `description`) still works.
 
-Typing instead of tapping is always allowed and ends the intake — someone describing the
-problem in their own words is past the point a menu helps. Intake messages are kept out of
-the history the bot sees, so its own pacing counts real exchanges rather than taps.
+**Emergencies.** Two tiers, deliberately kept apart:
 
-**The triage flow.** Once intake is done the bot replies, and the thread stays in `triage`
-until one of three things happens:
+- **Statutory** — water, electricity, or heating-season heat off, or something life-threatening
+  (a gas smell, sparks or a burning smell). `nowater`, `nopower`, `noheat`, `gas` and `sparks`
+  carry `statutory: true`, and only these hand the tenant the emergency service number, both in
+  the form and on the thread.
+- **Urgent but not statutory** — flooding, a door that won't lock. Same response target, same
+  skipped troubleshooting, no call-out number. A line that rings for a stuck lock is a line
+  that goes unanswered for a gas leak.
+
+Heat is the one seasonal case: statutory October to April, an ordinary urgent repair otherwise
+(`isStatutoryIssue` / `emergencyFor` in `src/intake.ts`). A free-text request has no issue to
+read, so its wording is tested instead, by `isStatutoryEmergency` in `src/sla.ts` — someone
+typing "no water in the whole unit" is owed the same number as someone who picked it off the
+tree. The number itself is `EMERGENCY_CONTACT` at the top of `src/intake.ts`, used verbatim.
+
+**The triage flow.** The basics become the first message on the thread and are stored on the
+ticket, where the landlord sees them as fields. The bot replies, and the thread stays in
+`triage` until one of three things happens:
 
 1. The tenant confirms the problem is fixed → closed, no maintenance visit, `closed_by = 'bot'`.
 2. The bot decides it needs a person → status `open`, with a category, a priority, and a
    one-line summary written for the landlord.
 3. The tenant hits **Send to landlord now** and skips the rest.
 
-**Emergencies.** Two tiers, deliberately kept apart:
-
-- **Statutory** — water, electricity, or heating-season heat off, or something
-  life-threatening (gas, smoke, sparks, a collapse). These escalate as `urgent` without
-  troubleshooting *and* hand the tenant the emergency service number.
-- **Urgent but not statutory** — a burst pipe, a lockout, a door that won't lock, sewage.
-  Same 24-hour target, same skipped troubleshooting, no call-out number. A line that rings
-  for a stuck window is a line that goes unanswered for a gas leak.
-
-`isStatutoryEmergency()` in `src/sla.ts` is the single test for the first tier, kept separate
-from `slaTier()` because a landlord marking something urgent should move the response time
-without making it a legal emergency. Where the tenant answered with a button, their answer
-decides — it beats matching words in the title.
-
-The number itself is `EMERGENCY_CONTACT` at the top of `src/intake.ts`, used verbatim and
-said once per thread. Change it there and both paths — the tapped one and the typed one —
-follow.
+Emergencies (gas, smoke, flooding, sewage, a door that won't lock) skip troubleshooting
+entirely and escalate as `urgent` on the first message.
 
 Whichever way it goes, the landlord sees the whole conversation — including everything the
 tenant already tried — so nobody has to repeat themselves.
@@ -121,18 +122,20 @@ group thread.
 
 ## The bot
 
-`src/bot.ts` exposes one function, `triage(title, history, intake)`, returning a reply plus an action
-(`ask` / `resolved` / `escalate`), a category, and a priority. It has two implementations
+`src/bot.ts` exposes one function, `triage(title, history, intake)`, returning a reply plus an
+action (`ask` / `resolved` / `escalate`), a category, and a priority. Whichever engine answers,
+one rule holds: **no decision until the four basics are covered.** Whatever the intake form
+left open — the exact spot, the timing, what was tried — is asked first, one per reply, before
+any troubleshooting; nothing the tenant already gave is asked again; and an issue the tenant
+flagged as an emergency stays urgent whatever the engine says. It has two implementations
 behind that single interface:
 
 - **Claude** (`claude-opus-5`) when `ANTHROPIC_API_KEY` is set, via structured outputs so the
   action and priority come back as validated fields rather than parsed prose.
-- **A built-in diagnostic script** otherwise — keyword-matched playbooks for the common cases
-  (GFCI resets, disposal reset buttons, thermostat batteries, P-traps, aerators, appliance
-  power-cycles) plus emergency detection.
-
-`intake` is what the tenant already answered with buttons. It is passed in rather than left
-in the message history, and the category it carries beats the keyword match.
+- **A built-in diagnostic script** otherwise — the picked issue's own safe fixes and follow-up
+  questions when a request came through the tree, keyword-matched playbooks for the common
+  cases (GFCI resets, disposal reset buttons, thermostat batteries, P-traps, aerators,
+  appliance power-cycles) when it did not, plus emergency detection either way.
 
 The fallback isn't only for missing keys: any API error, or a refusal, drops through to the
 rules engine, so a request is never lost because the model was unreachable. The badge in the
@@ -155,7 +158,7 @@ src/app.ts         every route, as one Request -> Response function
 src/db.ts          schema, the libSQL client, and types
 src/auth.ts        password hashing, sessions, throttling, cookies
 src/bot.ts         triage — Claude and the rule-based fallback
-src/intake.ts      the button-led questions, and what counts as an emergency
+src/intake.ts      the new-request decision tree, and the four basics it collects
 public/            the whole front end (index.html, app.js, styles.css)
 seed.ts            demo property, users, and tickets
 test/api.test.ts   end-to-end HTTP tests
@@ -169,10 +172,11 @@ All routes are JSON and cookie-authenticated.
 | ------ | ----- | ----- |
 | POST | `/api/signup`, `/api/login`, `/api/logout` | |
 | GET | `/api/me` | current user, or `{user: null}` |
+| GET | `/api/intake` | the decision tree behind a new request: groups, issues, rooms, timings |
 | GET | `/api/tickets?status=` | `open`, `closed`, `triage`, `all` |
-| POST | `/api/tickets` | tenant → starts triage; landlord → adds a to-do |
+| POST | `/api/tickets` | tenant → starts triage, with `intake: {issue, what, room, spot?, when?, trigger?, notes?}` or a plain `title` + `description`; landlord → adds a to-do |
 | GET | `/api/tickets/:id` | ticket plus full message thread |
-| POST | `/api/tickets/:id/messages` | replies; runs the bot while in triage. `{choice}` instead of `{body}` answers an intake button |
+| POST | `/api/tickets/:id/messages` | replies; runs the bot while in triage |
 | POST | `/api/tickets/:id/update` | landlord only — priority, category, title |
 | POST | `/api/tickets/:id/escalate` | tenant skips the bot |
 | POST | `/api/tickets/:id/close` / `/reopen` | with an optional resolution note |

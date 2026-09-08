@@ -135,6 +135,21 @@
   </div>
 </div>
 
+<!-- --------------------------------------------- new request (tenant) -->
+<!-- A tenant's request is a short decision tree rather than a blank box: pick a
+     category, narrow it to an issue, then give the four basics — what, where,
+     when, anything else. The assistant picks up in the thread from there. -->
+<div id="intakeModal" class="modal hidden">
+  <div class="modal-card intake-card">
+    <div class="intake-head">
+      <h2>New maintenance request</h2>
+      <nav class="intake-steps" id="intakeSteps" aria-label="Progress"></nav>
+      <div class="intake-crumbs" id="intakeCrumbs"></div>
+    </div>
+    <div id="intakeBody"></div>
+  </div>
+</div>
+
 <!-- ------------------------------------------------------- new schedule -->
 <div id="scheduleModal" class="modal hidden">
   <div class="modal-card">

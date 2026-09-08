@@ -147,12 +147,14 @@ CREATE TABLE IF NOT EXISTS tickets (
   -- stops being a winter emergency.
   sla_tier    TEXT,
   due_at      TEXT,
-  -- How far the button-led intake has got: 'category', 'severity', or 'done'.
-  -- 'done' also covers every ticket that never had an intake — a landlord to-do,
-  -- or a tenant who typed instead of tapping.
-  intake_stage TEXT NOT NULL DEFAULT 'done',
   -- Set when this ticket was raised by a schedule rather than by a person.
   recurring_id INTEGER REFERENCES recurring_tasks(id),
+  -- The structured intake a tenant filled in when raising this (JSON: the
+  -- issue they picked and the what/where/when/other basics). Null for free-text
+  -- requests and for landlord to-dos. Kept so the bot can see on every turn
+  -- which basics are covered, and so the landlord gets them as fields rather
+  -- than prose.
+  intake      TEXT,
   created_at  TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
   closed_at   TEXT
@@ -164,16 +166,6 @@ CREATE TABLE IF NOT EXISTS messages (
   author     TEXT NOT NULL CHECK (author IN ('tenant','bot','landlord','vendor','system')),
   user_id    INTEGER REFERENCES users(id),
   body       TEXT NOT NULL,
-  -- Set on the button-led intake that runs before the assistant. These messages
-  -- read as ordinary thread messages but are kept out of the history the
-  -- assistant sees, so its own turn counting is not thrown off by them.
-  kind       TEXT,
-  -- On a bot intake prompt: the JSON {stage, options} the buttons were drawn
-  -- from. Stored rather than recomputed so a button always answers the question
-  -- it was actually offered for.
-  choices    TEXT,
-  -- On the tenant's answer: which option they tapped.
-  choice     TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -410,6 +402,9 @@ async function evolve(): Promise<void> {
     await client().execute(
       "ALTER TABLE tickets ADD COLUMN recurring_id INTEGER REFERENCES recurring_tasks(id)");
   }
+  if (!(await tableColumns("tickets")).has("intake")) {
+    await client().execute("ALTER TABLE tickets ADD COLUMN intake TEXT");
+  }
 
   // Response-time targets. Existing requests get one worked out from what they
   // already say, so the list is not split between tickets that have a target and
@@ -419,21 +414,6 @@ async function evolve(): Promise<void> {
     await client().execute("ALTER TABLE tickets ADD COLUMN sla_tier TEXT");
     await client().execute("ALTER TABLE tickets ADD COLUMN due_at TEXT");
   }
-  // Button-led intake. Existing tickets never went through it, and a default of
-  // 'done' is what says so — anything else would put buttons back under threads
-  // the assistant has already finished with.
-  if (!tickets.has("intake_stage")) {
-    await client().execute(
-      "ALTER TABLE tickets ADD COLUMN intake_stage TEXT NOT NULL DEFAULT 'done'",
-    );
-  }
-  const messages = await tableColumns("messages");
-  if (!messages.has("kind")) {
-    await client().execute("ALTER TABLE messages ADD COLUMN kind TEXT");
-    await client().execute("ALTER TABLE messages ADD COLUMN choices TEXT");
-    await client().execute("ALTER TABLE messages ADD COLUMN choice TEXT");
-  }
-
   const undated = await client().execute(
     "SELECT id, title, summary, category, priority, created_at FROM tickets WHERE due_at IS NULL",
   );
@@ -615,10 +595,10 @@ export interface Ticket {
   closed_by: string | null;
   assigned_vendor_id: number | null;
   recurring_id: number | null;
+  /** JSON of the structured intake (see src/intake.ts), or null. */
+  intake: string | null;
   sla_tier: SlaTierName | null;
   due_at: string | null;
-  /** How far the button-led intake has got. 'done' once it is out of the way. */
-  intake_stage: "category" | "severity" | "done";
   created_at: string;
   updated_at: string;
   closed_at: string | null;
@@ -673,12 +653,6 @@ export interface Message {
   author: "tenant" | "bot" | "landlord" | "vendor" | "system";
   user_id: number | null;
   body: string;
-  /** 'intake' on the button-led questions and their answers; null on everything else. */
-  kind: string | null;
-  /** On a bot intake prompt: JSON `{stage, options}`. The client draws buttons from it. */
-  choices: string | null;
-  /** On the tenant's answer: the option value they tapped. */
-  choice: string | null;
   created_at: string;
   author_name?: string | null;
   /** Attached photos, as ids the client fetches separately. Never the bytes. */
