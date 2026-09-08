@@ -50,8 +50,19 @@ same property. Passwords are hashed with argon2id (`Bun.password`); sessions are
 That's why a landlord's own to-do ("clear the gutters") and an escalated tenant request sit
 in one list and close the same way.
 
-**The triage flow.** A tenant opens a request and describes the problem. The bot replies, and
-the thread stays in `triage` until one of three things happens:
+**Raising a request.** A tenant does not start from a blank box. They pick a category
+(plumbing, electrical, heating & cooling, appliance, doors & locks, pests, walls & floors,
+other), narrow it to an issue ("drain clogged or slow", "no heat", "gas smell"), and then give
+the four basics every diagnosis needs: **what** is broken, **where** it is (room plus the exact
+spot), **when** it started (asked only where timing matters), and **anything else** — what
+they have tried, whether it is getting worse. Every step can be gone back to. The tree lives in
+`src/intake.ts` and is served from `GET /api/intake`, so the form and the bot never disagree
+about what an issue is called. Issues flagged as emergencies show what to do right now and
+skip the bot entirely. The old free-text shape (`title` + `description`) still works.
+
+**The triage flow.** The basics become the first message on the thread and are stored on the
+ticket, where the landlord sees them as fields. The bot replies, and the thread stays in
+`triage` until one of three things happens:
 
 1. The tenant confirms the problem is fixed → closed, no maintenance visit, `closed_by = 'bot'`.
 2. The bot decides it needs a person → status `open`, with a category, a priority, and a
@@ -95,15 +106,20 @@ group thread.
 
 ## The bot
 
-`src/bot.ts` exposes one function, `triage(title, history)`, returning a reply plus an action
-(`ask` / `resolved` / `escalate`), a category, and a priority. It has two implementations
+`src/bot.ts` exposes one function, `triage(title, history, intake)`, returning a reply plus an
+action (`ask` / `resolved` / `escalate`), a category, and a priority. Whichever engine answers,
+one rule holds: **no decision until the four basics are covered.** Whatever the intake form
+left open — the exact spot, the timing, what was tried — is asked first, one per reply, before
+any troubleshooting; nothing the tenant already gave is asked again; and an issue the tenant
+flagged as an emergency stays urgent whatever the engine says. It has two implementations
 behind that single interface:
 
 - **Claude** (`claude-opus-5`) when `ANTHROPIC_API_KEY` is set, via structured outputs so the
   action and priority come back as validated fields rather than parsed prose.
-- **A built-in diagnostic script** otherwise — keyword-matched playbooks for the common cases
-  (GFCI resets, disposal reset buttons, thermostat batteries, P-traps, aerators, appliance
-  power-cycles) plus emergency detection.
+- **A built-in diagnostic script** otherwise — the picked issue's own safe fixes and follow-up
+  questions when a request came through the tree, keyword-matched playbooks for the common
+  cases (GFCI resets, disposal reset buttons, thermostat batteries, P-traps, aerators,
+  appliance power-cycles) when it did not, plus emergency detection either way.
 
 The fallback isn't only for missing keys: any API error, or a refusal, drops through to the
 rules engine, so a request is never lost because the model was unreachable. The badge in the
@@ -126,6 +142,7 @@ src/app.ts         every route, as one Request -> Response function
 src/db.ts          schema, the libSQL client, and types
 src/auth.ts        password hashing, sessions, throttling, cookies
 src/bot.ts         triage — Claude and the rule-based fallback
+src/intake.ts      the new-request decision tree, and the four basics it collects
 public/            the whole front end (index.html, app.js, styles.css)
 seed.ts            demo property, users, and tickets
 test/api.test.ts   end-to-end HTTP tests
@@ -139,8 +156,9 @@ All routes are JSON and cookie-authenticated.
 | ------ | ----- | ----- |
 | POST | `/api/signup`, `/api/login`, `/api/logout` | |
 | GET | `/api/me` | current user, or `{user: null}` |
+| GET | `/api/intake` | the decision tree behind a new request: groups, issues, rooms, timings |
 | GET | `/api/tickets?status=` | `open`, `closed`, `triage`, `all` |
-| POST | `/api/tickets` | tenant → starts triage; landlord → adds a to-do |
+| POST | `/api/tickets` | tenant → starts triage, with `intake: {issue, what, room, spot?, when?, trigger?, notes?}` or a plain `title` + `description`; landlord → adds a to-do |
 | GET | `/api/tickets/:id` | ticket plus full message thread |
 | POST | `/api/tickets/:id/messages` | replies; runs the bot while in triage |
 | POST | `/api/tickets/:id/update` | landlord only — priority, category, title |

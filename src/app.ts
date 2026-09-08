@@ -25,6 +25,9 @@ import {
   type ChatMessage, type Message, type RecurringTask, type Ticket, type User,
 } from "./db";
 import { triage, usingClaude } from "./bot";
+import {
+  findIssue, intakeForClient, intakeMessage, intakeTitle, parseIntake, type Intake,
+} from "./intake";
 import { dueAt, slaTier, SLA_LABEL, SLA_POLICY } from "./sla";
 
 /* --------------------------------------------------------------- helpers */
@@ -648,13 +651,24 @@ async function publicUser(u: User) {
   };
 }
 
+/** The structured intake a ticket was raised with, if it was raised that way. */
+function storedIntake(ticket: Ticket): Intake | null {
+  if (!ticket.intake) return null;
+  try {
+    const parsed = parseIntake(JSON.parse(ticket.intake));
+    return typeof parsed === "object" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Run the bot over a ticket in triage and apply whatever it decided.
  * Returns the bot's own message plus any status change.
  */
 async function runTriage(ticket: Ticket) {
   const history = await ticketMessages(ticket.id);
-  const result = await triage(ticket.title, history);
+  const result = await triage(ticket.title, history, storedIntake(ticket));
 
   await addMessage(ticket.id, "bot", result.reply);
 
@@ -907,10 +921,9 @@ async function listTickets(user: User, url: URL): Promise<Response> {
 }
 
 async function createTicket(user: User, req: Request): Promise<Response> {
-  const b = (await req.json().catch(() => null)) as Record<string, string> | null;
-  const title = String(b?.title ?? "").trim();
-  const description = String(b?.description ?? "").trim();
-  if (!title) return fail("Give the request a short title.");
+  const b = (await req.json().catch(() => null)) as Record<string, unknown> | null;
+  let title = String(b?.title ?? "").trim();
+  let description = String(b?.description ?? "").trim();
 
   const photos = takePhotos(b);
   if (typeof photos === "string") return fail(photos);
@@ -919,11 +932,28 @@ async function createTicket(user: User, req: Request): Promise<Response> {
   }
 
   if (user.role === "tenant") {
+    // The structured path: the tenant picked an issue and filled in the
+    // basics. The title and the opening message are composed from those, so
+    // every request of this shape reads the same way on the landlord's list.
+    // The free-text path (title + description) still works for older clients
+    // and for the API tests.
+    const intake = parseIntake(b?.intake);
+    if (typeof intake === "string") return fail(intake);
+    if (intake) {
+      title ||= intakeTitle(intake);
+      description = intakeMessage(intake);
+    }
+    if (!title) return fail("Give the request a short title.");
     if (!description) return fail("Describe what is going on so the assistant can help.");
+
+    const issue = intake ? findIssue(intake.issue) : null;
     const ticket = (await db.get<Ticket>(
-      `INSERT INTO tickets (property_id, tenant_id, created_by, title, summary, status)
-       VALUES (?, ?, ?, ?, ?, 'triage') RETURNING *`,
-      [user.property_id, user.id, user.id, title, title],
+      `INSERT INTO tickets
+         (property_id, tenant_id, created_by, title, summary, category, priority, status, intake)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'triage', ?) RETURNING *`,
+      [user.property_id, user.id, user.id, title, title,
+       issue?.category ?? "other", issue?.priority ?? "normal",
+       intake ? JSON.stringify(intake) : null],
     ))!;
 
     await addMessage(ticket.id, "tenant", description, user.id, photos);
@@ -945,6 +975,7 @@ async function createTicket(user: User, req: Request): Promise<Response> {
   // Landlords add to-dos straight to the list — no triage. A to-do can be kept
   // internal (tenant_id NULL) or raised with a specific tenant, who then sees it
   // in their own list and can talk it through in the same thread.
+  if (!title) return fail("Give the request a short title.");
   const priority = PRIORITIES.has(String(b?.priority)) ? String(b?.priority) : "normal";
   const category = CATEGORIES.has(String(b?.category)) ? String(b?.category) : "other";
 
@@ -1654,6 +1685,10 @@ async function route(req: Request, url: URL, path: string): Promise<Response> {
     return user ? json({ user: await publicUser(user) }) : json({ user: null });
   }
   if (!user) return fail("Please sign in.", 401);
+
+  // The decision tree behind a new request. Served rather than copied into the
+  // front end, so the form and the bot always agree on what an issue is called.
+  if (path === "/api/intake" && req.method === "GET") return json(intakeForClient());
 
   if (path === "/api/property" && req.method === "GET") {
     if (user.role !== "landlord") return fail("Landlords only.", 403);

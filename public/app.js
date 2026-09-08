@@ -17,6 +17,8 @@ const state = {
   vendors: [],
   // Recurring upkeep, and the options for setting it up.
   schedules: [], cadences: [], suggestions: [], scheduleOpen: null,
+  // The decision tree behind a tenant's new request, from /api/intake.
+  intakeTree: null,
 };
 
 /** The `?property=` every scoped request carries. */
@@ -1346,6 +1348,7 @@ function renderDetail(scroll = true) {
           : ""}
         <span>opened ${when(t.created_at)}</span>
       </div>
+      ${renderBasics(t)}
       ${brief}
       <div class="detail-actions">${actions.join("")}</div>
     </div>
@@ -1516,6 +1519,8 @@ function wireModal() {
   const modal = $("#modal");
   const open = () => {
     const tenant = state.me.role === "tenant";
+    // A tenant's request goes through the decision tree, not the blank form.
+    if (tenant) { openIntake(); return; }
     $("#modalTitle").textContent = tenant ? "New maintenance request" : "New to-do";
     $("#modalSubmit").textContent = tenant ? "Start with the assistant" : "Add to list";
     $("#descLabel").textContent = tenant ? "What's happening?" : "Details (optional)";
@@ -1595,6 +1600,294 @@ function wireModal() {
   });
 }
 
+/* ------------------------------------------------------- request intake */
+
+/**
+ * A tenant's new request is a short decision tree: category, then the issue,
+ * then the four basics every diagnosis needs — what is broken, where, when it
+ * started, anything else. Only then does the assistant get involved, and it
+ * asks for whichever of the four the form left open before it decides anything.
+ *
+ * Every step can be gone back to: the Back button, the finished segments of the
+ * progress strip, and the chips listing what has been chosen so far.
+ */
+const INTAKE_STEPS = ["Category", "Issue", "Details", "Assistant"];
+const blankBasics = () => ({ what: "", room: "", spot: "", when: "", trigger: "", notes: "" });
+const intake = { step: 1, group: null, issue: null, d: blankBasics() };
+
+async function loadIntakeTree() {
+  if (state.intakeTree) return state.intakeTree;
+  state.intakeTree = await api("/api/intake");
+  return state.intakeTree;
+}
+
+async function openIntake() {
+  const modal = $("#intakeModal");
+  intake.step = 1;
+  intake.group = null;
+  intake.issue = null;
+  intake.d = blankBasics();
+  pendingPhotos = [];
+  modal.classList.remove("hidden");
+  $("#intakeBody").innerHTML = '<p class="intake-lede">Loading…</p>';
+  try {
+    await loadIntakeTree();
+  } catch (ex) {
+    $("#intakeBody").innerHTML = `<p class="error">${esc(ex.message)}</p>`;
+    return;
+  }
+  renderIntake();
+}
+
+function closeIntake() {
+  $("#intakeModal").classList.add("hidden");
+  pendingPhotos = [];
+}
+
+/** Go back to an earlier step. Everything chosen after it is cleared. */
+function intakeGoTo(n) {
+  if (n <= 2) intake.issue = null;
+  if (n <= 1) intake.group = null;
+  intake.step = n;
+  renderIntake();
+}
+
+function renderIntake() {
+  const steps = $("#intakeSteps");
+  steps.innerHTML = INTAKE_STEPS.map((label, i) => {
+    const n = i + 1;
+    const cls = n < intake.step ? "done" : n === intake.step ? "current" : "";
+    const attrs = n < intake.step
+      ? ` data-go="${n}" title="Back to ${esc(label)}"`
+      : ` disabled${n === intake.step ? ' aria-current="step"' : ""}`;
+    return `<button type="button" class="${cls}"${attrs}>
+      <span class="bar"></span><span class="lbl">${n} ${esc(label)}</span></button>`;
+  }).join("");
+  steps.querySelectorAll("[data-go]").forEach((b) =>
+    b.addEventListener("click", () => intakeGoTo(Number(b.dataset.go))));
+
+  const crumbs = $("#intakeCrumbs");
+  const parts = [];
+  if (intake.group) {
+    parts.push(`<button type="button" class="crumb" data-go="1" title="Change category">${
+      esc(intake.group.name)} <span class="x">✕</span></button>`);
+  }
+  if (intake.issue) {
+    parts.push('<span class="sep">›</span>');
+    parts.push(`<button type="button" class="crumb" data-go="2" title="Change issue">${
+      esc(intake.issue.name)} <span class="x">✕</span></button>`);
+  }
+  crumbs.innerHTML = parts.join("") ||
+    '<span class="hint">Your choices will appear here. Tap one to change it.</span>';
+  crumbs.querySelectorAll("[data-go]").forEach((b) =>
+    b.addEventListener("click", () => intakeGoTo(Number(b.dataset.go))));
+
+  if (intake.step === 1) renderIntakeCategory();
+  else if (intake.step === 2) renderIntakeIssue();
+  else renderIntakeDetails();
+}
+
+function renderIntakeCategory() {
+  const body = $("#intakeBody");
+  body.innerHTML = `
+    <p class="intake-lede">What kind of problem is it? Pick the closest match — you can change it later.</p>
+    <div class="intake-grid">${state.intakeTree.groups.map((g) => `
+      <button type="button" class="intake-tile" data-group="${esc(g.id)}">
+        <span class="name">${esc(g.name)}</span><span class="eg">${esc(g.eg)}</span>
+      </button>`).join("")}
+    </div>
+    <div class="intake-actions"><span></span>
+      <button type="button" class="ghost" id="intakeCancel">Cancel</button></div>`;
+  body.querySelectorAll("[data-group]").forEach((b) =>
+    b.addEventListener("click", () => {
+      intake.group = state.intakeTree.groups.find((g) => g.id === b.dataset.group);
+      intake.step = 2;
+      renderIntake();
+    }));
+  $("#intakeCancel").addEventListener("click", closeIntake);
+}
+
+function renderIntakeIssue() {
+  const body = $("#intakeBody");
+  const g = intake.group;
+  body.innerHTML = `
+    <p class="intake-lede">${esc(g.name)}: what's happening?</p>
+    <div class="intake-list">${g.issues.map((i) => `
+      <button type="button" class="intake-row ${i.urgent ? "urgent" : ""}" data-issue="${esc(i.id)}">
+        <span><span class="name">${esc(i.name)}</span><br><span class="eg">${esc(i.eg)}</span></span>
+        ${i.urgent ? '<span class="pill urgent">emergency</span>' : '<span class="chev">›</span>'}
+      </button>`).join("")}
+    </div>
+    <div class="intake-actions">
+      <button type="button" class="ghost back" data-go="1">Back</button>
+      <button type="button" class="ghost" id="intakeCancel">Cancel</button>
+    </div>`;
+  body.querySelectorAll("[data-issue]").forEach((b) =>
+    b.addEventListener("click", () => {
+      intake.issue = g.issues.find((i) => i.id === b.dataset.issue);
+      intake.step = 3;
+      renderIntake();
+    }));
+  body.querySelector("[data-go]").addEventListener("click", () => intakeGoTo(1));
+  $("#intakeCancel").addEventListener("click", closeIntake);
+}
+
+/** A "what" placeholder that matches the category, so the tenant names the fixture, not the symptom. */
+const WHAT_PLACEHOLDER = {
+  plumbing: "e.g. kitchen faucet, toilet, shower drain, water heater",
+  electrical: "e.g. bathroom outlet, bedroom ceiling light, the breaker labelled KITCHEN",
+  hvac: "e.g. living room radiator, wall thermostat, bedroom vent",
+  appliance: "e.g. dishwasher, back-left stove burner, dryer",
+  doors: "e.g. front door deadbolt, bedroom window, patio screen",
+  pests: "e.g. mice under the sink, ants along the counter, wasp nest on the balcony",
+  structure: "e.g. bathroom ceiling, bedroom wall by the closet, kitchen floor tile",
+  other: "e.g. hallway smoke detector, lobby door, mailbox",
+};
+
+const basicsComplete = (d) => d.what.trim().length >= 2 && d.room.length > 0;
+
+function renderIntakeDetails() {
+  const body = $("#intakeBody");
+  const { issue, d } = intake;
+  const tree = state.intakeTree;
+  const chips = (list, picked, attr) => list.map((v) =>
+    `<button type="button" class="${picked === v ? "on" : ""}" data-${attr}="${esc(v)}">${esc(v)}</button>`,
+  ).join("");
+
+  body.innerHTML = `
+    ${issue.emergency ? `<div class="intake-emergency" role="alert">
+      <b>${esc(issue.emergency.title)}</b>
+      <ol>${issue.emergency.steps.map((s) => `<li>${esc(s)}</li>`).join("")}</ol>
+    </div>` : ""}
+    <p class="intake-lede">Four quick things before the assistant works out what to do. Short answers are fine.</p>
+    <div class="intake-form">
+      <div class="intake-field">
+        <div class="lab"><span>What is broken <span class="req">*</span></span></div>
+        <input type="text" id="inWhat" value="${esc(d.what)}" maxlength="120"
+          placeholder="${esc(WHAT_PLACEHOLDER[intake.group.id] || "Name the thing that's broken")}">
+      </div>
+      <div class="intake-field">
+        <div class="lab"><span>Where <span class="req">*</span></span></div>
+        <div class="chips" id="inRooms">${chips(tree.rooms, d.room, "room")}</div>
+        <input type="text" id="inSpot" value="${esc(d.spot)}" maxlength="160"
+          placeholder="Exact spot, e.g. under the sink, back-left burner, ceiling by the window">
+      </div>
+      <div class="intake-field">
+        <div class="lab"><span>When did it start</span>
+          <span class="opt">${issue.whenMatters ? "helps with this one" : "if relevant"}</span></div>
+        <div class="chips" id="inWhens">${chips(tree.whens, d.when, "when")}</div>
+        <input type="text" id="inTrigger" value="${esc(d.trigger)}" maxlength="200"
+          placeholder="Happens when… e.g. only when the shower runs, every time the dryer starts">
+      </div>
+      <div class="intake-field">
+        <div class="lab"><span>Anything else</span><span class="opt">optional</span></div>
+        <textarea id="inNotes" rows="3" maxlength="2000"
+          placeholder="What you've already tried, whether it's getting worse, damage to your things, best times for a visit">${esc(d.notes)}</textarea>
+      </div>
+      <div class="intake-field">
+        <div class="lab"><span>Photos</span><span class="opt">optional</span></div>
+        <input type="file" id="intakePhotoInput" accept="image/*" multiple hidden>
+        <button type="button" class="ghost block-soft" id="intakePhotoBtn">Add a photo</button>
+        <div class="photo-strip hidden" id="intakePhotoStrip"></div>
+      </div>
+    </div>
+    <p id="intakeError" class="error hidden" style="margin-top:12px"></p>
+    <div class="intake-actions">
+      <button type="button" class="ghost back" data-go="2">Back</button>
+      <span class="right">
+        <button type="button" class="ghost" id="intakeCancel">Cancel</button>
+        <button type="button" class="primary" id="intakeSubmit" disabled>${
+          issue.urgent ? "Send as emergency" : "Continue with the assistant"}</button>
+      </span>
+    </div>`;
+
+  const submit = $("#intakeSubmit");
+  const sync = () => {
+    d.what = $("#inWhat").value;
+    d.spot = $("#inSpot").value;
+    d.trigger = $("#inTrigger").value;
+    d.notes = $("#inNotes").value;
+    submit.disabled = !basicsComplete(d);
+  };
+  ["inWhat", "inSpot", "inTrigger", "inNotes"].forEach((id) =>
+    $(`#${id}`).addEventListener("input", sync));
+  // One-tap chips; tapping the picked one clears it.
+  const wireChips = (holder, attr, key) => {
+    holder.addEventListener("click", (e) => {
+      const b = e.target.closest(`[data-${attr}]`);
+      if (!b) return;
+      const v = b.dataset[attr];
+      d[key] = d[key] === v ? "" : v;
+      holder.querySelectorAll("button").forEach((c) => c.classList.toggle("on", c.dataset[attr] === d[key]));
+      sync();
+    });
+  };
+  wireChips($("#inRooms"), "room", "room");
+  wireChips($("#inWhens"), "when", "when");
+
+  $("#intakePhotoBtn").addEventListener("click", () => $("#intakePhotoInput").click());
+  $("#intakePhotoInput").addEventListener("change", async (e) => {
+    await stagePhotos(e.target.files, () => renderPhotoStrip($("#intakePhotoStrip")));
+    e.target.value = "";
+  });
+  renderPhotoStrip($("#intakePhotoStrip"));
+
+  body.querySelector("[data-go]").addEventListener("click", () => intakeGoTo(2));
+  $("#intakeCancel").addEventListener("click", closeIntake);
+  submit.addEventListener("click", submitIntake);
+  sync();
+  $("#inWhat").focus();
+}
+
+async function submitIntake() {
+  const btn = $("#intakeSubmit");
+  const err = $("#intakeError");
+  if (!basicsComplete(intake.d)) return;
+  btn.disabled = true;
+  btn.textContent = intake.issue.urgent ? "Sending…" : "Asking the assistant…";
+  err.classList.add("hidden");
+  try {
+    const { ticket } = await api("/api/tickets", {
+      method: "POST",
+      body: { intake: { issue: intake.issue.id, ...intake.d }, photos: pendingPhotos },
+    });
+    closeIntake();
+    await refresh(false);
+    await openTicket(ticket.id);
+  } catch (ex) {
+    err.textContent = ex.message;
+    err.classList.remove("hidden");
+    btn.disabled = false;
+    btn.textContent = intake.issue.urgent ? "Send as emergency" : "Continue with the assistant";
+  }
+}
+
+function wireIntake() {
+  const modal = $("#intakeModal");
+  modal.addEventListener("click", (e) => { if (e.target === modal) closeIntake(); });
+}
+
+/**
+ * The basics a request was raised with, as fields on the thread head. Read
+ * from the ticket's stored intake; the issue name comes from the tree, which
+ * is fetched lazily for whoever is looking.
+ */
+function renderBasics(t) {
+  if (!t.intake) return "";
+  let d;
+  try { d = JSON.parse(t.intake); } catch { return ""; }
+  if (!d || typeof d !== "object") return "";
+  if (!state.intakeTree) loadIntakeTree().then(() => renderDetail(false)).catch(() => {});
+  const issue = state.intakeTree?.groups.flatMap((g) => g.issues).find((i) => i.id === d.issue);
+  const where = [d.room, d.spot].filter(Boolean).join(", ");
+  const when = [d.when, d.trigger && `happens ${d.trigger}`].filter(Boolean).join(". ");
+  const rows = [
+    ["Issue", issue?.name], ["What", d.what], ["Where", where], ["When", when], ["Other", d.notes],
+  ].filter(([, v]) => v);
+  return `<div class="basics">${rows.map(([k, v]) =>
+    `<div><div class="k">${k}</div><div class="v">${esc(v)}</div></div>`).join("")}</div>`;
+}
+
 /* ------------------------------------------------------------------ boot */
 
 $("#logout").addEventListener("click", async () => {
@@ -1642,6 +1935,7 @@ function wireAccount() {
 
 wireAuth();
 wireModal();
+wireIntake();
 wireAccount();
 wirePropertySwitch();
 wirePhotoViewer();

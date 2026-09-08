@@ -149,6 +149,12 @@ CREATE TABLE IF NOT EXISTS tickets (
   due_at      TEXT,
   -- Set when this ticket was raised by a schedule rather than by a person.
   recurring_id INTEGER REFERENCES recurring_tasks(id),
+  -- The structured intake a tenant filled in when raising this (JSON: the
+  -- issue they picked and the what/where/when/other basics). Null for free-text
+  -- requests and for landlord to-dos. Kept so the bot can see on every turn
+  -- which basics are covered, and so the landlord gets them as fields rather
+  -- than prose.
+  intake      TEXT,
   created_at  TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
   closed_at   TEXT
@@ -396,6 +402,9 @@ async function evolve(): Promise<void> {
     await client().execute(
       "ALTER TABLE tickets ADD COLUMN recurring_id INTEGER REFERENCES recurring_tasks(id)");
   }
+  if (!(await tableColumns("tickets")).has("intake")) {
+    await client().execute("ALTER TABLE tickets ADD COLUMN intake TEXT");
+  }
 
   // Response-time targets. Existing requests get one worked out from what they
   // already say, so the list is not split between tickets that have a target and
@@ -586,6 +595,8 @@ export interface Ticket {
   closed_by: string | null;
   assigned_vendor_id: number | null;
   recurring_id: number | null;
+  /** JSON of the structured intake (see src/intake.ts), or null. */
+  intake: string | null;
   sla_tier: SlaTierName | null;
   due_at: string | null;
   created_at: string;
