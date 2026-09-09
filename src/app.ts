@@ -892,7 +892,12 @@ async function listTickets(user: User, url: URL): Promise<Response> {
             c.display_name AS creator_name, c.role AS creator_role,
             v.display_name AS vendor_name, pr.name AS property_name,
             r.title AS recurring_title, r.interval_days AS recurring_days,
-            (SELECT m.body FROM messages m WHERE m.ticket_id = t.id ORDER BY m.id DESC LIMIT 1) AS last_message,
+            -- The preview is what the row is for: it should read as the last
+            -- thing anyone said, not "Response time for this: within 24 hours."
+            -- System notes are the thread talking about itself.
+            (SELECT m.body FROM messages m
+              WHERE m.ticket_id = t.id AND m.author != 'system'
+              ORDER BY m.id DESC LIMIT 1) AS last_message,
             (SELECT COUNT(*) FROM messages m
                WHERE m.ticket_id = t.id
                  AND m.author != 'system'

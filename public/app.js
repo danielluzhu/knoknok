@@ -1745,8 +1745,11 @@ function renderIntake() {
     parts.push(`<button type="button" class="crumb" data-go="2" title="Change issue">${
       esc(intake.issue.name)} <span class="x">✕</span></button>`);
   }
-  crumbs.innerHTML = parts.join("") ||
-    '<span class="hint">Your choices will appear here. Tap one to change it.</span>';
+  // Nothing chosen yet means nothing to say. The line explaining that choices
+  // will appear here took a row of a phone screen to describe an empty space
+  // the tenant can already see.
+  crumbs.innerHTML = parts.join("");
+  crumbs.classList.toggle("hidden", !parts.length);
   crumbs.querySelectorAll("[data-go]").forEach((b) =>
     b.addEventListener("click", () => intakeGoTo(Number(b.dataset.go))));
 

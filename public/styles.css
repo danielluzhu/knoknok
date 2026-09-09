@@ -626,7 +626,14 @@ input, textarea, select { font: inherit; color: inherit; }
   padding: 24px 26px;
   display: flex; flex-direction: column; gap: 15px;
 }
-.msg { max-width: 72%; animation: rise 260ms cubic-bezier(.2, .8, .3, 1) both; }
+/* A short conversation sits against the composer rather than stranded at the
+   top of a tall empty pane. margin-top on the first child rather than
+   justify-content, which clips the top of a long thread when it overflows. */
+.thread > *:first-child { margin-top: auto; }
+/* 72% of a wide pane is a 700px line, which is roughly twice a comfortable
+   measure — the eye loses its place returning to the next line. Cap it in ch so
+   the limit follows the type size rather than the window. */
+.msg { max-width: min(72%, 62ch); animation: rise 260ms cubic-bezier(.2, .8, .3, 1) both; }
 .msg .who-line {
   font-size: 11.5px; color: var(--ink-faint); margin-bottom: 5px;
   font-weight: 600; letter-spacing: .01em;
@@ -1001,8 +1008,13 @@ input, textarea, select { font: inherit; color: inherit; }
   .intake-head { padding: 18px 16px 0; }
   #intakeBody { padding: 16px 16px 20px; }
   .intake-steps .lbl { font-size: 10px; letter-spacing: .03em; }
-  .intake-grid { gap: 6px; }
-  .intake-tile { padding: 10px 11px; min-height: 56px; }
+  /* One column. Two columns at 390px gave each tile about 150px, which is not
+     enough for "Doors, windows & locks" — the names wrapped mid-phrase and the
+     tiles came out different heights, so the grid read as broken rather than as
+     a set of choices. Full width lets each name sit on one line. */
+  .intake-grid { grid-template-columns: 1fr; gap: 7px; }
+  .intake-tile { padding: 12px 13px; min-height: 0; }
+  .intake-tile .name { font-size: 15px; }
 }
 
 /* ------------------------------------------------------------------ motion */
@@ -1067,17 +1079,35 @@ input, textarea, select { font: inherit; color: inherit; }
 /* The top bar has to stay one line, so drop what is available elsewhere: the
    property name is in the list, the engine and identity are in Account. */
 @media (max-width: 640px) {
-  .topbar { padding: 10px 12px; gap: 8px; }
-  .prop, .badge { display: none; }
+  /* The top bar has to stay one line. At 390px the name, the property and four
+     controls cannot all have it, and squeezing them produced a brand sitting on
+     top of a button and an identity worn down to a single letter. So: the
+     property is in the list, the engine badge and the identity are both in
+     Account, and what is left gets the room it needs. */
+  .topbar { padding: 10px 12px; gap: 10px; }
+  .prop, .badge, .who { display: none; }
   .prop-switch { padding-left: 0; border-left: 0; }
   .prop-switch select { max-width: 130px; }
   .ghost.tiny { padding: 5px 7px; }
-  .who { font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .topbar .ghost { padding: 6px 10px; font-size: 13px; white-space: nowrap; }
-  .topbar-right { gap: 8px; min-width: 0; }
-  .detail-head { padding: 14px 16px; }
-  .detail-head h2 { font-size: 19px; }
-  .row { padding: 12px; }
+  .brand { flex: 0 1 auto; min-width: 0; overflow: hidden; }
+  .logo-sm { font-size: 17px; white-space: nowrap; }
+  .topbar-right { flex: 1 1 auto; justify-content: flex-end; gap: 6px; min-width: 0; }
+  .topbar .ghost {
+    padding: 7px 10px; font-size: 13px; white-space: nowrap; flex: 0 0 auto;
+  }
+
+  /* The head was over half the screen before a single message showed. Every
+     part of it is worth having; none of it is worth that much room on a phone. */
+  .detail-head { padding: 13px 16px 14px; }
+  .detail-head h2 { font-size: 19px; margin-bottom: 6px; }
+  .detail-meta { gap: 6px 9px; }
+  /* The basics band repeats the opening message word for word — it exists so a
+     landlord reads them as a record rather than as prose. On a phone that
+     repetition cost a third of the screen before the conversation started, and
+     the same three facts are one line further down. */
+  .basics { display: none; }
+
+  .row { padding: 14px 12px; }
 }
 
 /* Native select chrome is the one thing that still looks unstyled next to the
