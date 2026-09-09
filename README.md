@@ -132,6 +132,61 @@ export ANTHROPIC_API_KEY=sk-ant-...
 bun start
 ```
 
+## Qwin
+
+With Qwin configured, the assistant's part of a request shrinks to the intake: it handles an
+emergency, asks for whichever of the four basics the form left open, and then hands the
+conversation to Qwin. A status line on the thread marks the handover, the ticket's `handler`
+becomes `qwin`, and every tenant message from then on goes to Qwin rather than the assistant.
+Qwin's replies appear on the thread under its own name, and it has the same three outcomes:
+keep talking, resolved without a visit, or escalate to the landlord. Requests raised as free
+text (no intake to finish) and issues flagged as emergencies never reach Qwin.
+
+```bash
+export QWIN_API_URL=https://.../turn      # one POST per turn
+export QWIN_API_KEY=...                   # sent as: Authorization: Bearer <key>
+bun start
+```
+
+Both must be set; with either missing nothing changes. If Qwin errors, times out (25 seconds,
+`QWIN_TIMEOUT_MS`), or answers something unreadable, the thread says so and the assistant
+answers that turn, so a request is never stranded.
+
+The whole connection is `src/qwin.ts`. Each turn POSTs the request in full, so Qwin need not
+keep state between turns, though it may: whatever it returns as `session` is sent back next time.
+
+```jsonc
+// request
+{
+  "session": null,                      // or whatever Qwin returned last turn
+  "request": {
+    "id": 42, "title": "Drain clogged or slow — kitchen sink",
+    "category": "plumbing", "priority": "normal",
+    "issue": { "id": "drain_slow", "name": "Drain clogged or slow" },
+    "basics": { "what": "kitchen sink", "where": "Kitchen, under the window",
+                "when": "since Tuesday, constant", "other": "plunged it, no change" },
+    "property": { "name": "Maple Court" },
+    "tenant": { "name": "Jo", "unit": "2A" }
+  },
+  "messages": [                         // the thread so far, status lines removed
+    { "role": "tenant", "content": "..." },
+    { "role": "assistant", "content": "..." },   // the maintenance assistant
+    { "role": "qwin", "content": "..." }
+  ]
+}
+// reply
+{
+  "reply": "...",                       // required (or "message")
+  "action": "ask",                      // "ask" | "resolved" | "escalate"; ask if omitted
+  "priority": "high",                   // optional override
+  "summary": "...",                     // optional one-liner for the landlord's list
+  "session": "conv_123"                 // optional, echoed back next turn
+}
+```
+
+If Qwin's real API wants a different shape, `toWire` and `fromWire` in `src/qwin.ts` are the
+two functions to change; nothing else in the app knows what goes over the wire.
+
 ## Layout
 
 ```
@@ -142,6 +197,7 @@ src/app.ts         every route, as one Request -> Response function
 src/db.ts          schema, the libSQL client, and types
 src/auth.ts        password hashing, sessions, throttling, cookies
 src/bot.ts         triage — Claude and the rule-based fallback
+src/qwin.ts        the handover to Qwin, once the basics are in
 src/intake.ts      the new-request decision tree, and the four basics it collects
 public/            the whole front end (index.html, app.js, styles.css)
 seed.ts            demo property, users, and tickets
@@ -160,7 +216,7 @@ All routes are JSON and cookie-authenticated.
 | GET | `/api/tickets?status=` | `open`, `closed`, `triage`, `all` |
 | POST | `/api/tickets` | tenant → starts triage, with `intake: {issue, what, room, spot?, when?, trigger?, notes?}` or a plain `title` + `description`; landlord → adds a to-do |
 | GET | `/api/tickets/:id` | ticket plus full message thread |
-| POST | `/api/tickets/:id/messages` | replies; runs the bot while in triage |
+| POST | `/api/tickets/:id/messages` | replies; runs the bot (or Qwin, after handover) while in triage |
 | POST | `/api/tickets/:id/update` | landlord only — priority, category, title |
 | POST | `/api/tickets/:id/escalate` | tenant skips the bot |
 | POST | `/api/tickets/:id/close` / `/reopen` | with an optional resolution note |

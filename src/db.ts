@@ -155,6 +155,12 @@ CREATE TABLE IF NOT EXISTS tickets (
   -- which basics are covered, and so the landlord gets them as fields rather
   -- than prose.
   intake      TEXT,
+  -- Who is talking to the tenant while the request is in triage. Null while the
+  -- maintenance assistant is collecting the basics; 'qwin' once it has handed
+  -- the conversation to Qwin (see src/qwin.ts). qwin_session is whatever id
+  -- Qwin asked to be given back on the next turn.
+  handler      TEXT CHECK (handler IN ('qwin')),
+  qwin_session TEXT,
   created_at  TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
   closed_at   TEXT
@@ -163,7 +169,7 @@ CREATE TABLE IF NOT EXISTS tickets (
 CREATE TABLE IF NOT EXISTS messages (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   ticket_id  INTEGER NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
-  author     TEXT NOT NULL CHECK (author IN ('tenant','bot','landlord','vendor','system')),
+  author     TEXT NOT NULL CHECK (author IN ('tenant','bot','landlord','vendor','qwin','system')),
   user_id    INTEGER REFERENCES users(id),
   body       TEXT NOT NULL,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -334,13 +340,15 @@ async function evolve(): Promise<void> {
       "id, username, password_hash, role, display_name, property_id, unit, created_at",
     );
   }
-  if (!(await tableDdl("messages")).includes("vendor")) {
+  // Two authors have been added to messages since the first schema: vendors,
+  // then Qwin. One rebuild covers a database that is missing either.
+  if (!(await tableDdl("messages")).includes("qwin")) {
     await rebuild(
       "messages",
       `CREATE TABLE messages__next (
          id         INTEGER PRIMARY KEY AUTOINCREMENT,
          ticket_id  INTEGER NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
-         author     TEXT NOT NULL CHECK (author IN ('tenant','bot','landlord','vendor','system')),
+         author     TEXT NOT NULL CHECK (author IN ('tenant','bot','landlord','vendor','qwin','system')),
          user_id    INTEGER REFERENCES users(id),
          body       TEXT NOT NULL,
          created_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -404,6 +412,11 @@ async function evolve(): Promise<void> {
   }
   if (!(await tableColumns("tickets")).has("intake")) {
     await client().execute("ALTER TABLE tickets ADD COLUMN intake TEXT");
+  }
+  if (!(await tableColumns("tickets")).has("handler")) {
+    await client().execute(
+      "ALTER TABLE tickets ADD COLUMN handler TEXT CHECK (handler IN ('qwin'))");
+    await client().execute("ALTER TABLE tickets ADD COLUMN qwin_session TEXT");
   }
 
   // Response-time targets. Existing requests get one worked out from what they
@@ -597,6 +610,10 @@ export interface Ticket {
   recurring_id: number | null;
   /** JSON of the structured intake (see src/intake.ts), or null. */
   intake: string | null;
+  /** 'qwin' once the conversation has been handed to Qwin; null otherwise. */
+  handler: "qwin" | null;
+  /** Qwin's own conversation id, sent back on every turn after the first. */
+  qwin_session: string | null;
   sla_tier: SlaTierName | null;
   due_at: string | null;
   created_at: string;
@@ -650,7 +667,7 @@ export interface TicketRead {
 export interface Message {
   id: number;
   ticket_id: number;
-  author: "tenant" | "bot" | "landlord" | "vendor" | "system";
+  author: "tenant" | "bot" | "landlord" | "vendor" | "qwin" | "system";
   user_id: number | null;
   body: string;
   created_at: string;

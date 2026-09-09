@@ -24,7 +24,10 @@ import {
   db, uniqueCode,
   type ChatMessage, type Message, type RecurringTask, type Ticket, type User,
 } from "./db";
-import { triage, usingClaude } from "./bot";
+import {
+  intakeTriage, triage, usingClaude, type Category, type TriageResult,
+} from "./bot";
+import { askQwin, usingQwin, type QwinTurn } from "./qwin";
 import {
   findIssue, intakeForClient, intakeMessage, intakeTitle, parseIntake, type Intake,
 } from "./intake";
@@ -648,6 +651,8 @@ async function publicUser(u: User) {
     // Only the roles that can span several need the switcher drawn at all.
     propertyCount: u.role === "tenant" ? 1 : (await propertiesFor(u)).length,
     botEngine: usingClaude ? "claude" : "rules",
+    // Whether a request is handed to Qwin once the basics are in.
+    qwin: usingQwin,
   };
 }
 
@@ -668,9 +673,93 @@ function storedIntake(ticket: Ticket): Intake | null {
  */
 async function runTriage(ticket: Ticket) {
   const history = await ticketMessages(ticket.id);
-  const result = await triage(ticket.title, history, storedIntake(ticket));
+  const intake = storedIntake(ticket);
 
-  await addMessage(ticket.id, "bot", result.reply);
+  // With Qwin configured, the assistant's part is the intake alone: emergencies
+  // and whichever of the four basics the form left open. The moment those are
+  // covered the conversation is handed over, and from then on every tenant
+  // message goes to Qwin. Requests raised as free text have no intake to
+  // finish, so the assistant keeps those.
+  if (usingQwin && intake && ticket.status === "triage") {
+    if (ticket.handler !== "qwin") {
+      const staged = intakeTriage(ticket.title, history, intake);
+      if (staged) return applyTriage(ticket, staged);
+      await db.run(
+        "UPDATE tickets SET handler = 'qwin', updated_at = datetime('now') WHERE id = ?",
+        [ticket.id],
+      );
+      await addMessage(
+        ticket.id, "system",
+        "That covers the basics. Qwin takes it from here and will work through the fix with you.",
+      );
+      ticket = { ...ticket, handler: "qwin" };
+    }
+    const turn = await runQwin(ticket, intake, history);
+    if (turn) return turn;
+    // Qwin could not answer this turn. Say so once, then let the assistant carry
+    // on so the tenant is not left talking to nobody.
+    await addMessage(
+      ticket.id, "system", "Qwin is not answering right now, so the assistant is stepping in.",
+    );
+  }
+
+  const result = await triage(ticket.title, history, intake);
+  return applyTriage(ticket, result);
+}
+
+/** One turn with Qwin, applied. Null when Qwin failed and the caller should fall back. */
+async function runQwin(ticket: Ticket, intake: Intake, history: Message[]) {
+  const tenant = ticket.tenant_id
+    ? await db.get<{ display_name: string; unit: string | null }>(
+        "SELECT display_name, unit FROM users WHERE id = ?", [ticket.tenant_id])
+    : null;
+  const property = await db.get<{ name: string }>(
+    "SELECT name FROM properties WHERE id = ?", [ticket.property_id]);
+
+  let turn: QwinTurn;
+  try {
+    turn = await askQwin({
+      ticketId: ticket.id,
+      title: ticket.title,
+      category: ticket.category,
+      priority: ticket.priority,
+      intake,
+      property: property ? { name: property.name } : null,
+      tenant: tenant ? { name: tenant.display_name, unit: tenant.unit } : null,
+      session: ticket.qwin_session,
+    }, history);
+  } catch (err) {
+    console.error("[qwin] turn failed, falling back to the assistant:", err);
+    return null;
+  }
+
+  if (turn.session && turn.session !== ticket.qwin_session) {
+    await db.run("UPDATE tickets SET qwin_session = ? WHERE id = ?", [turn.session, ticket.id]);
+  }
+  await addMessage(ticket.id, "qwin", turn.reply);
+
+  // Qwin does not re-file the request: the category is the intake's, and the
+  // priority only moves if Qwin says so. An issue the tenant flagged as an
+  // emergency never went to Qwin at all, so nothing here can lower one.
+  const issue = findIssue(intake.issue);
+  const result: TriageResult = {
+    reply: turn.reply,
+    action: turn.action,
+    category: (CATEGORIES.has(ticket.category) ? ticket.category : issue?.category ?? "other") as Category,
+    priority: turn.priority ?? ticket.priority,
+    summary: turn.summary ?? ticket.summary ?? ticket.title,
+    engine: "qwin",
+  };
+  await applyTriage(ticket, result, { spoken: true });
+  return result;
+}
+
+/**
+ * Apply what a triage turn decided: the reply on the thread (unless it is
+ * already there) and any change of status.
+ */
+async function applyTriage(ticket: Ticket, result: TriageResult, opts: { spoken?: boolean } = {}) {
+  if (!opts.spoken) await addMessage(ticket.id, "bot", result.reply);
 
   if (result.action === "escalate") {
     await db.run(

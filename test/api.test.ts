@@ -21,8 +21,10 @@ let server: ReturnType<typeof Bun.spawn> | null = null;
 /** A cookie jar per signed-in user, so tests can hold several sessions at once. */
 class Session {
   cookie = "";
+  /** Which server to talk to; the suite's own unless told otherwise. */
+  constructor(private base: string = BASE) {}
   async req(path: string, init: { method?: string; body?: unknown } = {}) {
-    const res = await fetch(BASE + path, {
+    const res = await fetch(this.base + path, {
       method: init.method ?? "GET",
       headers: {
         "content-type": "application/json",
@@ -1890,5 +1892,228 @@ describe("triage quality", () => {
       body: "I would rather someone just came out to look at it.",
     });
     expect(data.ticket.status).toBe("open");
+  });
+});
+
+/* ------------------------------------------------------------------- Qwin */
+
+// A second copy of the app, pointed at a Qwin stand-in that records what it was
+// sent and answers however the test tells it to. Nothing here can run against
+// an external deployment, whose environment the suite does not control.
+describe.skipIf(Boolean(EXTERNAL))("Qwin handover", () => {
+  const QWIN_PORT = 4397;
+  const APP_PORT = 4398;
+  const QDB = "data/test-qwin.db";
+  const KEY = "qwin-test-key";
+  const base = `http://localhost:${APP_PORT}`;
+
+  /** Every turn the stand-in has received: headers and parsed body. */
+  const received: { auth: string | null; body: any }[] = [];
+  /** What the next turn answers with. A status of 500 simulates Qwin being down. */
+  let answer: { status?: number; body: unknown } = { body: { reply: "Qwin here." } };
+
+  let qwin: ReturnType<typeof Bun.serve> | null = null;
+  let app: ReturnType<typeof Bun.spawn> | null = null;
+  const landlord = new Session(base);
+  const tenant = new Session(base);
+
+  beforeAll(async () => {
+    qwin = Bun.serve({
+      port: QWIN_PORT,
+      async fetch(req) {
+        received.push({ auth: req.headers.get("authorization"), body: await req.json() });
+        return Response.json(answer.body, { status: answer.status ?? 200 });
+      },
+    });
+    for (const suffix of ["", "-wal", "-shm"]) {
+      try { rmSync(QDB + suffix); } catch { /* first run */ }
+    }
+    app = Bun.spawn(["bun", "run", "server.ts"], {
+      env: {
+        ...process.env,
+        PORT: String(APP_PORT),
+        DB_PATH: QDB,
+        ANTHROPIC_API_KEY: "",
+        QWIN_API_URL: `http://localhost:${QWIN_PORT}/turn`,
+        QWIN_API_KEY: KEY,
+      },
+      stdout: "pipe", stderr: "pipe",
+    });
+    for (let i = 0; i < 100; i++) {
+      try { await fetch(base + "/api/me"); break; } catch { await Bun.sleep(100); }
+    }
+    const { data } = await landlord.post("/api/signup", {
+      role: "landlord", username: uniq("qland"), password: "password123",
+      displayName: "Quinn Landlord", propertyName: "Willow Row",
+    });
+    await tenant.post("/api/signup", {
+      role: "tenant", username: uniq("qten"), password: "password123",
+      displayName: "Tess Tenant", joinCode: data.user.property.joinCode, unit: "7C",
+    });
+  });
+
+  afterAll(() => {
+    app?.kill();
+    qwin?.stop(true);
+    for (const suffix of ["", "-wal", "-shm"]) {
+      try { rmSync(QDB + suffix); } catch { /* already gone */ }
+    }
+  });
+
+  test("the app says Qwin is in play", async () => {
+    const { data } = await tenant.get("/api/me");
+    expect(data.user.qwin).toBe(true);
+    expect(data.user.botEngine).toBe("rules");
+  });
+
+  test("the assistant collects the basics, then hands over — and Qwin gets everything", async () => {
+    received.length = 0;
+    answer = { body: { reply: "Qwin here. Try the RESET button first.", session: "conv-1" } };
+
+    // Two gaps left open: the exact spot and what was tried.
+    const made = await tenant.post("/api/tickets", {
+      intake: { issue: "outlet", what: "bathroom outlet", room: "Bathroom" },
+    });
+    const id = made.data.ticket.id;
+    expect(made.data.ticket.handler).toBeNull();
+    expect(made.data.messages.at(-1).author).toBe("bot");
+    expect(made.data.messages.at(-1).body).toContain("Where exactly in the bathroom");
+    expect(received.length).toBe(0);
+
+    const second = await tenant.post(`/api/tickets/${id}/messages`, { body: "Left of the mirror" });
+    expect(second.data.messages.at(-1).author).toBe("bot");
+    expect(second.data.messages.at(-1).body).toContain("tried anything");
+    expect(received.length).toBe(0);
+
+    // The basics are in: the handover is announced, and Qwin answers this turn.
+    const third = await tenant.post(`/api/tickets/${id}/messages`, { body: "Nothing yet" });
+    expect(third.data.ticket.status).toBe("triage");
+    expect(third.data.ticket.handler).toBe("qwin");
+    const authors = third.data.messages.map((m: any) => m.author);
+    expect(authors.slice(-2)).toEqual(["system", "qwin"]);
+    expect(third.data.messages.at(-2).body).toContain("Qwin takes it from here");
+    expect(third.data.messages.at(-1).body).toBe("Qwin here. Try the RESET button first.");
+    expect(third.data.bot.engine).toBe("qwin");
+
+    // What went over the wire.
+    expect(received.length).toBe(1);
+    const turn = received[0]!;
+    expect(turn.auth).toBe(`Bearer ${KEY}`);
+    expect(turn.body.session).toBeNull();
+    expect(turn.body.request.id).toBe(id);
+    expect(turn.body.request.category).toBe("electrical");
+    expect(turn.body.request.issue.id).toBe("outlet");
+    expect(turn.body.request.basics.what).toBe("bathroom outlet");
+    expect(turn.body.request.basics.where).toContain("Bathroom");
+    expect(turn.body.request.tenant).toEqual({ name: "Tess Tenant", unit: "7C" });
+    expect(turn.body.request.property).toEqual({ name: "Willow Row" });
+    const roles = turn.body.messages.map((m: any) => m.role);
+    expect(roles).toEqual(["tenant", "assistant", "tenant", "assistant", "tenant"]);
+    expect(turn.body.messages.at(-1).content).toBe("Nothing yet");
+
+    // From here on every tenant message goes to Qwin, with its session echoed back.
+    answer = { body: { reply: "Good. Is it working now?", session: "conv-1" } };
+    const fourth = await tenant.post(`/api/tickets/${id}/messages`, { body: "Pressed it" });
+    expect(fourth.data.messages.at(-1).author).toBe("qwin");
+    expect(received.length).toBe(2);
+    expect(received[1]!.body.session).toBe("conv-1");
+    expect(received[1]!.body.messages.map((m: any) => m.role).slice(-2)).toEqual(["qwin", "tenant"]);
+
+    // Qwin calls it resolved: closed without a visit, same as the assistant would.
+    answer = { body: { reply: "Great — all done.", action: "resolved" } };
+    const done = await tenant.post(`/api/tickets/${id}/messages`, { body: "Yes, working" });
+    expect(done.data.ticket.status).toBe("closed");
+    expect(done.data.ticket.closed_by).toBe("bot");
+  });
+
+  test("a complete intake goes to Qwin on the very first turn", async () => {
+    received.length = 0;
+    answer = { body: { reply: "Qwin: let us start with the trap." } };
+    const made = await tenant.post("/api/tickets", {
+      intake: {
+        issue: "clog", what: "kitchen sink", room: "Kitchen", spot: "the main basin",
+        when: "Since Tuesday", notes: "Plunged it, no change",
+      },
+    });
+    expect(made.data.ticket.handler).toBe("qwin");
+    expect(made.data.messages.map((m: any) => m.author)).toEqual(["tenant", "system", "qwin"]);
+    expect(received.length).toBe(1);
+    expect(received[0]!.body.request.basics.when).toBe("Since Tuesday");
+    expect(received[0]!.body.request.basics.other).toBe("Plunged it, no change");
+  });
+
+  test("Qwin can escalate, with its own summary and priority", async () => {
+    answer = { body: {
+      reply: "This needs a plumber.", action: "escalate", priority: "high",
+      summary: "Kitchen sink blocked below the trap; plunger and trap clean-out tried",
+    } };
+    const made = await tenant.post("/api/tickets", {
+      intake: {
+        issue: "clog", what: "kitchen sink", room: "Kitchen", spot: "the main basin",
+        when: "Since Tuesday", notes: "Plunged it, no change",
+      },
+    });
+    expect(made.data.ticket.status).toBe("open");
+    expect(made.data.ticket.priority).toBe("high");
+    expect(made.data.ticket.category).toBe("plumbing");
+    expect(made.data.ticket.summary).toContain("below the trap");
+    // Now on the landlord's list like any other escalation.
+    const list = await landlord.get("/api/tickets?status=open");
+    expect(list.data.tickets.some((t: any) => t.id === made.data.ticket.id)).toBe(true);
+  });
+
+  test("when Qwin is down the assistant steps in, and the thread says so", async () => {
+    answer = { status: 500, body: { error: "nope" } };
+    const made = await tenant.post("/api/tickets", {
+      intake: {
+        issue: "outlet", what: "bedroom outlet", room: "Bedroom", spot: "by the bed",
+        notes: "Nothing tried",
+      },
+    });
+    expect(made.data.ticket.status).toBe("triage");
+    expect(made.data.ticket.handler).toBe("qwin");
+    const authors = made.data.messages.map((m: any) => m.author);
+    expect(authors.slice(-2)).toEqual(["system", "bot"]);
+    expect(made.data.messages.at(-2).body).toContain("Qwin is not answering");
+    expect(made.data.messages.at(-1).body).toContain("GFCI");
+
+    // Once Qwin is back, the next turn goes to it again.
+    answer = { body: { reply: "Qwin is back." } };
+    const next = await tenant.post(`/api/tickets/${made.data.ticket.id}/messages`, { body: "ok" });
+    expect(next.data.messages.at(-1).author).toBe("qwin");
+  });
+
+  test("an emergency never reaches Qwin", async () => {
+    received.length = 0;
+    const made = await tenant.post("/api/tickets", {
+      intake: { issue: "gas", what: "smell near the stove", room: "Kitchen", spot: "by the stove" },
+    });
+    expect(made.data.ticket.status).toBe("open");
+    expect(made.data.ticket.priority).toBe("urgent");
+    expect(made.data.ticket.handler).toBeNull();
+    expect(received.length).toBe(0);
+  });
+
+  test("a free-text request stays with the assistant", async () => {
+    received.length = 0;
+    const made = await tenant.post("/api/tickets", {
+      title: "Bathroom outlet dead", description: "The outlet in my bathroom has no power at all",
+    });
+    expect(made.data.ticket.handler).toBeNull();
+    expect(made.data.messages.at(-1).author).toBe("bot");
+    expect(received.length).toBe(0);
+  });
+
+  test("the landlord sees Qwin's side of the thread after escalation", async () => {
+    answer = { body: { reply: "Handing this to your landlord.", action: "escalate" } };
+    const made = await tenant.post("/api/tickets", {
+      intake: {
+        issue: "clog", what: "bath", room: "Bathroom", spot: "the tub drain",
+        when: "Yesterday", notes: "Nothing yet",
+      },
+    });
+    const seen = await landlord.get(`/api/tickets/${made.data.ticket.id}`);
+    expect(seen.status).toBe(200);
+    expect(seen.data.messages.some((m: any) => m.author === "qwin")).toBe(true);
   });
 });

@@ -640,10 +640,12 @@ function enterApp() {
     ? `${me.displayName} · Unit ${me.unit}`
     : `${me.displayName} · ${me.role}`;
   const badge = $("#botBadge");
-  badge.textContent = me.botEngine === "claude" ? "bot: claude" : "bot: built-in";
-  badge.title = me.botEngine === "claude"
+  badge.textContent = (me.botEngine === "claude" ? "bot: claude" : "bot: built-in")
+    + (me.qwin ? " + qwin" : "");
+  badge.title = (me.botEngine === "claude"
     ? "Triage answered by Claude Opus 5"
-    : "Triage answered by the built-in diagnostic script (set ANTHROPIC_API_KEY for Claude)";
+    : "Triage answered by the built-in diagnostic script (set ANTHROPIC_API_KEY for Claude)")
+    + (me.qwin ? ". Once the basics are in, the tenant talks to Qwin." : "");
 
   // Vendors do not open work, they pick it up — so there is nothing to add.
   $("#newBtn").classList.toggle("hidden", me.role === "vendor");
@@ -1172,7 +1174,8 @@ function renderList() {
   list.innerHTML = state.tickets.map((t) => {
     const statusPill = t.status === "open"
       ? `<span class="pill open">to-do</span>`
-      : t.status === "triage" ? `<span class="pill triage">with bot</span>`
+      : t.status === "triage"
+        ? `<span class="pill triage">${t.handler === "qwin" ? "with Qwin" : "with bot"}</span>`
       : `<span class="pill closed">closed</span>`;
     const who = state.me.role !== "tenant" && t.tenant_name
       ? `${esc(t.tenant_name)}${t.tenant_unit ? " · " + esc(t.tenant_unit) : ""}`
@@ -1326,7 +1329,8 @@ function renderDetail(scroll = true) {
       <h2>${esc(t.title)}</h2>
       <div class="detail-meta">
         ${t.status === "open" ? '<span class="pill open">to-do</span>'
-          : t.status === "triage" ? '<span class="pill triage">with the assistant</span>'
+          : t.status === "triage"
+            ? `<span class="pill triage">${t.handler === "qwin" ? "with Qwin" : "with the assistant"}</span>`
           : '<span class="pill closed">closed</span>'}
         ${meta}
         ${assignRow}
@@ -1354,7 +1358,8 @@ function renderDetail(scroll = true) {
     </div>
     ${closed && t.resolution ? `<div class="resolution" style="margin-top:14px"><b>Resolved:</b> ${esc(t.resolution)}</div>` : ""}
     <div class="thread" id="thread">${renderThread()}
-      ${state.busy ? '<div class="msg bot"><div class="bubble thinking">The assistant is thinking…</div></div>' : ""}
+      ${state.busy ? `<div class="msg bot"><div class="bubble thinking">${
+        t.handler === "qwin" ? "Qwin" : "The assistant"} is thinking…</div></div>` : ""}
     </div>
     ${closed ? "" : `
     <div class="photo-strip hidden" id="photoStrip"></div>
@@ -1368,7 +1373,9 @@ function renderDetail(scroll = true) {
         </svg>
       </button>
       <textarea id="composerInput" rows="1" placeholder="${
-        t.status === "triage" && isTenant ? "Answer the assistant…" : "Write a message…"}"></textarea>
+        t.status === "triage" && isTenant
+          ? (t.handler === "qwin" ? "Answer Qwin…" : "Answer the assistant…")
+          : "Write a message…"}"></textarea>
       <button class="primary" id="sendBtn">Send</button>
     </div>`}`;
 
@@ -1434,12 +1441,13 @@ function renderThread() {
 function renderMessage(m) {
   const ROLE_FALLBACK = { tenant: "Tenant", landlord: "Landlord", vendor: "Vendor" };
   const label = m.author === "bot" ? "Maintenance assistant"
+    : m.author === "qwin" ? "Qwin"
     : m.author === "system" ? ""
     : m.author_name || ROLE_FALLBACK[m.author] || "";
   // My own messages sit on the right; the other party's on the left.
   const mine = m.author === state.me.role;
   const cls = m.author === "system" ? "system"
-    : m.author === "bot" ? "bot"
+    : m.author === "bot" || m.author === "qwin" ? "bot"
     : mine ? m.author : `${m.author} mine-left`;
   return `<div class="msg ${cls}">
     ${label ? `<div class="who-line">${esc(label)}</div>` : ""}

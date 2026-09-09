@@ -40,7 +40,7 @@ export interface TriageResult {
   /** One-line description for the landlord's to-do list. */
   summary: string;
   /** Which engine produced this result. */
-  engine: "claude" | "rules";
+  engine: "claude" | "rules" | "qwin";
 }
 
 export const usingClaude = Boolean(process.env.ANTHROPIC_API_KEY);
@@ -629,7 +629,11 @@ function intakeSummary(
   return parts.join(" — ").slice(0, 400);
 }
 
-function triageWithRules(title: string, history: Message[], intake: Intake | null): TriageResult {
+/**
+ * What the rules engine works from on every turn: the thread split by who
+ * spoke, the issue and playbook in play, and where in the script we are.
+ */
+function rulesContext(title: string, history: Message[], intake: Intake | null) {
   const tenantTurns = history.filter((m) => m.author === "tenant");
   const botTurns = history.filter((m) => m.author === "bot");
   const latest = norm(tenantTurns.at(-1)?.body ?? "");
@@ -645,6 +649,34 @@ function triageWithRules(title: string, history: Message[], intake: Intake | nul
     : pickPlaybook(all, titleText);
   const category: Category = book?.category ?? issue?.category ?? "other";
   const label = title.trim() || "Maintenance request";
+
+  // The basics the form left open. These are asked before any troubleshooting,
+  // and they are always the first replies on the thread — so how many have been
+  // asked is simply how many replies there have been, capped at the gap count.
+  const gaps = intake ? intakeGaps(intake).slice(0, MAX_GAP_QUESTIONS) : [];
+  const botReplies = botTurns.length;
+  const wantsHuman = hits(latest, WANTS_HUMAN);
+  const summarize = (ruledOut: number) =>
+    intake && issue ? intakeSummary(intake, issue, gaps, tenantTurns, ruledOut) : label;
+
+  return {
+    tenantTurns, latest, all, issue, book, category, label, gaps, botReplies, wantsHuman,
+    summarize,
+  };
+}
+
+/**
+ * The intake stage of the script: emergencies, then the basics the form left
+ * open. Null once those are covered — the moment the conversation is ready for
+ * whoever does the diagnosis, whether that is the rest of this script or Qwin.
+ */
+export function intakeTriage(
+  title: string,
+  history: Message[],
+  intake: Intake | null,
+): TriageResult | null {
+  const ctx = rulesContext(title, history, intake);
+  const { tenantTurns, all, issue, book, category, label, gaps, botReplies, wantsHuman } = ctx;
 
   // 1. Emergencies short-circuit everything.
   const emergency = issue?.urgent
@@ -673,16 +705,33 @@ function triageWithRules(title: string, history: Message[], intake: Intake | nul
     };
   }
 
-  // The basics the form left open. These are asked before any troubleshooting,
-  // and they are always the first replies on the thread — so how many have been
-  // asked is simply how many replies there have been, capped at the gap count.
-  const gaps = intake ? intakeGaps(intake).slice(0, MAX_GAP_QUESTIONS) : [];
-  const botReplies = botTurns.length;
-  const wantsHuman = hits(latest, WANTS_HUMAN);
-  const summarize = (ruledOut: number) =>
-    intake && issue ? intakeSummary(intake, issue, gaps, tenantTurns, ruledOut) : label;
+  // 2. Fill the gaps first: no decision until what, where, when and what was
+  //    tried are all known.
+  if (botReplies < gaps.length && !wantsHuman) {
+    const opening = botReplies === 0
+      ? "Thanks — a couple of quick things before we work out what this is.\n\n"
+      : "Got it. ";
+    return {
+      reply: opening + gaps[botReplies]!.ask,
+      action: "ask",
+      category,
+      priority: book?.priority ?? issue?.priority ?? "normal",
+      summary: ctx.summarize(0),
+      engine: "rules",
+    };
+  }
+  return null;
+}
 
-  // 2. Tenant confirmed a fix worked. Only once a fix has actually been offered
+function triageWithRules(title: string, history: Message[], intake: Intake | null): TriageResult {
+  const staged = intakeTriage(title, history, intake);
+  if (staged) return staged;
+
+  const {
+    latest, issue, book, category, label, gaps, botReplies, wantsHuman, summarize,
+  } = rulesContext(title, history, intake);
+
+  // 3. Tenant confirmed a fix worked. Only once a fix has actually been offered
   //    — "yes" in answer to "is it getting worse?" means the opposite.
   if (botReplies > gaps.length && hits(latest, YES) && !hits(latest, NO)) {
     return {
@@ -699,21 +748,6 @@ function triageWithRules(title: string, history: Message[], intake: Intake | nul
     };
   }
 
-  // 3. Fill the gaps first: no decision until what, where, when and what was
-  //    tried are all known.
-  if (botReplies < gaps.length && !wantsHuman) {
-    const opening = botReplies === 0
-      ? "Thanks — a couple of quick things before we work out what this is.\n\n"
-      : "Got it. ";
-    return {
-      reply: opening + gaps[botReplies]!.ask,
-      action: "ask",
-      category,
-      priority: book?.priority ?? issue?.priority ?? "normal",
-      summary: summarize(0),
-      engine: "rules",
-    };
-  }
   // How far into the troubleshooting we are, gap questions aside.
   const phase = botReplies - gaps.length;
 
