@@ -140,7 +140,7 @@ function renderScheduleList() {
       : days <= 0 ? "due now"
       : days === 1 ? "due tomorrow"
       : `due in ${days}d`;
-    return `<div class="row ${r.paused ? "row-paused" : ""}" data-id="${r.id}">
+    return `<button type="button" class="row ${r.paused ? "row-paused" : ""}" data-id="${r.id}">
       <div class="row-top"><span class="row-title">${esc(r.title)}</span>
         <span class="row-marks"><span class="row-meta">${when}</span></span></div>
       <div class="row-meta">
@@ -150,7 +150,7 @@ function renderScheduleList() {
         <span>${esc(CATEGORY_LABEL[r.category] || "Other")}</span>
       </div>
       ${r.details ? `<div class="row-snippet">${esc(r.details)}</div>` : ""}
-    </div>`;
+    </button>`;
   }).join("");
   list.querySelectorAll(".row").forEach((r) =>
     r.addEventListener("click", () => {
@@ -164,10 +164,10 @@ function renderScheduleDetail() {
   const r = state.schedules.find((x) => x.id === state.scheduleOpen);
   if (!r) {
     el.innerHTML = `<div class="placeholder"><div>
-      <p style="font-size:34px;margin:0">🗓️</p>
+      <p class="mark" aria-hidden="true">🗓️</p>
       <p>Upkeep that comes round again — landscaping, cleaning, roof checks,
       a sewer survey.<br>Each one raises an ordinary to-do when it falls due.</p>
-      <p style="margin-top:18px"><button class="primary" id="addSchedule">+ New recurring task</button></p>
+      <p><button class="primary" id="addSchedule">+ New recurring task</button></p>
     </div></div>`;
     $("#addSchedule").addEventListener("click", openScheduleModal);
     return;
@@ -992,7 +992,9 @@ function renderChatList() {
     return;
   }
   list.innerHTML = state.chats.map((c) => `
-    <div class="row ${state.chatWith === c.id ? "active" : ""} ${c.unread ? "has-unread" : ""}" data-id="${c.id}">
+    <button type="button" class="row ${state.chatWith === c.id ? "active" : ""} ${
+      c.unread ? "has-unread" : ""}" data-id="${c.id}"${
+      state.chatWith === c.id ? ' aria-current="true"' : ""}>
       <div class="with-avatar">
         ${avatar(c.name)}
         <div>
@@ -1010,7 +1012,7 @@ function renderChatList() {
           }</div>
         </div>
       </div>
-    </div>`).join("");
+    </button>`).join("");
   list.querySelectorAll(".row").forEach((r) =>
     r.addEventListener("click", () => openChat(Number(r.dataset.id))));
 }
@@ -1040,7 +1042,7 @@ function renderChatDetail(scroll = true) {
 
   if (!state.chatWith || !state.chat) {
     el.innerHTML = `<div class="placeholder"><div>
-      <p style="font-size:34px;margin:0">💬</p>
+      <p class="mark" aria-hidden="true">💬</p>
       <p>Pick someone to message.<br>Tenants can only message you, so nothing here is a group thread.</p>
     </div></div>`;
     return;
@@ -1196,14 +1198,16 @@ function renderList() {
     const unread = t.unread > 0
       ? `<span class="unread" title="${t.unread} new message${t.unread === 1 ? "" : "s"}">${t.unread}</span>`
       : "";
-    return `<div class="row ${state.selected === t.id ? "active" : ""} ${t.unread > 0 ? "has-unread" : ""}" data-id="${t.id}">
+    return `<button type="button" class="row ${state.selected === t.id ? "active" : ""} ${
+      t.unread > 0 ? "has-unread" : ""}" data-id="${t.id}"${
+      state.selected === t.id ? ' aria-current="true"' : ""}>
       <div class="row-top"><span class="row-title">${esc(t.title)}</span>
         <span class="row-marks">${unread}<span class="dot p-${t.priority}" title="priority: ${t.priority}"></span></span></div>
       <div class="row-meta">${statusPill}${dueBadge(t)}${repeats}${where}${claim}${
         fromLandlord ? '<span class="pill from">from landlord</span>' : ""
       }<span>${who}</span><span>${when(t.updated_at)}</span></div>
       <div class="row-snippet">${esc(t.last_message || t.summary)}</div>
-    </div>`;
+    </button>`;
   }).join("");
   list.querySelectorAll(".row").forEach((r) =>
     r.addEventListener("click", () => openTicket(Number(r.dataset.id))));
@@ -1228,6 +1232,59 @@ async function openTicket(id, scroll = true) {
   renderDetail(scroll);
 }
 
+/**
+ * Show or hide the reading pane.
+ *
+ * Side by side above 820px, one at a time below it: a phone cannot give a list
+ * and a conversation half a screen each and leave either usable, and a tenant
+ * reporting a leak is on a phone by definition. The class is set here and only
+ * here, so what the layout shows and what `state.selected` says can never
+ * disagree.
+ */
+/**
+ * Say what just arrived, once, for anyone listening rather than looking.
+ *
+ * Only messages from someone else, and only the newest — the thread re-renders
+ * on every poll, so anything broader would re-read the whole conversation every
+ * few seconds.
+ */
+let announced = 0;
+let announcedFor = null;
+function announce(messages) {
+  const latest = [...messages].reverse().find(
+    (m) => m.id && m.author !== "system" && m.user_id !== state.me.id,
+  );
+  if (!latest) return;
+  // Opening a thread is not news. Catch up to where it already is, silently,
+  // and speak only what lands after that.
+  if (announcedFor !== state.selected) {
+    announcedFor = state.selected;
+    announced = latest.id;
+    return;
+  }
+  if (latest.id <= announced) return;
+  announced = latest.id;
+  const who = latest.author === "bot"
+    ? "Maintenance assistant"
+    : (latest.author_name || "New message");
+  const el = $("#announcer");
+  if (el) el.textContent = `${who}: ${latest.body}`;
+}
+
+function showDetail(open) {
+  $(".layout")?.classList.toggle("detail-open", Boolean(open));
+}
+
+/** Leave a thread and go back to the list. Only reachable on a narrow screen. */
+function closeDetail() {
+  state.selected = null;
+  state.ticket = null;
+  state.messages = [];
+  showDetail(false);
+  renderDetail(false);
+  renderList();
+}
+
 function renderDetail(scroll = true) {
   const el = $("#detail");
   // Background polling re-renders this pane, so hold on to anything the user is
@@ -1237,8 +1294,9 @@ function renderDetail(scroll = true) {
   const prevScroll = prev?.scrollTop ?? 0;
   const wasAtBottom = !prev || prev.scrollHeight - prev.scrollTop - prev.clientHeight < 80;
   if (!state.selected || !state.ticket) {
+    showDetail(false);
     el.innerHTML = `<div class="placeholder"><div>
-      <p style="font-size:34px;margin:0">🔧</p>
+      <p class="mark" aria-hidden="true">🔧</p>
       <p>${state.me.role === "tenant"
         ? "Pick a request, or start a new one.<br>The assistant will try to sort it out before it ever reaches your landlord."
         : state.me.role === "vendor"
@@ -1247,6 +1305,8 @@ function renderDetail(scroll = true) {
     </div></div>`;
     return;
   }
+  showDetail(true);
+  announce(state.messages);
   const t = state.ticket;
   const isTenant = state.me.role === "tenant";
   const isVendor = state.me.role === "vendor";
@@ -1323,6 +1383,13 @@ function renderDetail(scroll = true) {
 
   el.innerHTML = `
     <div class="detail-head">
+      <button class="back-btn" id="backBtn" aria-label="Back to the list">
+        <svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true">
+          <path d="M15 5l-7 7 7 7" fill="none" stroke="currentColor" stroke-width="2"
+                stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <span>All requests</span>
+      </button>
       <h2>${esc(t.title)}</h2>
       <div class="detail-meta">
         ${t.status === "open" ? '<span class="pill open">to-do</span>'
@@ -1384,6 +1451,7 @@ function renderDetail(scroll = true) {
     e.target.value = ""; // so picking the same file twice still fires
   });
 
+  $("#backBtn")?.addEventListener("click", closeDetail);
   $("#closeBtn")?.addEventListener("click", onClose);
   $("#claimBtn")?.addEventListener("click", () => act(`/api/tickets/${t.id}/claim`));
   $("#releaseBtn")?.addEventListener("click", () => act(`/api/tickets/${t.id}/release`));

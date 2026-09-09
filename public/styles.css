@@ -15,18 +15,25 @@
   --bg-tint: #efe9e0;
   --panel: #fffdfb;
   --panel-sunk: #f6f2ec;
+  /* Three text steps, each one at or above 4.5:1 on both --bg and --panel.
+     The faint step is where a warm grey wants to drift too light: it carries
+     timestamps, author lines and system notes, which are text people read, not
+     decoration. Measured, not eyeballed — roughly 16:1, 7:1 and 4.5:1. */
   --ink: #1c1917;
-  --ink-soft: #6f665e;
-  --ink-faint: #9c938b;
+  --ink-soft: #574f48;
+  --ink-faint: #776e66;
   --line: #e8e1d7;
   --line-soft: #f0ebe3;
 
-  --accent: #bd5433;
-  --accent-hover: #a3452a;
+  --accent: #b75131;
+  --accent-hover: #9c4227;
   --accent-ink: #ffffff;
 
   --urgent: #c0392b;
-  --high: #c2740a;
+  /* Amber is the one status hue that cannot be had at full saturation and stay
+     legible on a light ground; this is the darkest it can be while still
+     reading as amber rather than brown. */
+  --high: #a26108;
   --ok: #2f7a4f;
   --info: #2f5fa8;
   --violet: #5b46a4;
@@ -56,7 +63,7 @@
     --panel-sunk: #232120;
     --ink: #f2ece5;
     --ink-soft: #a79d94;
-    --ink-faint: #7e746c;
+    --ink-faint: #8b8178;
     --line: #302c29;
     --line-soft: #262322;
 
@@ -95,6 +102,26 @@ body {
 }
 
 .hidden { display: none !important; }
+
+/* Out of the way until it is tabbed to, then unmissable. */
+.skip-link {
+  position: fixed; top: 10px; left: 10px; z-index: 100;
+  padding: 10px 16px;
+  background: var(--accent); color: var(--accent-ink);
+  border-radius: var(--r-md); box-shadow: var(--shadow-lg);
+  font-size: 14px; font-weight: 600; text-decoration: none;
+  transform: translateY(-160%);
+  transition: transform var(--fast);
+}
+.skip-link:focus-visible { transform: none; }
+.list:focus { outline: none; }
+
+/* Present for assistive technology, absent for everyone else. */
+.sr-only {
+  position: absolute; width: 1px; height: 1px;
+  margin: -1px; padding: 0; border: 0;
+  overflow: hidden; clip-path: inset(50%); white-space: nowrap;
+}
 
 button { font: inherit; cursor: pointer; color: inherit; }
 input, textarea, select { font: inherit; color: inherit; }
@@ -413,12 +440,22 @@ input, textarea, select { font: inherit; color: inherit; }
 
 /* -------------------------------------------------------------------- rows */
 
+/* Rows are real buttons. They were divs with click handlers, which looked
+   identical and could not be reached by keyboard or announced as anything you
+   could open — on a list whose entire purpose is opening things. The reset
+   below is what a button needs to sit flush in a list. */
 .row {
   position: relative;
+  display: block; width: 100%; text-align: left;
+  margin: 0; border: 0; border-bottom: 1px solid var(--line-soft);
+  background: transparent; color: inherit; font: inherit;
   padding: 13px 15px;
-  border-bottom: 1px solid var(--line-soft);
   cursor: pointer;
   transition: background var(--fast);
+}
+.row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px; /* inset, so the ring is not clipped by the list edge */
 }
 .row::before {
   content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
@@ -524,6 +561,21 @@ input, textarea, select { font: inherit; color: inherit; }
 /* ------------------------------------------------------------------ detail */
 
 .detail { display: flex; flex-direction: column; min-height: 0; background: var(--bg); }
+
+/* The way back to the list, on the layouts that only show one pane. Hidden
+   rather than absent on wide screens, so the head does not reflow when the
+   viewport crosses the breakpoint. */
+.back-btn {
+  display: none;
+  align-items: center; gap: 4px;
+  margin: 0 0 10px -8px; padding: 6px 10px 6px 8px;
+  border: 0; border-radius: var(--r-full);
+  background: transparent; color: var(--ink-soft);
+  font-size: 13.5px; font-weight: 550;
+  transition: background var(--fast), color var(--fast);
+}
+.back-btn:hover { background: var(--panel-sunk); color: var(--ink); }
+.back-btn svg { flex: none; }
 .detail-head {
   padding: 18px 26px; border-bottom: 1px solid var(--line); background: var(--panel);
 }
@@ -780,10 +832,24 @@ input, textarea, select { font: inherit; color: inherit; }
 /* Inside the new-request form the strip is already within the field's padding. */
 #newPhotoStrip { padding: 10px 0 0; background: none; }
 
+/* The empty reading pane is the largest surface in the app and the first thing
+   a new account sees. Hold the text to a readable measure and let the space
+   around it do the work, rather than centring a wide ribbon of prose. */
 .placeholder {
   flex: 1; display: grid; place-items: center;
   color: var(--ink-soft); text-align: center; padding: 40px;
   line-height: 1.65;
+}
+.placeholder > div { max-width: 34ch; }
+.placeholder p { margin: 0; }
+.placeholder p + p { margin-top: 14px; }
+.placeholder .mark {
+  display: grid; place-items: center;
+  width: 62px; height: 62px; margin: 0 auto 18px;
+  border-radius: var(--r-full);
+  background: color-mix(in oklab, var(--accent) 9%, var(--panel));
+  border: 1px solid color-mix(in oklab, var(--accent) 18%, var(--line));
+  font-size: 27px; line-height: 1;
 }
 
 /* ------------------------------------------------------------------- modal */
@@ -955,16 +1021,47 @@ input, textarea, select { font: inherit; color: inherit; }
   }
 }
 
+/* Some people turn contrast up because the default is not enough. Honour it:
+   firm up every hairline, and stop the faint text step from being faint. */
+@media (prefers-contrast: more) {
+  :root {
+    --line: color-mix(in oklab, var(--ink) 28%, var(--panel));
+    --line-soft: color-mix(in oklab, var(--ink) 18%, var(--panel));
+    --ink-faint: var(--ink-soft);
+  }
+  .row { border-bottom-color: var(--line); }
+  .pill, .bubble, .choice-btn, .btn, .ghost { border-width: 1.5px; }
+  :focus-visible { outline-width: 3px; }
+}
+
 /* -------------------------------------------------------------- responsive */
 
 @media (max-width: 820px) {
-  .layout { grid-template-columns: 1fr; grid-template-rows: minmax(0, 40%) minmax(0, 60%); }
+  /* One pane at a time. Two panes at 40/60 gave a list too short to scan and a
+     conversation too short to read; whichever you were using, the other half
+     was in the way. */
+  .layout { grid-template-columns: 1fr; grid-template-rows: 1fr; }
+  .sidebar, .detail { grid-area: 1 / 1; min-width: 0; }
+  .sidebar { border-right: 0; }
+  .detail { display: none; }
+  .layout.detail-open .sidebar { display: none; }
+  .layout.detail-open .detail { display: flex; }
+  .back-btn { display: inline-flex; }
+
   .msg { max-width: 88%; }
   .thread { padding: 18px 16px; }
   .detail-head, .composer { padding-left: 16px; padding-right: 16px; }
   .resolution { margin-left: 16px; margin-right: 16px; }
   .field-row { grid-template-columns: 1fr; }
   .auth-card { padding: 26px; }
+
+  /* Thumb-sized targets. Anything you tap while holding a phone one-handed
+     wants 44px, which several of these were a few pixels short of. */
+  .row { padding: 14px 12px; }
+  .views button { padding: 10px 8px; }
+  .filters button { padding: 8px 12px; }
+  .composer textarea { font-size: 16px; } /* 16px stops iOS zooming on focus */
+  .sidebar-head .primary.small { padding: 11px; }
 }
 
 /* The top bar has to stay one line, so drop what is available elsewhere: the
@@ -978,7 +1075,6 @@ input, textarea, select { font: inherit; color: inherit; }
   .who { font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .topbar .ghost { padding: 6px 10px; font-size: 13px; white-space: nowrap; }
   .topbar-right { gap: 8px; min-width: 0; }
-  .layout { grid-template-rows: minmax(0, 36%) minmax(0, 64%); }
   .detail-head { padding: 14px 16px; }
   .detail-head h2 { font-size: 19px; }
   .row { padding: 12px; }

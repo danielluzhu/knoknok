@@ -12,6 +12,10 @@
 </head>
 <body>
 
+<!-- Keyboard users land here first. Without it, reaching a request means tabbing
+     through the whole top bar and every filter, on every page load. -->
+<a class="skip-link" href="#list">Skip to requests</a>
+
 <!-- ---------------------------------------------------------------- auth -->
 <div id="auth" class="auth hidden">
   <div class="auth-card">
@@ -75,19 +79,27 @@
   </header>
 
   <main class="layout">
-    <aside class="sidebar">
+    <aside class="sidebar" aria-label="Requests">
       <div class="sidebar-head">
-        <div class="views" id="views"></div>
+        <div class="views" id="views" role="tablist" aria-label="What to show"></div>
         <button id="newBtn" class="primary small">+ New</button>
-        <div class="filters" id="filters"></div>
+        <div class="filters" id="filters" role="group" aria-label="Filter by status"></div>
       </div>
-      <div id="list" class="list"></div>
+      <!-- Not role="list": its children are buttons, and a list role demands
+           listitem children. tabindex="-1" lets the skip link actually land
+           focus here rather than only scrolling to it. -->
+      <div id="list" class="list" tabindex="-1" aria-label="Requests"></div>
       <div id="landlordInfo" class="landlord-info hidden"></div>
     </aside>
 
-    <section id="detail" class="detail"></section>
+    <section id="detail" class="detail" aria-label="Conversation"></section>
   </main>
 </div>
+
+<!-- Announcements for screen readers. A live region on the thread itself would
+     re-read the whole conversation every time the pane re-renders, which it does
+     on every poll; this says only what just arrived. -->
+<div id="announcer" class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>
 
 <!-- ------------------------------------------------------------- new item -->
 <div id="modal" class="modal hidden">
