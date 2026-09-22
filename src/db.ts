@@ -10,6 +10,10 @@
  */
 import { createClient } from "@libsql/client";
 import { dueAt, slaTier } from "./sla";
+import {
+  nteFor, tradeFor,
+  type ApprovalState, type Billable, type Entry, type Trade, type WoStatus,
+} from "./workorder";
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
@@ -60,6 +64,10 @@ CREATE TABLE IF NOT EXISTS properties (
   join_code   TEXT NOT NULL UNIQUE,
   vendor_code TEXT UNIQUE,
   landlord_id INTEGER REFERENCES users(id),
+  -- What a repair may cost on this property before the landlord is asked first.
+  -- Per property rather than per landlord: a studio and a six-flat building do
+  -- not have the same idea of a small bill.
+  approval_threshold_cents INTEGER NOT NULL DEFAULT 50000,
   created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -104,6 +112,21 @@ CREATE TABLE IF NOT EXISTS landlord_vendors (
   vendor_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
   created_at  TEXT NOT NULL DEFAULT (datetime('now')),
   PRIMARY KEY (landlord_id, vendor_id)
+);
+
+-- Who a landlord wants called for each trade. This is what makes dispatch
+-- automatic: a request that needs a plumber and does not need approval goes
+-- straight to the plumber, without a landlord having to notice it first.
+--
+-- One vendor per trade per landlord, so there is always exactly one answer to
+-- "who goes". A landlord with two plumbers picks a first choice; the other is
+-- still in the network and can be assigned by hand or claim the job themselves.
+CREATE TABLE IF NOT EXISTS preferred_vendors (
+  landlord_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  trade       TEXT NOT NULL,
+  vendor_id   INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  PRIMARY KEY (landlord_id, trade)
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -155,6 +178,36 @@ CREATE TABLE IF NOT EXISTS tickets (
   -- which basics are covered, and so the landlord gets them as fields rather
   -- than prose.
   intake      TEXT,
+
+  -- The work order: everything decided once triage has said this needs a person.
+  -- See src/workorder.ts, which computes the lot and explains why each one is a
+  -- separate decision. Null until the request leaves triage — a thread the
+  -- tenant is still talking through has no vendor, no cap and no invoice.
+  --
+  --   trade           which contractor this needs, which is not the category
+  --   nte_cents       how far they may go without coming back to ask
+  --   approval_state  not_required | pending | approved | declined
+  --   wo_status       new | awaiting_approval | assigned | scheduled
+  --                   | work_done | closed
+  --   billable_to     landlord | tenant | undecided — a suggestion, never a
+  --                   charge; only a landlord ever sets this to 'tenant'
+  --   entry_permission / access_notes / pets
+  --                   what the vendor needs in order to get through the door
+  --   actual_cents    what the work came to, as reported on completion
+  trade            TEXT,
+  nte_cents        INTEGER,
+  approval_state   TEXT,
+  approval_note    TEXT,
+  approved_by      TEXT,
+  approved_at      TEXT,
+  wo_status        TEXT,
+  scheduled_for    TEXT,
+  billable_to      TEXT,
+  billable_note    TEXT,
+  entry_permission TEXT,
+  access_notes     TEXT,
+  pets             TEXT,
+  actual_cents     INTEGER,
   created_at  TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
   closed_at   TEXT
@@ -433,6 +486,56 @@ async function evolve(): Promise<void> {
     });
   }
 
+  // The work order: what a request becomes once triage decides it needs a
+  // person. Added as one block because the columns are one decision — a row
+  // with a trade but no spend cap is not a half-migrated work order, it is a
+  // broken one.
+  const wo = await tableColumns("tickets");
+  if (!wo.has("trade")) {
+    for (const column of [
+      "trade TEXT", "nte_cents INTEGER", "approval_state TEXT", "approval_note TEXT",
+      "approved_by TEXT", "approved_at TEXT", "wo_status TEXT", "scheduled_for TEXT",
+      "billable_to TEXT", "billable_note TEXT", "entry_permission TEXT",
+      "access_notes TEXT", "pets TEXT", "actual_cents INTEGER",
+    ]) {
+      await client().execute(`ALTER TABLE tickets ADD COLUMN ${column}`);
+    }
+  }
+  if (!(await tableColumns("properties")).has("approval_threshold_cents")) {
+    await client().execute(
+      "ALTER TABLE properties ADD COLUMN approval_threshold_cents INTEGER NOT NULL DEFAULT 50000");
+  }
+
+  // Requests that were already open when the work order arrived. They are given
+  // a trade and a cap from what they already say, and land in 'new' — never in
+  // 'awaiting_approval', because nobody is going to answer an approval request
+  // for a job that has been sitting on the list since March. A landlord can
+  // still send one back for approval by hand.
+  const unplanned = await client().execute(
+    `SELECT id, title, summary, category, priority, assigned_vendor_id, status
+       FROM tickets WHERE wo_status IS NULL AND status != 'triage'`,
+  );
+  for (const row of unplanned.rows) {
+    // Rows are index-accessible but not iterable, so read them positionally
+    // rather than destructuring — the same `at` shape the step above uses.
+    const cell = (i: number) => (row as unknown as unknown[])[i];
+    const id = cell(0) as number;
+    const trade = tradeFor(String(cell(3) ?? ""), `${cell(1) ?? ""} ${cell(2) ?? ""}`);
+    const nte = nteFor(trade, (String(cell(4) ?? "normal") as Priority));
+    await client().execute({
+      sql: `UPDATE tickets
+              SET trade = ?, nte_cents = ?, approval_state = 'not_required',
+                  wo_status = ?, billable_to = 'landlord'
+            WHERE id = ?`,
+      args: [
+        trade,
+        nte,
+        cell(6) === "closed" ? "closed" : cell(5) ? "assigned" : "new",
+        id,
+      ],
+    });
+  }
+
   // Last, because these index columns only exist once the steps above have run.
   await client().execute(
     "CREATE INDEX IF NOT EXISTS idx_properties_landlord ON properties(landlord_id)",
@@ -562,6 +665,8 @@ export interface Property {
   join_code: string;
   vendor_code: string | null;
   landlord_id: number | null;
+  /** Above this, a repair waits for the landlord's yes. See src/workorder.ts. */
+  approval_threshold_cents: number;
   created_at: string;
 }
 
@@ -599,6 +704,21 @@ export interface Ticket {
   intake: string | null;
   sla_tier: SlaTierName | null;
   due_at: string | null;
+  /** The work order (see src/workorder.ts). Null while still in triage. */
+  trade: Trade | null;
+  nte_cents: number | null;
+  approval_state: ApprovalState | null;
+  approval_note: string | null;
+  approved_by: string | null;
+  approved_at: string | null;
+  wo_status: WoStatus | null;
+  scheduled_for: string | null;
+  billable_to: Billable | null;
+  billable_note: string | null;
+  entry_permission: Entry | null;
+  access_notes: string | null;
+  pets: string | null;
+  actual_cents: number | null;
   created_at: string;
   updated_at: string;
   closed_at: string | null;

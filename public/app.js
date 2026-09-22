@@ -19,6 +19,8 @@ const state = {
   schedules: [], cadences: [], suggestions: [], scheduleOpen: null,
   // The decision tree behind a tenant's new request, from /api/intake.
   intakeTree: null,
+  // Who gets called for what, and what may be spent before anyone asks.
+  dispatch: null,
 };
 
 /** The `?property=` every scoped request carries. */
@@ -840,7 +842,12 @@ async function loadProperty() {
               `${esc(v.display_name)}${v.jobs ? ` (${v.jobs} job${v.jobs === 1 ? "" : "s"})` : ""}`
             ).join(", ")
           : "No vendors yet — share a code above with a contractor."
-      }</div>`;
+      }</div>
+      ${renderDispatch()}`;
+    wireDispatch();
+
+    // Loaded after the panel is drawn, so the sidebar never waits on it.
+    loadDispatch();
 
     // The breakdown doubles as a way in: clicking a building narrows to it.
     $("#landlordInfo").querySelectorAll(".prop-line-open").forEach((b) =>
@@ -849,6 +856,81 @@ async function loadProperty() {
   } catch {
     /* sidebar extras are optional — never block the list on them */
   }
+}
+
+/* ------------------------------------------------------- dispatch settings */
+
+/**
+ * The two settings that decide what happens to a request without the landlord
+ * in the room: how much may be spent before they are asked, and who gets called
+ * for what. Both live in the sidebar because they are properties of the
+ * business rather than of any one request.
+ */
+async function loadDispatch() {
+  try {
+    state.dispatch = await api(`/api/dispatch?${scopeQuery()}`);
+    const holder = $("#dispatchPanel");
+    if (holder) {
+      holder.outerHTML = renderDispatch();
+      wireDispatch();
+    }
+  } catch { /* optional, like the rest of the sidebar */ }
+}
+
+function renderDispatch() {
+  const d = state.dispatch;
+  if (!d) return '<div id="dispatchPanel"></div>';
+  const vendorOptions = (picked) =>
+    `<option value="">Nobody — I'll assign it</option>${
+      d.vendors.map((v) => `<option value="${v.id}"${
+        v.id === picked ? " selected" : ""}>${esc(v.display_name)}</option>`).join("")}`;
+
+  return `<div id="dispatchPanel"><details class="dispatch">
+    <summary>Dispatch rules</summary>
+    <p class="dispatch-lede">A repair under the limit goes straight to the first-choice
+      trade. Over it, you are asked first — except an emergency, which always goes.</p>
+    <div class="dispatch-rows">
+      ${d.properties.map((p) => `
+        <label class="inline-edit dispatch-limit">${esc(p.name)}
+          <input type="text" inputmode="decimal" size="7" data-limit="${p.id}"
+                 value="${(p.approval_threshold_cents / 100).toFixed(0)}"
+                 aria-label="Approval limit for ${esc(p.name)}">
+        </label>`).join("")}
+    </div>
+    <div class="dispatch-rows">
+      ${d.trades.map((t) => `
+        <label class="inline-edit dispatch-trade">${esc(t.label)}
+          <select data-trade="${esc(t.trade)}">${vendorOptions(t.vendorId)}</select>
+        </label>`).join("")}
+    </div>
+    ${d.vendors.length ? "" :
+      '<p class="dispatch-lede">No vendors yet — share a code above, then pick who goes for each trade.</p>'}
+  </details></div>`;
+}
+
+function wireDispatch() {
+  const panel = $("#dispatchPanel");
+  if (!panel) return;
+  panel.querySelectorAll("[data-limit]").forEach((input) =>
+    input.addEventListener("change", async () => {
+      try {
+        state.dispatch = await api("/api/dispatch", {
+          method: "POST",
+          body: { propertyId: Number(input.dataset.limit), threshold: input.value },
+        });
+      } catch (ex) { alert(ex.message); }
+      loadDispatch();
+    }));
+  panel.querySelectorAll("[data-trade]").forEach((select) =>
+    select.addEventListener("change", async () => {
+      try {
+        state.dispatch = await api("/api/dispatch", {
+          method: "POST",
+          body: { trade: select.dataset.trade, vendorId: select.value || null },
+        });
+      } catch (ex) { alert(ex.message); }
+      loadDispatch();
+    }));
 }
 
 /**
@@ -1416,6 +1498,7 @@ function renderDetail(scroll = true) {
         <span>opened ${when(t.created_at)}</span>
       </div>
       ${renderBasics(t)}
+      ${renderWorkOrder(t)}
       ${brief}
       <div class="detail-actions">${actions.join("")}</div>
     </div>
@@ -1451,6 +1534,7 @@ function renderDetail(scroll = true) {
     e.target.value = ""; // so picking the same file twice still fires
   });
 
+  wireWorkOrder(t);
   $("#backBtn")?.addEventListener("click", closeDetail);
   $("#closeBtn")?.addEventListener("click", onClose);
   $("#claimBtn")?.addEventListener("click", () => act(`/api/tickets/${t.id}/claim`));
@@ -1680,7 +1764,10 @@ function wireModal() {
  * progress strip, and the chips listing what has been chosen so far.
  */
 const INTAKE_STEPS = ["Category", "Issue", "Details", "Assistant"];
-const blankBasics = () => ({ what: "", room: "", spot: "", when: "", trigger: "", notes: "" });
+const blankBasics = () =>
+  ({ what: "", room: "", spot: "", when: "", trigger: "", notes: "",
+     // Access, for whoever ends up coming. Asked here rather than on the day.
+     entry: "call_first", access: "", pets: "" });
 const intake = { step: 1, group: null, issue: null, d: blankBasics() };
 
 async function loadIntakeTree() {
@@ -1856,6 +1943,17 @@ function renderIntakeDetails() {
           placeholder="What you've already tried, whether it's getting worse, damage to your things, best times for a visit">${esc(d.notes)}</textarea>
       </div>
       <div class="intake-field">
+        <div class="lab"><span>Getting in</span>
+          <span class="opt">so nobody has to chase you on the day</span></div>
+        <div class="chips" id="inEntry">${tree.entries.map((e) =>
+          `<button type="button" class="${d.entry === e.id ? "on" : ""}" data-entry="${esc(e.id)}"
+             title="${esc(e.eg)}">${esc(e.label)}</button>`).join("")}</div>
+        <input type="text" id="inAccess" value="${esc(d.access)}" maxlength="400"
+          placeholder="Anything they need — buzzer code, lockbox, side gate, the door sticks">
+        <input type="text" id="inPets" value="${esc(d.pets)}" maxlength="200"
+          placeholder="Pets they should know about, e.g. a nervous dog in the kitchen">
+      </div>
+      <div class="intake-field">
         <div class="lab"><span>Photos</span><span class="opt">optional</span></div>
         <input type="file" id="intakePhotoInput" accept="image/*" multiple hidden>
         <button type="button" class="ghost block-soft" id="intakePhotoBtn">Add a photo</button>
@@ -1878,9 +1976,11 @@ function renderIntakeDetails() {
     d.spot = $("#inSpot").value;
     d.trigger = $("#inTrigger").value;
     d.notes = $("#inNotes").value;
+    d.access = $("#inAccess").value;
+    d.pets = $("#inPets").value;
     submit.disabled = !basicsComplete(d);
   };
-  ["inWhat", "inSpot", "inTrigger", "inNotes"].forEach((id) =>
+  ["inWhat", "inSpot", "inTrigger", "inNotes", "inAccess", "inPets"].forEach((id) =>
     $(`#${id}`).addEventListener("input", sync));
   // One-tap chips; tapping the picked one clears it.
   const wireChips = (holder, attr, key) => {
@@ -1895,6 +1995,7 @@ function renderIntakeDetails() {
   };
   wireChips($("#inRooms"), "room", "room");
   wireChips($("#inWhens"), "when", "when");
+  wireChips($("#inEntry"), "entry", "entry");
 
   $("#intakePhotoBtn").addEventListener("click", () => $("#intakePhotoInput").click());
   $("#intakePhotoInput").addEventListener("change", async (e) => {
@@ -1943,6 +2044,191 @@ function wireIntake() {
  * from the ticket's stored intake; the issue name comes from the tree, which
  * is fetched lazily for whoever is looking.
  */
+/* ------------------------------------------------------------ work order */
+
+/* These mirror src/workorder.ts. The server is the authority — everything here
+   is a label for something it has already decided. */
+const TRADE_LABEL = {
+  plumber: "Plumber", electrician: "Electrician", hvac: "Heating and cooling",
+  appliance: "Appliance engineer", locksmith: "Locksmith", pest: "Pest control",
+  roofer: "Roofer", landscaper: "Grounds", cleaner: "Cleaner", handyman: "Handyman",
+  general: "General contractor",
+};
+const WO_LABEL = {
+  new: "Needs a vendor", awaiting_approval: "Awaiting approval", assigned: "Vendor assigned",
+  scheduled: "Scheduled", work_done: "Work done", closed: "Closed",
+};
+const ENTRY_LABEL = {
+  permitted: "May enter when nobody is home",
+  call_first: "Call or text the tenant first",
+  must_be_home: "Tenant must be home — book a time",
+};
+const BILLABLE_LABEL = {
+  landlord: "Landlord", tenant: "Tenant — to confirm", undecided: "Worth checking",
+};
+
+const money = (cents) =>
+  cents == null ? "—" : "$" + (cents / 100).toLocaleString("en-US", {
+    minimumFractionDigits: cents % 100 ? 2 : 0, maximumFractionDigits: 2,
+  });
+
+/** A stored "YYYY-MM-DD HH:MM:SS" (UTC) as the value a datetime-local wants. */
+const forInput = (sql) => {
+  if (!sql) return "";
+  const d = new Date(String(sql).replace(" ", "T") + "Z");
+  if (Number.isNaN(d.getTime())) return "";
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${
+    pad(d.getHours())}:${pad(d.getMinutes())}`;
+};
+
+const appointment = (sql) => {
+  const d = new Date(String(sql).replace(" ", "T") + "Z");
+  return Number.isNaN(d.getTime()) ? "" : d.toLocaleString(undefined, {
+    weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit",
+  });
+};
+
+/**
+ * The work order: who goes, how far they may go, how they get in, who pays.
+ *
+ * Everyone on the thread sees the same card. A tenant seeing the spend cap and
+ * who it is billed to is the point rather than a leak — the alternative is
+ * finding out about a recharge from a deposit deduction months later.
+ */
+function renderWorkOrder(t) {
+  if (!t.wo_status) return "";
+  const isLandlord = state.me.role === "landlord";
+  const isTenant = state.me.role === "tenant";
+  const mine = state.me.role === "vendor" && t.assigned_vendor_id === state.me.id;
+  const open = t.status === "open";
+
+  const rows = [
+    ["Trade", TRADE_LABEL[t.trade] || "—"],
+    ["Spend cap", money(t.nte_cents)],
+    ["Stage", WO_LABEL[t.wo_status] || "—"],
+    ["Billed to", BILLABLE_LABEL[t.billable_to] || "—"],
+    t.scheduled_for ? ["Booked for", appointment(t.scheduled_for)] : null,
+    t.actual_cents != null ? ["Came to", money(t.actual_cents)] : null,
+  ].filter(Boolean);
+
+  const access = [
+    t.entry_permission ? ENTRY_LABEL[t.entry_permission] : null,
+    t.access_notes,
+    t.pets ? `Pets: ${t.pets}` : null,
+  ].filter(Boolean).join(" · ");
+
+  // The approval note carries the reasoning — why this needs a yes, or what was
+  // authorised and by whom — and is worth showing whichever way it went.
+  const banner = t.approval_state === "pending"
+    ? `<p class="wo-banner wait">${esc(t.approval_note || "Waiting on the landlord to approve.")}</p>`
+    : t.approval_state === "declined"
+      ? `<p class="wo-banner no">Not approved${t.approved_by ? ` by ${esc(t.approved_by)}` : ""}${
+          t.approval_note ? `: ${esc(t.approval_note)}` : "."}</p>`
+      : t.approval_note
+        ? `<p class="wo-banner yes">${esc(t.approval_note)}</p>`
+        : "";
+
+  const controls = [];
+  if (isLandlord && open && t.approval_state === "pending") {
+    controls.push(`<div class="wo-approve">
+      <label class="inline-edit">up to
+        <input type="text" id="woNte" value="${money(t.nte_cents).replace("$", "")}"
+               inputmode="decimal" size="7" aria-label="Amount to approve">
+      </label>
+      <button class="primary small" id="woApprove">Approve</button>
+      <button class="ghost" id="woDecline">Not this one</button>
+    </div>`);
+  }
+  if ((mine || isLandlord) && open && ["assigned", "scheduled"].includes(t.wo_status)) {
+    controls.push(`<div class="wo-book">
+      <label class="inline-edit">visit
+        <input type="datetime-local" id="woWhen" value="${forInput(t.scheduled_for)}">
+      </label>
+      <button class="ghost" id="woSchedule">${t.scheduled_for ? "Move it" : "Book a time"}</button>
+      ${t.scheduled_for ? '<button class="ghost" id="woUnschedule">Cancel visit</button>' : ""}
+    </div>`);
+  }
+  if ((mine || isLandlord) && open && ["assigned", "scheduled"].includes(t.wo_status)) {
+    controls.push(`<div class="wo-done">
+      <label class="inline-edit">cost
+        <input type="text" id="woCost" placeholder="0.00" inputmode="decimal" size="7"
+               aria-label="What the work came to">
+      </label>
+      <button class="ghost" id="woDone">Work is done</button>
+    </div>`);
+  }
+  if (isLandlord && t.status !== "closed") {
+    controls.push(`<label class="inline-edit">billed to
+      <select id="woBilling">
+        ${Object.entries(BILLABLE_LABEL).map(([k, v]) =>
+          `<option value="${k}"${k === t.billable_to ? " selected" : ""}>${v}</option>`).join("")}
+      </select></label>`);
+  }
+
+  return `<div class="workorder">
+    <div class="wo-head">Work order</div>
+    <div class="basics">${rows.map(([k, v]) =>
+      `<div><div class="k">${k}</div><div class="v">${esc(String(v))}</div></div>`).join("")}</div>
+    ${access ? `<p class="wo-access"><b>Access:</b> ${esc(access)}${
+      (isTenant || isLandlord) && t.status !== "closed"
+        ? ' <button class="linkish" id="woAccess">change</button>' : ""}</p>`
+      : (isTenant || isLandlord) && t.status !== "closed"
+        ? '<p class="wo-access">No access notes yet. <button class="linkish" id="woAccess">Add them</button></p>'
+        : ""}
+    ${banner}
+    ${controls.length ? `<div class="wo-controls">${controls.join("")}</div>` : ""}
+  </div>`;
+}
+
+/** Wire the work-order card up. Called from renderDetail once the HTML is in. */
+function wireWorkOrder(t) {
+  const id = t.id;
+  $("#woApprove")?.addEventListener("click", () =>
+    act(`/api/tickets/${id}/approve`, { approve: true, nte: $("#woNte").value }));
+  $("#woDecline")?.addEventListener("click", () => {
+    const note = prompt("Why not? The tenant reads this too.");
+    if (note && note.trim()) act(`/api/tickets/${id}/approve`, { approve: false, note });
+  });
+  $("#woSchedule")?.addEventListener("click", () => {
+    const when = $("#woWhen").value;
+    if (!when) return alert("Pick a date and time first.");
+    act(`/api/tickets/${id}/schedule`, { when: new Date(when).toISOString() });
+  });
+  $("#woUnschedule")?.addEventListener("click", () =>
+    act(`/api/tickets/${id}/schedule`, { clear: true }));
+  $("#woDone")?.addEventListener("click", () => {
+    const notes = prompt("What did you do? (optional)") ?? "";
+    act(`/api/tickets/${id}/done`, { cost: $("#woCost").value, notes });
+  });
+  $("#woBilling")?.addEventListener("change", (e) => {
+    const to = e.target.value;
+    // Recharging a resident is the one choice here that costs somebody money,
+    // so it asks for a reason before it will go through — the same reason the
+    // tenant then reads on the thread.
+    const note = to === "tenant"
+      ? prompt("Why is this the tenant's? They will see this.")
+      : "";
+    if (to === "tenant" && !(note && note.trim())) return renderDetail(false);
+    act(`/api/tickets/${id}/billing`, { to, note });
+  });
+  $("#woAccess")?.addEventListener("click", () => {
+    const entry = prompt(
+      "How should a vendor get in?\n\n"
+      + "1 — they can enter when nobody is home\n"
+      + "2 — call or text me first\n"
+      + "3 — only when I am home",
+      { permitted: "1", call_first: "2", must_be_home: "3" }[t.entry_permission] || "2",
+    );
+    const chosen = { 1: "permitted", 2: "call_first", 3: "must_be_home" }[String(entry).trim()];
+    if (!chosen) return;
+    const access = prompt("Anything they need to get in? (buzzer, lockbox, side gate)",
+      t.access_notes || "") ?? "";
+    const pets = prompt("Any pets they should know about?", t.pets || "") ?? "";
+    act(`/api/tickets/${id}/access`, { entry: chosen, access, pets });
+  });
+}
+
 function renderBasics(t) {
   if (!t.intake) return "";
   let d;

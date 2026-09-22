@@ -30,6 +30,11 @@ import {
   parseIntake, type Intake,
 } from "./intake";
 import { dueAt, isStatutoryEmergency, slaTier, SLA_LABEL, SLA_POLICY } from "./sla";
+import {
+  approvalFor, canAdvance, DEFAULT_APPROVAL_THRESHOLD, ENTRY_LABEL, money, nteFor,
+  parseBillable, parseEntry, parseMoney, plan, TRADE_LABEL, TRADES, tradeFor, WO_LABEL,
+  type Billable, type Trade, type WoStatus,
+} from "./workorder";
 
 /* --------------------------------------------------------------- helpers */
 
@@ -153,6 +158,9 @@ async function runDueSchedules(scope: number[]): Promise<number> {
     await addMessage(ticket.id, "system", `Raised by the "${task.title}" schedule.`);
     if (task.details) await addMessage(ticket.id, "landlord", task.details, task.created_by);
     await applySla(ticket.id);
+    // Planned upkeep is a work order like any other: it needs a trade, a cap
+    // and — if it is expensive enough — the landlord's yes before it goes out.
+    await openWorkOrder(ticket.id);
 
     // Step forward from the schedule's own clock, catching up past cycles
     // without raising a ticket for each.
@@ -320,6 +328,218 @@ async function noteResponseTime(ticketId: number) {
   const tier = row?.sla_tier;
   if (!tier || !SLA_LABEL[tier]) return;
   await addMessage(ticketId, "system", `Response time for this: ${SLA_LABEL[tier]}.`);
+}
+
+/* ------------------------------------------------------------ work orders */
+
+/**
+ * Everything between "this needs a person" and "a van arrived".
+ *
+ * The decisions themselves are in `src/workorder.ts` and are pure. What lives
+ * here is the part that touches rows: working out the inputs, writing down what
+ * was decided, and saying so on the thread — because a spend cap nobody was
+ * told about is not a cap, it is a surprise.
+ */
+
+/** What a repair may cost on this property before the landlord is asked first. */
+async function approvalThreshold(propertyId: number): Promise<number> {
+  const row = await db.get<{ approval_threshold_cents: number | null }>(
+    "SELECT approval_threshold_cents FROM properties WHERE id = ?", [propertyId]);
+  return row?.approval_threshold_cents ?? DEFAULT_APPROVAL_THRESHOLD;
+}
+
+/**
+ * Whether this request is an emergency in the statutory sense, which is what
+ * decides both that the approval queue is skipped and that the repair is the
+ * landlord's however it was caused.
+ *
+ * Read the same two ways as everywhere else: off the issue the tenant picked
+ * when there was one, and off the wording when there was not.
+ */
+function ticketIsStatutory(t: Ticket): boolean {
+  const intake = storedIntake(t);
+  const issue = intake ? findIssue(intake.issue) : null;
+  const at = new Date(String(t.created_at).replace(" ", "T") + "Z");
+  return issue
+    ? isStatutoryIssue(issue, at)
+    : isStatutoryEmergency({ category: t.category, text: `${t.title} ${t.summary}`, at });
+}
+
+/** The vendor this landlord wants called for this trade, if they have said. */
+async function preferredVendor(propertyId: number, trade: Trade) {
+  return db.get<{ id: number; display_name: string }>(
+    `SELECT u.id, u.display_name
+       FROM preferred_vendors pv
+       JOIN users u ON u.id = pv.vendor_id
+       JOIN properties p ON p.landlord_id = pv.landlord_id
+      WHERE p.id = $property AND pv.trade = $trade
+        -- The vendor must still be able to see this property. A contractor who
+        -- has left the network stays in the preference table until the landlord
+        -- changes it, and dispatching to them would be dispatching to nobody.
+        AND (EXISTS (SELECT 1 FROM property_vendors x
+                     WHERE x.vendor_id = u.id AND x.property_id = p.id)
+          OR EXISTS (SELECT 1 FROM landlord_vendors y
+                     WHERE y.vendor_id = u.id AND y.landlord_id = p.landlord_id))`,
+    { property: propertyId, trade },
+  );
+}
+
+/**
+ * Send the job to the trade's first-choice vendor, if there is one and nobody
+ * already has it.
+ *
+ * This is the whole point of the preference table: a request that needs a
+ * plumber and is within the spend cap reaches the plumber without a landlord
+ * having to read it first. Nothing is forced — the vendor can hand it back, and
+ * it returns to the open pool for anyone in the network to claim.
+ */
+async function dispatch(t: Ticket, trade: Trade): Promise<boolean> {
+  if (t.assigned_vendor_id) return false;
+  const vendor = await preferredVendor(t.property_id, trade);
+  if (!vendor) return false;
+  await db.run(
+    `UPDATE tickets SET assigned_vendor_id = ?, wo_status = 'assigned',
+                        updated_at = datetime('now')
+     WHERE id = ? AND assigned_vendor_id IS NULL`,
+    [vendor.id, t.id],
+  );
+  await addMessage(
+    t.id, "system",
+    `Sent to ${vendor.display_name}, the first-choice ${TRADE_LABEL[trade].toLowerCase()} for this property.`,
+  );
+  return true;
+}
+
+/**
+ * Turn a request that has just left triage into a work order.
+ *
+ * Runs once, the first time a ticket becomes open. Everything after that is
+ * either a person's decision or `refileWorkOrder` below — this function never
+ * overwrites a landlord.
+ */
+async function openWorkOrder(ticketId: number) {
+  const t = await db.get<Ticket>("SELECT * FROM tickets WHERE id = ?", [ticketId]);
+  if (!t || t.wo_status) return null;
+
+  const statutory = ticketIsStatutory(t);
+  const decided = plan({
+    category: t.category,
+    priority: t.priority,
+    text: `${t.title} ${t.summary}`,
+    tier: t.sla_tier,
+    statutory,
+    threshold: await approvalThreshold(t.property_id),
+  });
+
+  await db.run(
+    `UPDATE tickets
+        SET trade = ?, nte_cents = ?, approval_state = ?, approval_note = ?,
+            billable_to = ?, billable_note = ?, wo_status = ?, updated_at = datetime('now')
+      WHERE id = ?`,
+    [decided.trade, decided.nte, decided.approval, decided.approvalWhy,
+     decided.billable, decided.billableWhy, decided.status, t.id],
+  );
+
+  await addMessage(
+    t.id, "system",
+    `Work order raised: ${TRADE_LABEL[decided.trade].toLowerCase()}, up to ${money(decided.nte)}.`,
+  );
+  if (decided.approval === "pending") {
+    await addMessage(t.id, "system", `Waiting on the landlord to approve. ${decided.approvalWhy}`);
+  } else {
+    // Approved or under the limit: it can go out now.
+    if (decided.approval === "approved") {
+      await addMessage(t.id, "system", decided.approvalWhy);
+    }
+    await dispatch(t, decided.trade);
+  }
+  return decided;
+}
+
+/**
+ * Re-decide a work order after the landlord has re-filed the request.
+ *
+ * Moving something from plumbing to appliance changes who should go, and
+ * marking it urgent changes what the visit is worth — so the trade and the cap
+ * follow the re-filing. What does not follow is a decision a person has already
+ * made: once a landlord has approved or declined an amount, that amount is
+ * theirs and this function leaves both the money and the approval alone. Taking
+ * an authorisation back by recalculation is how a vendor ends up working to a
+ * number nobody agreed.
+ */
+async function refileWorkOrder(t: Ticket) {
+  if (!t.wo_status || t.wo_status === "closed") return null;
+  const after = await db.get<Ticket>("SELECT * FROM tickets WHERE id = ?", [t.id]);
+  if (!after) return null;
+
+  const trade = tradeFor(after.category, `${after.title} ${after.summary}`);
+  const notes: string[] = [];
+  const sets: string[] = ["trade = $trade"];
+  const params: Record<string, unknown> = { id: t.id, trade };
+
+  if (trade !== t.trade) {
+    notes.push(`the trade is now ${TRADE_LABEL[trade].toLowerCase()}`);
+  }
+
+  // Untouched by a person: the cap is still ours to recalculate.
+  if (!after.approved_by) {
+    const nte = nteFor(trade, after.priority);
+    if (nte !== after.nte_cents) {
+      const approval = approvalFor({
+        nte,
+        threshold: await approvalThreshold(after.property_id),
+        tier: after.sla_tier,
+      });
+      sets.push("nte_cents = $nte", "approval_state = $state", "approval_note = $why");
+      params.nte = nte;
+      params.state = approval.state;
+      params.why = approval.why;
+      notes.push(`the cap is now ${money(nte)}`);
+      // Crossing the limit in either direction moves the job: onto the approval
+      // queue, or off it and out to a vendor.
+      if (approval.state === "pending" && after.wo_status !== "awaiting_approval") {
+        sets.push("wo_status = 'awaiting_approval'");
+        notes.push("and it needs approving before work starts");
+      } else if (approval.state !== "pending" && after.wo_status === "awaiting_approval") {
+        sets.push("wo_status = 'new'");
+        notes.push("and it no longer needs approving");
+      }
+    }
+  }
+
+  if (!notes.length && trade === t.trade) return null;
+  await db.run(
+    `UPDATE tickets SET ${sets.join(", ")}, updated_at = datetime('now') WHERE id = $id`,
+    params,
+  );
+  if (notes.length) {
+    await addMessage(t.id, "system", `Work order updated: ${notes.join(", ")}.`);
+  }
+  // A re-filed job that is now clear to go, and has nobody on it, goes out.
+  const ready = await db.get<Ticket>("SELECT * FROM tickets WHERE id = ?", [t.id]);
+  if (ready && ready.wo_status !== "awaiting_approval" && !ready.assigned_vendor_id) {
+    await dispatch(ready, trade);
+  }
+  return trade;
+}
+
+/**
+ * Move a work order to a new state, refusing moves the lifecycle does not allow.
+ *
+ * Returns an error string rather than throwing, because every caller is a route
+ * that wants to turn it into a 400.
+ */
+async function setWoStatus(t: Ticket, to: WoStatus, extra: Record<string, unknown> = {}) {
+  if (!canAdvance(t.wo_status, to)) {
+    return `A job that is ${WO_LABEL[t.wo_status ?? "new"].toLowerCase()} cannot become `
+      + `${WO_LABEL[to].toLowerCase()}.`;
+  }
+  const sets = ["wo_status = $to", ...Object.keys(extra).map((k) => `${k} = $${k}`)];
+  await db.run(
+    `UPDATE tickets SET ${sets.join(", ")}, updated_at = datetime('now') WHERE id = $id`,
+    { id: t.id, to, ...extra },
+  );
+  return null;
 }
 
 /* ----------------------------------------------------------------- photos */
@@ -681,6 +901,10 @@ async function runTriage(ticket: Ticket) {
       [result.category, result.priority, result.summary, ticket.id],
     );
     await addMessage(ticket.id, "system", "Sent to the landlord's to-do list.");
+    // The response target is set by the caller straight after triage; the work
+    // order is raised here because this is the moment the request became work.
+    await applySla(ticket.id);
+    await openWorkOrder(ticket.id);
   } else if (result.action === "resolved") {
     await db.run(
       `UPDATE tickets
@@ -955,11 +1179,16 @@ async function createTicket(user: User, req: Request): Promise<Response> {
     const issue = intake ? findIssue(intake.issue) : null;
     const ticket = (await db.get<Ticket>(
       `INSERT INTO tickets
-         (property_id, tenant_id, created_by, title, summary, category, priority, status, intake)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'triage', ?) RETURNING *`,
+         (property_id, tenant_id, created_by, title, summary, category, priority, status, intake,
+          entry_permission, access_notes, pets)
+       VALUES (?, ?, ?, ?, ?, ?, ?, 'triage', ?, ?, ?, ?) RETURNING *`,
+      // Access is copied out of the intake JSON onto columns of its own because
+      // it is the vendor's, not the assistant's: it has to be readable — and
+      // editable — on a work order raised from a free-text request too.
       [user.property_id, user.id, user.id, title, title,
        issue?.category ?? "other", issue?.priority ?? "normal",
-       intake ? JSON.stringify(intake) : null],
+       intake ? JSON.stringify(intake) : null,
+       intake?.entry || null, intake?.access || null, intake?.pets || null],
     ))!;
 
     await addMessage(ticket.id, "tenant", description, user.id, photos);
@@ -1030,6 +1259,7 @@ async function createTicket(user: User, req: Request): Promise<Response> {
     await addMessage(ticket.id, "system", `${user.display_name} raised this with the tenant.`);
   }
   await applySla(ticket.id);
+  await openWorkOrder(ticket.id);
   await markRead(ticket.id, user.id);
   return json({
     ticket: await visibleTicket(user, ticket.id),
@@ -1116,6 +1346,8 @@ async function updateTicket(user: User, ticket: Ticket, req: Request): Promise<R
         `Response time is now ${SLA_LABEL[after.tier]} of the request being raised.`,
       );
     }
+    // Which trade goes, and what the visit is worth, both follow the re-filing.
+    await refileWorkOrder(ticket);
   }
   return json({
     ticket: await visibleTicket(user, ticket.id),
@@ -1130,6 +1362,7 @@ async function escalate(user: User, ticket: Ticket): Promise<Response> {
   ]);
   await addMessage(ticket.id, "system", `${user.display_name} sent this to the landlord.`);
   await noteResponseTime(ticket.id);
+  await openWorkOrder(ticket.id);
   return json({
     ticket: await visibleTicket(user, ticket.id),
     messages: await ticketMessages(ticket.id),
@@ -1144,7 +1377,11 @@ async function closeTicket(user: User, ticket: Ticket, req: Request): Promise<Re
   await db.run(
     `UPDATE tickets
      SET status = 'closed', resolution = ?, closed_by = ?, closed_at = datetime('now'),
-         updated_at = datetime('now')
+         updated_at = datetime('now'),
+         -- A closed request has no open work order. Notably this also clears an
+         -- approval that was never answered: nobody should be asked to approve
+         -- spending on something that is already done with.
+         wo_status = CASE WHEN wo_status IS NULL THEN NULL ELSE 'closed' END
      WHERE id = ?`,
     [resolution, user.display_name, ticket.id],
   );
@@ -1163,9 +1400,16 @@ async function reopenTicket(user: User, ticket: Ticket): Promise<Response> {
   await db.run(
     `UPDATE tickets
      SET status = ?, resolution = NULL, closed_by = NULL, closed_at = NULL,
-         updated_at = datetime('now')
+         updated_at = datetime('now'),
+         -- Back to work: whoever had it still has it, otherwise it needs
+         -- somebody. A reopened job never returns to the approval queue — the
+         -- landlord already said yes to this repair once.
+         wo_status = CASE
+           WHEN ? = 'triage' THEN NULL
+           WHEN assigned_vendor_id IS NOT NULL THEN 'assigned'
+           ELSE 'new' END
      WHERE id = ?`,
-    [next, ticket.id],
+    [next, next, ticket.id],
   );
   await addMessage(ticket.id, "system", `Reopened by ${user.display_name}.`, user.id);
   return json({
@@ -1182,6 +1426,11 @@ async function reopenTicket(user: User, ticket: Ticket): Promise<Response> {
 async function claimTicket(user: User, ticket: Ticket, claim: boolean): Promise<Response> {
   if (user.role !== "vendor") return fail("Vendors only.", 403);
   if (ticket.status !== "open") return fail("Only open jobs can be picked up.");
+  // Work that has not been authorised is not work yet. A vendor who picks this
+  // up and attends is a vendor who may not be paid.
+  if (claim && ticket.wo_status === "awaiting_approval") {
+    return fail("This one is waiting on the landlord to approve the cost.", 409);
+  }
 
   if (claim) {
     if (ticket.assigned_vendor_id === user.id) return fail("You already have this one.");
@@ -1193,9 +1442,13 @@ async function claimTicket(user: User, ticket: Ticket, claim: boolean): Promise<
   // The WHERE guards against two vendors claiming the same job at once: the
   // second UPDATE matches nothing, and we say so rather than silently stealing it.
   const res = await db.run(
-    `UPDATE tickets SET assigned_vendor_id = ?, updated_at = datetime('now')
+    `UPDATE tickets SET assigned_vendor_id = ?, wo_status = ?, updated_at = datetime('now'),
+                       scheduled_for = CASE WHEN ? = 'new' THEN NULL ELSE scheduled_for END
      WHERE id = ? AND assigned_vendor_id IS ?`,
-    [claim ? user.id : null, ticket.id, claim ? null : user.id],
+    // Handing a job back un-schedules it as well as un-assigning it: the
+    // appointment belonged to the vendor who is no longer coming.
+    [claim ? user.id : null, claim ? "assigned" : "new", claim ? "assigned" : "new",
+     ticket.id, claim ? null : user.id],
   );
   if (!res.rowsAffected) return fail("Another vendor already has this one.", 409);
 
@@ -1235,7 +1488,10 @@ async function assignTicket(user: User, ticket: Ticket, req: Request): Promise<R
     if (ticket.assigned_vendor_id === vendorId) return fail(`Already assigned to ${vendor.display_name}.`);
 
     await db.run(
-      "UPDATE tickets SET assigned_vendor_id = ?, updated_at = datetime('now') WHERE id = ?",
+      `UPDATE tickets SET assigned_vendor_id = ?, updated_at = datetime('now'),
+                         wo_status = CASE WHEN wo_status IN ('new', 'awaiting_approval')
+                                          THEN 'assigned' ELSE wo_status END
+       WHERE id = ?`,
       [vendorId, ticket.id],
     );
     await addMessage(
@@ -1245,7 +1501,11 @@ async function assignTicket(user: User, ticket: Ticket, req: Request): Promise<R
   } else {
     if (!ticket.assigned_vendor_id) return fail("Nobody has this one.");
     await db.run(
-      "UPDATE tickets SET assigned_vendor_id = NULL, updated_at = datetime('now') WHERE id = ?",
+      `UPDATE tickets SET assigned_vendor_id = NULL, scheduled_for = NULL,
+                         updated_at = datetime('now'),
+                         wo_status = CASE WHEN wo_status IN ('assigned', 'scheduled')
+                                          THEN 'new' ELSE wo_status END
+       WHERE id = ?`,
       [ticket.id],
     );
     await addMessage(ticket.id, "system", `${user.display_name} unassigned this.`, user.id);
@@ -1653,6 +1913,376 @@ async function sendChat(user: User, tenantId: number, req: Request): Promise<Res
   return json({ messages: await chatMessages(tenantId) });
 }
 
+/* ------------------------------------------------- work order, by the hour */
+
+/** SQLite-shaped UTC timestamp, matching datetime('now'). */
+const stamp = (d: Date) => d.toISOString().replace("T", " ").slice(0, 19);
+
+/**
+ * The landlord answers an approval request.
+ *
+ * Approving can also move the cap: a landlord who thinks $350 will not cover it
+ * says yes to $500 in the same action, which is the conversation they would
+ * otherwise have had on the phone. Declining ends the job — there is no state
+ * where work is refused and the request stays open pretending otherwise — so it
+ * asks for a reason, which the tenant reads on the same thread.
+ */
+async function approveWork(user: User, ticket: Ticket, req: Request): Promise<Response> {
+  if (user.role !== "landlord") return fail("Only the landlord approves spending.", 403);
+  if (!ticket.wo_status) return fail("This is still in triage — there is nothing to approve yet.");
+  if (ticket.status === "closed") return fail("This request is closed.");
+
+  const b = (await req.json().catch(() => null)) as Record<string, unknown> | null;
+  const note = String(b?.note ?? "").trim().slice(0, 500);
+
+  if (b?.approve === false) {
+    if (!note) return fail("Say why, so the tenant knows what happens instead.");
+    await db.run(
+      `UPDATE tickets
+          SET approval_state = 'declined', approval_note = ?, approved_by = ?,
+              approved_at = datetime('now'), status = 'closed', wo_status = 'closed',
+              resolution = ?, closed_by = ?, closed_at = datetime('now'),
+              updated_at = datetime('now')
+        WHERE id = ?`,
+      [note, user.display_name, `Not approved: ${note}`, user.display_name, ticket.id],
+    );
+    await addMessage(
+      ticket.id, "system",
+      `${user.display_name} did not approve this work: ${note}`, user.id,
+    );
+    return json({
+      ticket: await visibleTicket(user, ticket.id),
+      messages: await ticketMessages(ticket.id),
+    });
+  }
+
+  // An amount is optional on an approval, and means "yes, up to this instead".
+  const raised = b?.nte === undefined || b?.nte === null || b?.nte === ""
+    ? null
+    : parseMoney(b.nte);
+  if (b?.nte !== undefined && b?.nte !== null && b?.nte !== "" && raised === null) {
+    return fail("That is not an amount I can read.");
+  }
+  const nte = raised ?? ticket.nte_cents ?? 0;
+  const why = note
+    || `Approved by ${user.display_name} up to ${money(nte)}.`;
+
+  // Work already done and over its cap is approved after the fact: the invoice
+  // is accepted, and the job stays where it is rather than going back out.
+  const next: WoStatus = ticket.wo_status === "work_done"
+    ? "work_done"
+    : ticket.assigned_vendor_id ? "assigned" : "new";
+
+  await db.run(
+    `UPDATE tickets
+        SET approval_state = 'approved', approval_note = ?, approved_by = ?,
+            approved_at = datetime('now'), nte_cents = ?, wo_status = ?,
+            updated_at = datetime('now')
+      WHERE id = ?`,
+    [why, user.display_name, nte, next, ticket.id],
+  );
+  await addMessage(
+    ticket.id, "system",
+    `${user.display_name} approved this, up to ${money(nte)}.`
+      + (note ? ` ${note}` : ""),
+    user.id,
+  );
+
+  const after = (await db.get<Ticket>("SELECT * FROM tickets WHERE id = ?", [ticket.id]))!;
+  if (!after.assigned_vendor_id && after.wo_status === "new") {
+    await dispatch(after, (after.trade ?? tradeFor(after.category, after.title)) as Trade);
+  }
+  return json({
+    ticket: await visibleTicket(user, ticket.id),
+    messages: await ticketMessages(ticket.id),
+  });
+}
+
+/**
+ * Put a time on the job, or take one off.
+ *
+ * Either the vendor who has it or the landlord can book it. The tenant cannot,
+ * which is not a slight — they are the one constraint the booking has to work
+ * around, and they say so through the access answers rather than by picking a
+ * slot nobody has agreed to.
+ */
+async function scheduleWork(user: User, ticket: Ticket, req: Request): Promise<Response> {
+  const mine = user.role === "vendor" && ticket.assigned_vendor_id === user.id;
+  if (!mine && user.role !== "landlord") {
+    return fail("Only the landlord or the vendor on this job can book a time.", 403);
+  }
+  if (ticket.status !== "open") return fail("This request is not open.");
+  if (!ticket.assigned_vendor_id) return fail("Nobody has this one yet.");
+  if (ticket.wo_status === "awaiting_approval") {
+    return fail("This one is waiting on approval before it can be booked.");
+  }
+
+  const b = (await req.json().catch(() => null)) as Record<string, unknown> | null;
+
+  if (b?.clear) {
+    if (!ticket.scheduled_for) return fail("There is no appointment to cancel.");
+    const err = await setWoStatus(ticket, "assigned", { scheduled_for: null });
+    if (err) return fail(err);
+    await addMessage(ticket.id, "system", `${user.display_name} cancelled the appointment.`, user.id);
+    return json({
+      ticket: await visibleTicket(user, ticket.id),
+      messages: await ticketMessages(ticket.id),
+    });
+  }
+
+  const when = new Date(String(b?.when ?? ""));
+  if (Number.isNaN(when.getTime())) return fail("That is not a time I can read.");
+  // A day's grace behind now, so booking "this morning" from the van after the
+  // fact still works; anything older than that is a typo.
+  if (when.getTime() < Date.now() - 86400_000) return fail("That time has already passed.");
+
+  const err = await setWoStatus(ticket, "scheduled", { scheduled_for: stamp(when) });
+  if (err) return fail(err);
+
+  const readable = when.toLocaleString("en-US", {
+    weekday: "long", month: "short", day: "numeric", hour: "numeric", minute: "2-digit",
+    timeZone: "UTC", timeZoneName: "short",
+  });
+  await addMessage(
+    ticket.id, "system",
+    `${user.display_name} booked this for ${readable}.`
+      + (ticket.entry_permission === "must_be_home"
+        ? " The tenant asked to be home — please confirm the time works for them."
+        : ""),
+    user.id,
+  );
+  return json({
+    ticket: await visibleTicket(user, ticket.id),
+    messages: await ticketMessages(ticket.id),
+  });
+}
+
+/**
+ * The vendor reports what they did and what it cost.
+ *
+ * This does not close the request. Work being done and a request being finished
+ * are different claims, and the person who did the work is not the person who
+ * decides the second one — the tenant living with the result is. So the job
+ * lands on "work done" and waits to be closed by whoever is satisfied.
+ *
+ * An invoice over the cap does not bounce; it is recorded and put in front of
+ * the landlord. Refusing to write down what something cost does not make it
+ * cost less, and the vendor has already been.
+ */
+async function completeWork(user: User, ticket: Ticket, req: Request): Promise<Response> {
+  const mine = user.role === "vendor" && ticket.assigned_vendor_id === user.id;
+  if (!mine && user.role !== "landlord") {
+    return fail("Only the landlord or the vendor on this job can mark it done.", 403);
+  }
+  if (ticket.status !== "open") return fail("This request is not open.");
+
+  const b = (await req.json().catch(() => null)) as Record<string, unknown> | null;
+  const notes = String(b?.notes ?? "").trim().slice(0, 2000);
+  const cost = b?.cost === undefined || b?.cost === null || b?.cost === ""
+    ? null
+    : parseMoney(b.cost);
+  if (b?.cost !== undefined && b?.cost !== null && b?.cost !== "" && cost === null) {
+    return fail("That is not an amount I can read.");
+  }
+
+  const over = cost !== null && ticket.nte_cents !== null && cost > ticket.nte_cents;
+  const err = await setWoStatus(ticket, "work_done", {
+    actual_cents: cost,
+    ...(over
+      ? {
+        approval_state: "pending",
+        approval_note: `${money(cost)} is over the ${money(ticket.nte_cents)} cap that was `
+          + "authorised. The work is done; the invoice needs signing off.",
+      }
+      : {}),
+  });
+  if (err) return fail(err);
+
+  await addMessage(
+    ticket.id, user.role === "vendor" ? "vendor" : "landlord",
+    `Work done.${cost !== null ? ` ${money(cost)}.` : ""}${notes ? `\n${notes}` : ""}`,
+    user.id,
+  );
+  if (over) {
+    await addMessage(
+      ticket.id, "system",
+      `That is over the ${money(ticket.nte_cents)} cap on this job — the landlord has been `
+        + "asked to sign off the difference.",
+    );
+  }
+  return json({
+    ticket: await visibleTicket(user, ticket.id),
+    messages: await ticketMessages(ticket.id),
+  });
+}
+
+/**
+ * Who the invoice belongs to.
+ *
+ * Only a landlord reaches this, and the change is posted to the shared thread
+ * rather than filed quietly: the first a tenant hears about being recharged for
+ * a repair should not be a deduction from their deposit.
+ */
+async function setBilling(user: User, ticket: Ticket, req: Request): Promise<Response> {
+  if (user.role !== "landlord") return fail("Landlords only.", 403);
+  if (!ticket.wo_status) return fail("This is still in triage.");
+
+  const b = (await req.json().catch(() => null)) as Record<string, unknown> | null;
+  const to = parseBillable(b?.to);
+  if (!to) return fail("Say who this is billed to.");
+  const note = String(b?.note ?? "").trim().slice(0, 500);
+  if (to === "tenant" && !note) {
+    return fail("Recharging a tenant needs a reason they can read.");
+  }
+  if (to === ticket.billable_to && note === (ticket.billable_note ?? "")) {
+    return json({ ticket, messages: await ticketMessages(ticket.id) });
+  }
+
+  await db.run(
+    "UPDATE tickets SET billable_to = ?, billable_note = ?, updated_at = datetime('now') WHERE id = ?",
+    [to, note || null, ticket.id],
+  );
+  const said: Record<Billable, string> = {
+    landlord: "is the landlord's to pay",
+    tenant: "is being recharged to the tenant",
+    undecided: "needs a decision on who pays",
+  };
+  await addMessage(
+    ticket.id, "system",
+    `${user.display_name} recorded that this ${said[to]}.${note ? ` ${note}` : ""}`,
+    user.id,
+  );
+  return json({
+    ticket: await visibleTicket(user, ticket.id),
+    messages: await ticketMessages(ticket.id),
+  });
+}
+
+/**
+ * How the vendor gets in, changed after the fact.
+ *
+ * The tenant owns this answer — they are the only one who knows when it stops
+ * being true — and the landlord can set it too, for requests raised without a
+ * tenant on them at all.
+ */
+async function setAccess(user: User, ticket: Ticket, req: Request): Promise<Response> {
+  const mine = user.role === "tenant" && ticket.tenant_id === user.id;
+  if (!mine && user.role !== "landlord") return fail("This is not yours to change.", 403);
+  if (ticket.status === "closed") return fail("This request is closed.");
+
+  const b = (await req.json().catch(() => null)) as Record<string, unknown> | null;
+  if (!b) return fail("Malformed request body.");
+
+  const sets: string[] = [];
+  const params: Record<string, unknown> = { id: ticket.id };
+  if (b.entry !== undefined) {
+    const entry = parseEntry(b.entry);
+    if (!entry) return fail("Unknown access choice.");
+    sets.push("entry_permission = $entry");
+    params.entry = entry;
+  }
+  if (b.access !== undefined) {
+    sets.push("access_notes = $access");
+    params.access = String(b.access ?? "").trim().slice(0, 400) || null;
+  }
+  if (b.pets !== undefined) {
+    sets.push("pets = $pets");
+    params.pets = String(b.pets ?? "").trim().slice(0, 200) || null;
+  }
+  if (!sets.length) return fail("Nothing to change.");
+
+  await db.run(
+    `UPDATE tickets SET ${sets.join(", ")}, updated_at = datetime('now') WHERE id = $id`,
+    params,
+  );
+  const after = (await db.get<Ticket>("SELECT * FROM tickets WHERE id = ?", [ticket.id]))!;
+  await addMessage(
+    ticket.id, "system",
+    `${user.display_name} updated access: ${
+      after.entry_permission ? ENTRY_LABEL[after.entry_permission].toLowerCase() : "not said"
+    }.${after.access_notes ? ` ${after.access_notes}` : ""}${
+      after.pets ? ` Pets: ${after.pets}.` : ""}`,
+    user.id,
+  );
+  return json({
+    ticket: await visibleTicket(user, ticket.id),
+    messages: await ticketMessages(ticket.id),
+  });
+}
+
+/**
+ * The two settings that decide what happens without a landlord in the room:
+ * how much may be spent before they are asked, and who gets called for what.
+ */
+async function dispatchSettings(user: User, url: URL): Promise<Response> {
+  if (user.role !== "landlord") return fail("Landlords only.", 403);
+  const scope = await requestedScope(user, url);
+  if (!scope) return fail("That property is not yours.", 403);
+
+  const properties = await db.all<{ id: number; name: string; approval_threshold_cents: number }>(
+    `SELECT id, name, approval_threshold_cents FROM properties
+      WHERE landlord_id = ? ORDER BY id`,
+    [user.id],
+  );
+  const preferred = await db.all<{ trade: string; vendor_id: number; display_name: string }>(
+    `SELECT pv.trade, pv.vendor_id, u.display_name
+       FROM preferred_vendors pv JOIN users u ON u.id = pv.vendor_id
+      WHERE pv.landlord_id = ?`,
+    [user.id],
+  );
+  const byTrade = new Map(preferred.map((p) => [p.trade, p]));
+
+  return json({
+    properties,
+    defaultThreshold: DEFAULT_APPROVAL_THRESHOLD,
+    vendors: scope.length ? await networkVendors(user, scope) : [],
+    trades: TRADES.map((trade) => ({
+      trade,
+      label: TRADE_LABEL[trade],
+      vendorId: byTrade.get(trade)?.vendor_id ?? null,
+      vendorName: byTrade.get(trade)?.display_name ?? null,
+    })),
+  });
+}
+
+async function saveDispatchSettings(user: User, req: Request): Promise<Response> {
+  if (user.role !== "landlord") return fail("Landlords only.", 403);
+  const b = (await req.json().catch(() => null)) as Record<string, unknown> | null;
+  if (!b) return fail("Malformed request body.");
+
+  if (b.threshold !== undefined) {
+    const cents = parseMoney(b.threshold);
+    if (cents === null) return fail("That is not an amount I can read.");
+    const propertyId = Number(b.propertyId ?? user.property_id);
+    if (!(await landlordOwns(user.id, propertyId))) return fail("That property is not yours.", 403);
+    await db.run(
+      "UPDATE properties SET approval_threshold_cents = ? WHERE id = ?", [cents, propertyId]);
+  }
+
+  if (b.trade !== undefined) {
+    const trade = String(b.trade);
+    if (!(TRADES as readonly string[]).includes(trade)) return fail("Unknown trade.");
+    const raw = b.vendorId;
+    const vendorId = raw === null || raw === "" || raw === undefined ? null : Number(raw);
+    if (vendorId === null) {
+      await db.run(
+        "DELETE FROM preferred_vendors WHERE landlord_id = ? AND trade = ?", [user.id, trade]);
+    } else {
+      const network = await networkVendors(user, await accessibleProperties(user));
+      if (!network.some((v) => v.id === vendorId)) {
+        return fail("That vendor is not in your network.");
+      }
+      await db.run(
+        `INSERT INTO preferred_vendors (landlord_id, trade, vendor_id) VALUES (?, ?, ?)
+         ON CONFLICT (landlord_id, trade) DO UPDATE SET vendor_id = excluded.vendor_id`,
+        [user.id, trade, vendorId],
+      );
+    }
+  }
+
+  return await dispatchSettings(user, new URL("http://x/api/dispatch"));
+}
+
 /* ------------------------------------------------------------- the router */
 
 /** Handles every `/api/*` request. Returns null for anything else. */
@@ -1731,6 +2361,12 @@ async function route(req: Request, url: URL, path: string): Promise<Response> {
     return await listNetworkVendors(user, url);
   }
 
+  // Who gets called for what, and how much they may spend before anyone asks.
+  if (path === "/api/dispatch") {
+    if (req.method === "GET") return await dispatchSettings(user, url);
+    if (req.method === "POST") return await saveDispatchSettings(user, req);
+  }
+
   if (path === "/api/properties") {
     if (user.role === "tenant") return fail("Tenants belong to one property.", 403);
     if (req.method === "GET") return await listProperties(user);
@@ -1797,6 +2433,12 @@ async function route(req: Request, url: URL, path: string): Promise<Response> {
       if (action === "claim") return await claimTicket(user, ticket, true);
       if (action === "release") return await claimTicket(user, ticket, false);
       if (action === "assign") return await assignTicket(user, ticket, req);
+      // The work order, from approval through to the invoice.
+      if (action === "approve") return await approveWork(user, ticket, req);
+      if (action === "schedule") return await scheduleWork(user, ticket, req);
+      if (action === "done") return await completeWork(user, ticket, req);
+      if (action === "billing") return await setBilling(user, ticket, req);
+      if (action === "access") return await setAccess(user, ticket, req);
     }
   }
   return fail("Not found.", 404);

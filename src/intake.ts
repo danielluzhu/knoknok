@@ -16,6 +16,7 @@
 import type { Category } from "./bot";
 import type { Priority } from "./db";
 import { inHeatingSeason } from "./sla";
+import { ENTRY_LABEL, ENTRY_OPTIONS, parseEntry, type Entry } from "./workorder";
 
 export interface Issue {
   id: string;
@@ -466,6 +467,16 @@ export interface Intake {
   when: string;
   trigger: string;
   notes: string;
+  /**
+   * Access, for whoever ends up coming. Asked here rather than by the
+   * assistant, because it is not a diagnostic question — knowing there is a dog
+   * behind the door changes nothing about what is wrong with the boiler, and
+   * everything about the visit. Asking it once on the form also means nobody
+   * has to chase the tenant on the morning of the appointment.
+   */
+  entry: Entry | "";
+  access: string;
+  pets: string;
 }
 
 const clip = (v: unknown, max: number) => String(v ?? "").trim().slice(0, max);
@@ -489,6 +500,11 @@ export function parseIntake(raw: unknown): Intake | string | null {
     when: clip(b.when, 60),
     trigger: clip(b.trigger, 200),
     notes: clip(b.notes, 2000),
+    // Access is optional on the way in. An unanswered entry question means
+    // "ask me", which is the safe reading and also the default the form shows.
+    entry: parseEntry(b.entry) ?? "",
+    access: clip(b.access, 400),
+    pets: clip(b.pets, 200),
   };
   if (intake.what.length < 2) return "Say what is broken — the fixture or appliance.";
   if (!intake.room) return "Say where it is.";
@@ -504,6 +520,12 @@ export function intakeMessage(d: Intake): string {
   const lines = [`What: ${d.what}`, `Where: ${whereText(d)}`];
   if (whenText(d)) lines.push(`When: ${whenText(d)}`);
   if (d.notes) lines.push(`Other: ${d.notes}`);
+  // Access goes on the thread, not just into the work order, so the tenant can
+  // see what they told us and correct it — they are the only one who knows when
+  // it stops being true.
+  if (d.entry) lines.push(`Access: ${ENTRY_LABEL[d.entry]}`);
+  if (d.access) lines.push(`Getting in: ${d.access}`);
+  if (d.pets) lines.push(`Pets: ${d.pets}`);
   return lines.join("\n");
 }
 
@@ -625,5 +647,6 @@ export function intakeForClient() {
     })),
     rooms: ROOMS,
     whens: WHENS,
+    entries: ENTRY_OPTIONS,
   };
 }

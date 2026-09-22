@@ -1121,3 +1121,81 @@ input, textarea, select { font: inherit; color: inherit; }
   padding-right: 30px;
 }
 .inline-edit select { background-position: right 7px center; padding-right: 24px; }
+
+/* ------------------------------------------------------------- work order */
+
+/* Who goes, how far they may go, how they get in, who pays. Sits under the
+   basics on the thread head and is shown to everyone on the thread — a tenant
+   seeing the spend cap and who it is billed to is the point of putting it
+   here, not a leak. */
+.workorder {
+  margin-top: 13px; padding: 12px 13px 13px;
+  border: 1px solid var(--line); border-radius: var(--r-md);
+  background: var(--panel);
+}
+.wo-head {
+  font-size: 10.5px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase;
+  color: var(--ink-faint); margin-bottom: 9px;
+}
+.workorder .basics { margin-top: 0; }
+.wo-access { margin: 10px 0 0; font-size: 13px; color: var(--ink-soft); }
+.wo-access b { color: var(--ink); }
+
+/* The reasoning behind the money decision: why this needs a yes, or what was
+   authorised and by whom. Colour carries the same three answers as the text. */
+.wo-banner {
+  margin: 10px 0 0; padding: 9px 11px; border-radius: var(--r-sm);
+  font-size: 13px; border-left: 3px solid;
+}
+.wo-banner.wait {
+  background: color-mix(in oklab, var(--high) 10%, var(--panel));
+  border-color: var(--high); color: var(--ink-soft);
+}
+.wo-banner.yes {
+  background: color-mix(in oklab, var(--ok) 10%, var(--panel));
+  border-color: var(--ok); color: var(--ink-soft);
+}
+.wo-banner.no {
+  background: color-mix(in oklab, var(--urgent) 10%, var(--panel));
+  border-color: var(--urgent); color: var(--ink-soft);
+}
+
+.wo-controls {
+  display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; margin-top: 11px;
+}
+.wo-controls > div { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.wo-controls input[type="text"],
+.wo-controls input[type="datetime-local"] {
+  padding: 5px 8px; font: inherit; font-size: 13px;
+  color: var(--ink); background: var(--panel);
+  border: 1px solid var(--line); border-radius: var(--r-sm);
+}
+.wo-controls input:focus { outline: none; border-color: var(--accent); box-shadow: var(--ring); }
+
+/* A text button, for changes that are rare enough not to earn a control of
+   their own but common enough to need naming. */
+.linkish {
+  background: none; border: 0; padding: 0; font: inherit; font-size: inherit;
+  color: var(--accent); text-decoration: underline; cursor: pointer;
+}
+.linkish:hover { color: var(--accent-hover); }
+
+/* ---------------------------------------------------------- dispatch rules */
+
+.dispatch { margin-top: 12px; border-top: 1px solid var(--line-soft); padding-top: 10px; }
+.dispatch summary {
+  cursor: pointer; font-weight: 650; font-size: 13px; color: var(--ink);
+  list-style: none;
+}
+.dispatch summary::-webkit-details-marker { display: none; }
+.dispatch summary::before { content: "▸ "; color: var(--ink-faint); }
+.dispatch[open] summary::before { content: "▾ "; }
+.dispatch-lede { margin: 8px 0; font-size: 12.5px; color: var(--ink-faint); }
+.dispatch-rows { display: grid; gap: 6px; margin: 9px 0; }
+.dispatch-rows .inline-edit { justify-content: space-between; gap: 8px; }
+.dispatch-limit input {
+  width: 74px; padding: 4px 7px; font: inherit; font-size: 13px;
+  color: var(--ink); background: var(--panel);
+  border: 1px solid var(--line); border-radius: var(--r-sm);
+}
+.dispatch-trade select { max-width: 60%; }

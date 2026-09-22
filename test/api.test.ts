@@ -8,6 +8,9 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
 import { emergencyFor, findIssue, isStatutoryIssue } from "../src/intake";
 import { isStatutoryEmergency } from "../src/sla";
+import {
+  approvalFor, billingSuggestion, canAdvance, nteFor, tradeFor,
+} from "../src/workorder";
 
 const PORT = 4399;
 const DB = "data/test-knoknok.db";
@@ -2004,5 +2007,281 @@ describe("triage quality", () => {
       body: "I would rather someone just came out to look at it.",
     });
     expect(data.ticket.status).toBe("open");
+  });
+});
+
+/* ------------------------------------------------------- the work order */
+
+describe("what triage decides once it needs a person", () => {
+  test("the trade is who you call, not what the tenant filed it under", () => {
+    // A dishwasher is filed under plumbing by half the people who report it.
+    expect(tradeFor("plumbing", "The dishwasher is leaking onto the kitchen floor"))
+      .toBe("appliance");
+    expect(tradeFor("electrical", "The dryer stopped mid-cycle")).toBe("appliance");
+    // A water heater is a plumber; the boiler in the same cupboard is not.
+    expect(tradeFor("plumbing", "No hot water from the water heater")).toBe("plumber");
+    expect(tradeFor("plumbing", "The boiler is making a banging noise")).toBe("hvac");
+    // A stain on a bedroom ceiling is a roof, whatever room it shows up in.
+    expect(tradeFor("structural", "Damp patch on the ceiling under the roof")).toBe("roofer");
+    // Nothing specific in the wording: the category decides.
+    expect(tradeFor("pest", "Mice in the kitchen")).toBe("pest");
+    expect(tradeFor("other", "The hallway light switch cover is cracked")).toBe("handyman");
+  });
+
+  test("the cap follows the trade and how urgent it is", () => {
+    expect(nteFor("plumber", "normal")).toBe(35000);
+    // An emergency call-out is not priced like a booked visit.
+    expect(nteFor("plumber", "urgent")).toBe(52500);
+    // Something that can wait for whoever is already nearby costs less.
+    expect(nteFor("plumber", "low")).toBeLessThan(35000);
+  });
+
+  test("an emergency is never held in the approval queue", () => {
+    const dear = { nte: 200000, threshold: 50000 };
+    expect(approvalFor(dear).state).toBe("pending");
+    // The same money, on a home that is unlivable right now, goes anyway.
+    const now = approvalFor({ ...dear, tier: "emergency" });
+    expect(now.state).toBe("approved");
+    expect(now.why).toContain("does not wait");
+  });
+
+  test("nothing is ever billed to a tenant by a regular expression", () => {
+    // The thing it will not do: decide.
+    const flushed = billingSuggestion({
+      text: "The toilet is blocked, my son flushed a toy down it",
+    });
+    expect(flushed.to).toBe("undecided");
+    expect(flushed.why).toContain("chargeable");
+
+    // The default, and the emergency override.
+    expect(billingSuggestion({ text: "The radiator is cold" }).to).toBe("landlord");
+    expect(billingSuggestion({
+      text: "I lost my keys and cannot get in", statutory: true,
+    }).to).toBe("landlord");
+  });
+
+  test("the lifecycle refuses moves that make no sense", () => {
+    expect(canAdvance("new", "assigned")).toBe(true);
+    expect(canAdvance("assigned", "scheduled")).toBe(true);
+    // Work cannot be done by somebody who was never sent.
+    expect(canAdvance("new", "work_done")).toBe(false);
+    expect(canAdvance("awaiting_approval", "scheduled")).toBe(false);
+    // Backwards is allowed where it actually happens: a vendor hands it back,
+    // or the work did not hold.
+    expect(canAdvance("scheduled", "assigned")).toBe(true);
+    expect(canAdvance("work_done", "scheduled")).toBe(true);
+  });
+});
+
+describe("the work order end to end", () => {
+  const owner = new Session();
+  const resident = new Session();
+  const plumber = new Session();
+  let joinCode = "";
+  let vendorCode = "";
+  let propertyId = 0;
+
+  beforeAll(async () => {
+    const made = await owner.post("/api/signup", {
+      role: "landlord", username: uniq("wo"), password: "password123",
+      displayName: "Wynn Oakes", propertyName: "Birch Row",
+    });
+    joinCode = made.data.user.property.joinCode;
+    vendorCode = made.data.user.property.vendorCode;
+    propertyId = made.data.user.property.id;
+    await resident.post("/api/signup", {
+      role: "tenant", username: uniq("wores"), password: "password123",
+      displayName: "Rae Quinn", joinCode, unit: "1",
+    });
+    await plumber.post("/api/signup", {
+      role: "vendor", username: uniq("wopl"), password: "password123",
+      displayName: "Quick Pipes", vendorCode,
+    });
+  });
+
+  /** Raise something the bot will hand straight on, and return the open ticket. */
+  const raise = async (title: string, description: string) => {
+    const { data } = await resident.post("/api/tickets", { title, description });
+    const id = data.ticket.id;
+    if (data.ticket.status === "triage") await resident.post(`/api/tickets/${id}/escalate`);
+    return (await owner.get(`/api/tickets/${id}`)).data.ticket;
+  };
+
+  test("an escalated request arrives as a work order, priced and filed", async () => {
+    const t = await raise("Kitchen tap drips", "It drips all night and the washer looks worn.");
+    expect(t.trade).toBe("plumber");
+    // The cap is the trade's, moved by how urgent the bot decided this was.
+    expect(t.nte_cents).toBe(nteFor("plumber", t.priority));
+    // Under the property's limit, so nobody is asked and it is ready to go out.
+    expect(t.approval_state).toBe("not_required");
+    expect(t.wo_status).toBe("new");
+    expect(t.billable_to).toBe("landlord");
+  });
+
+  test("work over the limit waits, and a vendor cannot pick it up meanwhile", async () => {
+    const t = await raise(
+      "Roof is leaking into the back bedroom",
+      "Water comes through the ceiling whenever it rains hard.",
+    );
+    expect(t.trade).toBe("roofer");
+    expect(t.wo_status).toBe("awaiting_approval");
+    expect(t.approval_note).toContain("over the");
+
+    const grabbed = await plumber.post(`/api/tickets/${t.id}/claim`);
+    expect(grabbed.status).toBe(409);
+    expect(grabbed.data.error).toContain("approve");
+
+    // Approving can raise the cap in the same breath.
+    const yes = await owner.post(`/api/tickets/${t.id}/approve`, { approve: true, nte: "900" });
+    expect(yes.status).toBe(200);
+    expect(yes.data.ticket.approval_state).toBe("approved");
+    expect(yes.data.ticket.nte_cents).toBe(90000);
+    expect(yes.data.ticket.approved_by).toBe("Wynn Oakes");
+    expect(yes.data.ticket.wo_status).toBe("new");
+    expect((await plumber.post(`/api/tickets/${t.id}/claim`)).status).toBe(200);
+  });
+
+  test("declining ends the job, and says why where the tenant can read it", async () => {
+    const t = await raise("Replace the garden fence", "The fence panels are leaning badly.");
+    await owner.post(`/api/tickets/${t.id}/approve`, { approve: true, nte: "2000" });
+    // Put it back in the queue by re-filing it as something dearer.
+    const again = await raise("Rebuild the garden wall", "The wall is bowing and needs rebuilding.");
+    expect(again.wo_status).toBe("awaiting_approval");
+
+    const bare = await owner.post(`/api/tickets/${again.id}/approve`, { approve: false });
+    expect(bare.status).toBe(400); // a refusal with no reason is not a refusal
+
+    const no = await owner.post(`/api/tickets/${again.id}/approve`, {
+      approve: false, note: "Getting two more quotes first.",
+    });
+    expect(no.data.ticket.approval_state).toBe("declined");
+    expect(no.data.ticket.status).toBe("closed");
+    // The tenant sees the reason on their own thread, not a silent disappearance.
+    const seen = await resident.get(`/api/tickets/${again.id}`);
+    expect(seen.data.messages.some((m: any) => m.body.includes("two more quotes"))).toBe(true);
+  });
+
+  test("a first-choice vendor is sent the job without the landlord touching it", async () => {
+    const vendorId = (await owner.get("/api/vendors")).data.vendors
+      .find((v: any) => v.display_name === "Quick Pipes").id;
+    const saved = await owner.post("/api/dispatch", { trade: "plumber", vendorId });
+    expect(saved.data.trades.find((t: any) => t.trade === "plumber").vendorName)
+      .toBe("Quick Pipes");
+
+    const t = await raise("Bathroom sink is blocked", "It fills up and drains very slowly.");
+    expect(t.trade).toBe("plumber");
+    expect(t.assigned_vendor_id).toBe(vendorId);
+    expect(t.wo_status).toBe("assigned");
+  });
+
+  test("the vendor books a time, does the work, and the invoice is what closes it", async () => {
+    const t = await raise("Radiator valve is stuck", "The bedroom radiator stays cold.");
+    await owner.post(`/api/tickets/${t.id}/assign`, {
+      vendorId: (await owner.get("/api/vendors")).data.vendors[0].id,
+    });
+
+    const when = new Date(Date.now() + 2 * 86400_000).toISOString();
+    const booked = await plumber.post(`/api/tickets/${t.id}/schedule`, { when });
+    expect(booked.status).toBe(200);
+    expect(booked.data.ticket.wo_status).toBe("scheduled");
+    expect(booked.data.ticket.scheduled_for).toBeTruthy();
+
+    const done = await plumber.post(`/api/tickets/${t.id}/done`, {
+      cost: "180", notes: "Replaced the valve and bled the radiator.",
+    });
+    expect(done.data.ticket.wo_status).toBe("work_done");
+    expect(done.data.ticket.actual_cents).toBe(18000);
+    // Doing the work is not the same claim as the request being finished.
+    expect(done.data.ticket.status).toBe("open");
+  });
+
+  test("an invoice over the cap is recorded, not refused", async () => {
+    const t = await raise("Extractor fan has stopped", "The bathroom fan does nothing.");
+    await owner.post(`/api/tickets/${t.id}/assign`, {
+      vendorId: (await owner.get("/api/vendors")).data.vendors[0].id,
+    });
+    const over = await plumber.post(`/api/tickets/${t.id}/done`, { cost: "9999" });
+    expect(over.status).toBe(200);
+    expect(over.data.ticket.actual_cents).toBe(999900);
+    expect(over.data.ticket.wo_status).toBe("work_done");
+    // The work happened. What needs a decision now is the bill.
+    expect(over.data.ticket.approval_state).toBe("pending");
+    expect(over.data.ticket.approval_note).toContain("over the");
+
+    const signed = await owner.post(`/api/tickets/${t.id}/approve`, {
+      approve: true, nte: "9999",
+    });
+    expect(signed.data.ticket.approval_state).toBe("approved");
+    expect(signed.data.ticket.wo_status).toBe("work_done"); // stays done, not re-sent
+  });
+
+  test("recharging a tenant needs a reason, and the tenant reads it", async () => {
+    const t = await raise("Locked out", "I lost my keys and cannot get into the flat.");
+    expect(t.trade).toBe("locksmith");
+    // The wording suggests it, and the suggestion is all it is.
+    expect(t.billable_to).toBe("undecided");
+
+    const bare = await owner.post(`/api/tickets/${t.id}/billing`, { to: "tenant" });
+    expect(bare.status).toBe(400);
+
+    const charged = await owner.post(`/api/tickets/${t.id}/billing`, {
+      to: "tenant", note: "Replacement keys are yours under clause 8.",
+    });
+    expect(charged.data.ticket.billable_to).toBe("tenant");
+    const seen = await resident.get(`/api/tickets/${t.id}`);
+    expect(seen.data.messages.some((m: any) => m.body.includes("clause 8"))).toBe(true);
+
+    // And a tenant cannot decide this for themselves either way.
+    expect((await resident.post(`/api/tickets/${t.id}/billing`, { to: "landlord" })).status)
+      .toBe(403);
+  });
+
+  test("re-filing a request moves the trade and the cap with it", async () => {
+    const t = await raise("Something is wrong with the oven", "It will not heat up at all.");
+    const moved = await owner.post(`/api/tickets/${t.id}/update`, { category: "electrical" });
+    // The wording still names an oven, so it is still an appliance engineer.
+    expect(moved.data.ticket.trade).toBe("appliance");
+
+    const plain = await raise("Scuff on the hallway wall", "Needs patching and painting.");
+    expect(plain.trade).toBe("handyman");
+    const urgent = await owner.post(`/api/tickets/${plain.id}/update`, { priority: "urgent" });
+    expect(urgent.data.ticket.nte_cents).toBe(nteFor("handyman", "urgent"));
+  });
+
+  test("access is the tenant's to give and to change", async () => {
+    const { data } = await resident.post("/api/tickets", {
+      intake: {
+        issue: "leak", what: "kitchen tap", room: "Kitchen", when: "Today",
+        notes: "Dripping steadily.",
+        entry: "permitted", access: "Lockbox by the gate, code 4412", pets: "One nervous cat",
+      },
+    });
+    const id = data.ticket.id;
+    expect(data.ticket.entry_permission).toBe("permitted");
+    expect(data.ticket.access_notes).toContain("4412");
+    expect(data.ticket.pets).toContain("cat");
+
+    const changed = await resident.post(`/api/tickets/${id}/access`, {
+      entry: "must_be_home", access: "", pets: "One nervous cat",
+    });
+    expect(changed.data.ticket.entry_permission).toBe("must_be_home");
+    // And a vendor on the property cannot rewrite it, once they can see it at all.
+    await resident.post(`/api/tickets/${id}/escalate`);
+    expect((await plumber.post(`/api/tickets/${id}/access`, { entry: "permitted" })).status)
+      .toBe(403);
+  });
+
+  test("the approval limit is the landlord's to set, per property", async () => {
+    const before = await raise("Fit a new extractor hood", "The kitchen hood is beyond repair.");
+    expect(before.wo_status).toBe("new"); // handyman, under $500
+
+    await owner.post("/api/dispatch", { propertyId, threshold: "100" });
+    const after = await raise("Fit a second extractor hood", "The utility room needs one too.");
+    expect(after.wo_status).toBe("awaiting_approval");
+
+    await owner.post("/api/dispatch", { propertyId, threshold: "500" });
+    const settings = await owner.get("/api/dispatch");
+    expect(settings.data.properties.find((p: any) => p.id === propertyId)
+      .approval_threshold_cents).toBe(50000);
   });
 });

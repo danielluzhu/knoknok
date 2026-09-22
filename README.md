@@ -104,6 +104,60 @@ landlord can change either from the task header, and the change is written into 
 (`Dana set priority to urgent and filed it under plumbing.`) so there's a record of who
 decided what.
 
+**The work order.** A request that needs a person stops being a description and becomes a
+job, with five things decided about it. The rules are in `src/workorder.ts`, kept pure so they
+can be read as rules; `src/app.ts` writes down what they say and puts it on the thread, where
+everyone — tenant included — can see it.
+
+1. **Trade.** Who you actually call, which is not the category. A tenant files a leaking
+   dishwasher under plumbing, and it is an appliance engineer who fixes it; a stain on a
+   bedroom ceiling is a roofer whatever room it shows up in. Wording overrides the category
+   (`TRADE_OVERRIDES`), and the category decides the rest.
+2. **Not-to-exceed.** The spend cap the vendor works under: go up to this without asking, stop
+   and come back above it. A first guess from the trade and the priority — urgent is 1.5×,
+   because a call-out is not priced like a booked visit — which the landlord can move, and
+   what they set sticks.
+3. **Approval.** Over the property's limit (`$500` by default, per property), the job waits
+   for the landlord's yes and no vendor can pick it up. Under it, work goes ahead. **An
+   emergency never waits.** Water, power, winter heat, flooding, a door that will not lock —
+   that is a duty the landlord already owes, on the statute's clock rather than the owner's,
+   and holding it in a queue makes a liar of the 24-hour target the tenant was given in the
+   same breath. The cap still travels with the job; nobody waits on it.
+4. **Access.** How the vendor gets in — enter when nobody's home, call first, or only when the
+   tenant is home — plus buzzer codes, lockboxes and pets. Asked on the intake form rather
+   than by the assistant, because it changes nothing about the diagnosis and everything about
+   the visit. The tenant can change it afterwards; they are the only one who knows when it
+   stops being true.
+5. **Billing.** Who the invoice belongs to. This one is allowed to say *landlord*, and allowed
+   to say *worth checking* — never *tenant* on its own. Charging a resident for a repair is a
+   decision with a tenancy agreement behind it and a deposit dispute in front of it, and a
+   regular expression that saw the word "flushed" is not what should make it. What it does is
+   stop the question going unasked. A landlord setting it to *tenant* must give a reason, and
+   the reason is posted to the shared thread — the first a tenant hears about a recharge should
+   not be a deduction from their deposit.
+
+**Dispatch.** A landlord names a first-choice vendor per trade (`preferred_vendors`), and a
+job that needs that trade and does not need approving goes straight to them, without anyone
+reading it first. Nothing is forced: the vendor can hand it back, and it returns to the open
+pool for anyone in the network to claim. Both settings — the per-property limit and the
+trade table — live under **Dispatch rules** in the landlord's sidebar.
+
+**Where a job has got to.** Finer-grained than the ticket's own three statuses, because an
+open request nobody has been sent to and an open request whose plumber is coming Thursday are
+very different things to everyone waiting:
+
+```
+new → awaiting_approval → assigned → scheduled → work_done → closed
+```
+
+Backwards moves are legal where they actually happen — a vendor hands a job back, the work did
+not hold — and illegal where they do not: nothing reaches `work_done` without somebody having
+been sent. Marking work done does **not** close the request. Work being done and a request
+being finished are different claims, and the person who did the work is not the one who decides
+the second; that is the tenant living with the result. An invoice over the cap is recorded
+rather than refused — the vendor has already been, and refusing to write down what something
+cost does not make it cost less — and goes to the landlord to sign off.
+
 **Unread.** Each side's read position is tracked per thread. The list shows a count of
 messages you haven't seen, and the thread draws a line where you left off. Your own messages
 and status lines never count against you.
@@ -159,6 +213,8 @@ src/db.ts          schema, the libSQL client, and types
 src/auth.ts        password hashing, sessions, throttling, cookies
 src/bot.ts         triage — Claude and the rule-based fallback
 src/intake.ts      the new-request decision tree, and the four basics it collects
+src/workorder.ts   trade, spend cap, approval, access and billing — the rules, kept pure
+src/sla.ts         response-time targets, and what counts as a statutory emergency
 public/            the whole front end (index.html, app.js, styles.css)
 seed.ts            demo property, users, and tickets
 test/api.test.ts   end-to-end HTTP tests
@@ -174,12 +230,20 @@ All routes are JSON and cookie-authenticated.
 | GET | `/api/me` | current user, or `{user: null}` |
 | GET | `/api/intake` | the decision tree behind a new request: groups, issues, rooms, timings |
 | GET | `/api/tickets?status=` | `open`, `closed`, `triage`, `all` |
-| POST | `/api/tickets` | tenant → starts triage, with `intake: {issue, what, room, spot?, when?, trigger?, notes?}` or a plain `title` + `description`; landlord → adds a to-do |
+| POST | `/api/tickets` | tenant → starts triage, with `intake: {issue, what, room, spot?, when?, trigger?, notes?, entry?, access?, pets?}` or a plain `title` + `description`; landlord → adds a to-do |
 | GET | `/api/tickets/:id` | ticket plus full message thread |
 | POST | `/api/tickets/:id/messages` | replies; runs the bot while in triage |
 | POST | `/api/tickets/:id/update` | landlord only — priority, category, title |
 | POST | `/api/tickets/:id/escalate` | tenant skips the bot |
 | POST | `/api/tickets/:id/close` / `/reopen` | with an optional resolution note |
+| POST | `/api/tickets/:id/claim` / `/release` | vendor takes a job, or hands it back |
+| POST | `/api/tickets/:id/assign` | landlord hands a job to one of their vendors |
+| POST | `/api/tickets/:id/approve` | landlord only — `{approve, nte?, note?}`; declining closes it and needs a reason |
+| POST | `/api/tickets/:id/schedule` | vendor or landlord — `{when}` or `{clear: true}` |
+| POST | `/api/tickets/:id/done` | vendor or landlord — `{cost?, notes?}`; over the cap goes back for sign-off |
+| POST | `/api/tickets/:id/billing` | landlord only — `{to, note}`; a tenant recharge needs a reason |
+| POST | `/api/tickets/:id/access` | tenant or landlord — `{entry?, access?, pets?}` |
+| GET / POST | `/api/dispatch` | landlord only — the per-property approval limit and the first-choice vendor per trade |
 | GET | `/api/chats` | conversations — one per tenant for a landlord, one for a tenant |
 | GET | `/api/chats/:tenantId` | a conversation and its messages |
 | POST | `/api/chats/:tenantId/messages` | send a direct message |
