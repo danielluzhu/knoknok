@@ -1263,3 +1263,25 @@ input, textarea, select { font: inherit; color: inherit; }
 /* Codes are typed in capitals, but an example in the empty box reads better as
    written ("e.g. K4M2QP", not "E.G. K4M2QP"). */
 input[style*="uppercase"]::placeholder { text-transform: none; }
+
+/* ------------------------------------------------------- how-to guides */
+
+/* Links the assistant attached to a fix, under its message. Card-shaped rather
+   than inline so each is an obvious thumb target on a phone. */
+.guides { display: grid; gap: 6px; margin-top: 6px; max-width: 420px; }
+.guide-link {
+  display: grid; grid-template-columns: 1fr auto; gap: 1px 10px; align-items: baseline;
+  padding: 8px 12px; border-radius: var(--r-md, 10px);
+  border: 1px solid color-mix(in oklab, var(--info) 30%, var(--line));
+  background: color-mix(in oklab, var(--info) 6%, var(--panel));
+  color: var(--ink); text-decoration: none;
+  transition: background var(--fast), border-color var(--fast);
+}
+.guide-link:hover { background: color-mix(in oklab, var(--info) 12%, var(--panel)); }
+.guide-link:focus-visible { outline: none; border-color: var(--info); box-shadow: var(--ring); }
+.guide-kicker {
+  grid-column: 1 / -1; font-size: 10.5px; font-weight: 650; letter-spacing: .06em;
+  text-transform: uppercase; color: var(--info);
+}
+.guide-title { font-size: 13.5px; font-weight: 550; overflow-wrap: anywhere; }
+.guide-source { font-size: 12px; color: var(--ink-faint); white-space: nowrap; }

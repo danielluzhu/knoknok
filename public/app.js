@@ -1846,7 +1846,23 @@ function renderMessage(m) {
     ${label ? `<div class="who-line">${esc(label)}</div>` : ""}
     ${m.body ? `<div class="bubble">${esc(m.body)}</div>` : ""}
     ${renderPhotos(m)}
+    ${renderGuides(m)}
   </div>`;
+}
+
+/**
+ * How-to links the assistant attached. They come from the server's vetted list,
+ * never from the model's text, and open in a new tab so the thread — and the
+ * question it ends on — is still there when the tenant comes back.
+ */
+function renderGuides(m) {
+  if (!m.guides?.length) return "";
+  return `<div class="guides" aria-label="How-to guides">${m.guides.map((g) => `
+    <a class="guide-link" href="${esc(g.url)}" target="_blank" rel="noopener noreferrer">
+      <span class="guide-kicker">How to</span>
+      <span class="guide-title">${esc(g.title)}</span>
+      <span class="guide-source">${esc(g.source)} ↗</span>
+    </a>`).join("")}</div>`;
 }
 
 async function act(path, body) {

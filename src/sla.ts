@@ -69,7 +69,10 @@ const DEAD = String.raw`(?:off|out(?! of)|dead|gone|shut off|cut off|not working
 const DANGER_TO_LIFE = [
   /\bgas\b[^.]{0,20}\b(leak|leaking)\b|\bsmell(?:s|ing)?\b[^.]{0,12}\bgas\b/,
   /\bcarbon monoxide\b|\bco alarm\b|\bco detector\b/,
-  /\bfire\b|\bsmoke\b(?![^.]{0,10}\balarm (?:battery|chirp)) |\bburning smell\b|\bsmells? (?:of )?burning\b/,
+  // Smoke, unless it is a smoke alarm asking for a battery: "the smoke alarm in
+  // the hallway keeps chirping" is a nine-volt, not a fire. The old exception
+  // only knew the exact words "alarm chirp", and demanded a space after "smoke".
+  /\bfire\b|\bsmoke\b(?!\s+(?:alarm|detector)s?\b[^.]{0,40}\b(?:chirp|beep|battery))|\bburning smell\b|\bsmells? (?:of )?burning\b/,
   /\bspark(?:s|ing)\b|\bexposed wir|\blive wire\b|\belectric(?:al)? shock\b|\belectrocut/,
   /\bcollaps(?:e|ed|ing)\b|\bceiling (?:is )?(?:falling|coming down)\b/,
   /\basbestos\b|\bblack mold\b/,

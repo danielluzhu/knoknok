@@ -6,7 +6,9 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { rmSync } from "node:fs";
-import { emergencyFor, findIssue, isStatutoryIssue } from "../src/intake";
+import { emergencyFor, findIssue, INTAKE, isStatutoryIssue, tipGuide, tipText } from "../src/intake";
+import { PLAYBOOKS } from "../src/bot";
+import { GUIDE_HOSTS, GUIDES, guide } from "../src/guides";
 import { isStatutoryEmergency } from "../src/sla";
 import {
   approvalFor, billingSuggestion, canAdvance, nteFor, tradeFor,
@@ -2682,5 +2684,127 @@ describe("ending a tenancy and removing a vendor", () => {
       displayName: "Stale", vendorCode: old,
     });
     expect(stale.status).toBe(400);
+  });
+});
+
+/* -------------------------------------------------------- tenant self-fixes */
+
+/** Every fix the assistant can suggest, from both the form and the free-text scripts. */
+const everyFix = () => [
+  ...INTAKE.flatMap((g) => g.issues.flatMap((i) =>
+    i.tips.map((t) => ({ where: `intake:${i.id}`, text: tipText(t), guide: tipGuide(t) })))),
+  ...PLAYBOOKS.flatMap((p) =>
+    p.checks.map((c) => ({ where: `playbook:${p.keywords[0]}`, text: c.do, guide: c.guide ?? null }))),
+];
+
+describe("what a tenant is asked to fix", () => {
+  test("every guide a fix points at is in the catalogue", () => {
+    const missing = everyFix().filter((f) => f.guide && !guide(f.guide));
+    expect(missing).toEqual([]);
+  });
+
+  test("every guide is an https page on a vetted site", () => {
+    for (const g of Object.values(GUIDES)) {
+      const url = new URL(g!.url);
+      expect(url.protocol).toBe("https:");
+      expect(GUIDE_HOSTS).toContain(url.host);
+      expect(g!.title.length).toBeGreaterThan(5);
+    }
+  });
+
+  test("no fix asks a tenant to replace, install or rewire anything", () => {
+    // Consumables are fine — a battery, a bulb, a filter. Fixtures are the landlord's.
+    // "Do not relight it" is the rule working, not breaking, so a negated verb is fine.
+    const forbidden = /(?<!\b(?:not|never|n't|don't)\s)\b(replace|install|rewire|relight|swap|remove the cover|take (?:the )?cover off)\b(?![^.]{0,30}\b(batter(?:y|ies)|bulb|filter)\b)/i;
+    const breaking = everyFix().filter((f) => forbidden.test(f.text));
+    expect(breaking.map((f) => `${f.where}: ${f.text}`)).toEqual([]);
+  });
+});
+
+describe("guides in the thread", () => {
+  const tenant = new Session();
+
+  beforeAll(async () => {
+    const { data } = await new Session().post("/api/signup", {
+      role: "landlord", username: uniq("gd"), password: "password123",
+      displayName: "Gil D", propertyName: "Guide House",
+    });
+    await tenant.post("/api/signup", {
+      role: "tenant", username: uniq("gdt"), password: "password123",
+      displayName: "Gia T", joinCode: data.user.property.joinCode, unit: "1",
+    });
+  });
+
+  test("a fix with a guide arrives with its link, and the link survives a reload", async () => {
+    const { data } = await tenant.post("/api/tickets", {
+      intake: { issue: "dishwasher", what: "dishwasher", room: "Kitchen", when: "Today",
+                notes: "Water left in the bottom after every cycle" },
+    });
+    const reply = data.messages.at(-1);
+    expect(reply.author).toBe("bot");
+    const ids = reply.guides.map((g: any) => g.id);
+    expect(ids).toContain("dishwasher-filter");
+    expect(reply.guides[0].url).toStartWith("https://");
+    // Links are data on the message, never pasted into its text.
+    expect(reply.body).not.toContain("http");
+
+    const again = await tenant.get(`/api/tickets/${data.ticket.id}`);
+    expect(again.data.messages.at(-1).guides.map((g: any) => g.id)).toEqual(ids);
+    expect(again.data.messages.at(-1).guide_ids).toBeUndefined();
+  });
+
+  test("a chirping smoke alarm is a battery, not a fire", async () => {
+    const { data } = await tenant.post("/api/tickets", {
+      title: "Smoke alarm chirping",
+      description: "The smoke alarm in the hallway keeps chirping every minute or so.",
+    });
+    expect(data.ticket.priority).not.toBe("urgent");
+    const reply = data.messages.at(-1);
+    expect(reply.body).toContain("battery");
+    expect(reply.guides.map((g: any) => g.id)).toContain("smoke-alarm-chirp");
+    expect(data.messages.some((m: any) => m.body.includes("Call Dan"))).toBe(false);
+  });
+
+  test("a carbon monoxide alarm is an emergency, and is never told to be silenced", async () => {
+    const co = findIssue("coalarm")!;
+    expect(isStatutoryIssue(co, new Date("2026-07-01T12:00:00Z"))).toBe(true);
+    expect(co.emergency!.steps.join(" ")).toContain("911");
+    expect(co.emergency!.steps.join(" ").toLowerCase()).not.toContain("hush");
+
+    const { data } = await tenant.post("/api/tickets", {
+      title: "CO alarm going off", description: "The CO alarm is sounding continuously.",
+    });
+    expect(data.ticket.priority).toBe("urgent");
+    expect(data.ticket.status).toBe("open");
+  });
+
+  test("a free-text request finds the specific fix, not the generic appliance one", async () => {
+    const { data } = await tenant.post("/api/tickets", {
+      title: "Dryer not drying", description: "Clothes are still wet after a full cycle in the dryer.",
+    });
+    expect(data.messages.at(-1).body).toContain("lint screen");
+    expect(data.messages.at(-1).guides.map((g: any) => g.id)).toContain("dryer-lint");
+  });
+
+  test("an escalation carries no guides", async () => {
+    const { data } = await tenant.post("/api/tickets", {
+      intake: { issue: "stain", what: "ceiling", room: "Bedroom", when: "Today",
+                notes: "Brown ring, damp" },
+    });
+    await tenant.post(`/api/tickets/${data.ticket.id}/messages`, { body: "It's still damp, please send someone" });
+    const { data: after } = await tenant.get(`/api/tickets/${data.ticket.id}`);
+    const last = after.messages.filter((m: any) => m.author === "bot").at(-1);
+    expect(last.guides).toBeUndefined();
+  });
+});
+
+describe("a smoke alarm asking for a battery", () => {
+  test("is not a fire, but a smoke alarm going off still is", () => {
+    const at = new Date("2026-07-01T12:00:00Z");
+    expect(isStatutoryEmergency({ text: "The smoke alarm in the hallway keeps chirping", at })).toBe(false);
+    expect(isStatutoryEmergency({ text: "smoke detector beeping, low battery", at })).toBe(false);
+    expect(isStatutoryEmergency({ text: "The smoke alarm is going off", at })).toBe(true);
+    expect(isStatutoryEmergency({ text: "There is smoke coming from the oven.", at })).toBe(true);
+    expect(isStatutoryEmergency({ text: "CO alarm chirping", at })).toBe(true);
   });
 });

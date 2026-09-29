@@ -7,8 +7,9 @@
  */
 import type { Message, Priority } from "./db";
 import {
-  findIssue, intakeGaps, whenText, whereText, type Intake, type Issue,
+  findIssue, intakeGaps, tipGuide, tipText, whenText, whereText, type Intake, type Issue,
 } from "./intake";
+import { GUIDE_IDS, guideMenu, guidesFor, TENANT_FIX_RULE, type GuideId } from "./guides";
 
 export const CATEGORIES = [
   "plumbing",
@@ -39,13 +40,18 @@ export interface TriageResult {
   priority: Priority;
   /** One-line description for the landlord's to-do list. */
   summary: string;
+  /**
+   * How-to guides for the fixes suggested in `reply`, from the vetted catalogue
+   * in src/guides.ts. Ids only — the links are looked up, never written.
+   */
+  guides: GuideId[];
   /** Which engine produced this result. */
   engine: "claude" | "rules";
 }
 
 export const usingClaude = Boolean(process.env.ANTHROPIC_API_KEY);
 
-const SYSTEM_PROMPT = `You are the maintenance triage assistant for a residential property
+const systemPrompt = () => `You are the maintenance triage assistant for a residential property
 management app. A tenant has reported a problem in their home, and they are reading your reply on
 a phone, probably standing in front of the thing that is broken.
 
@@ -70,6 +76,10 @@ just following orders:
 
 Two to four of those. Number them if the order matters, and write them as things a person can do
 without tools they do not own.
+
+WHAT IS THE TENANT'S TO FIX
+
+${TENANT_FIX_RULE}
 
 If part of it is genuinely not theirs to touch, say so and say why in the same breath — "the panel
 itself is an electrician's job, but the breaker handles on the front are yours". Being told the
@@ -132,7 +142,15 @@ FIELDS
 "sink problem". Include what was already ruled out.
 
 "priority": urgent = unsafe or unlivable now, high = getting worse or badly disrupting daily life,
-normal = should be fixed soon, low = cosmetic or convenience.`;
+normal = should be fixed soon, low = cosmetic or convenience.
+
+"guides": how-to guides for the checks in THIS reply, by id, from the list below and nowhere
+else — at most three, in the order of the checks, and only where the guide walks through the same
+step you suggested. Never put a URL in the reply text; the app shows the guides you pick as links
+under your message. Leave it empty when you are asking a question, escalating, or suggested
+nothing a guide covers. Several guides go further than a tenant should (replacing the part, not
+just cleaning it); your reply is what says which part is theirs.
+${guideMenu() || "(no guides are available)"}`;
 
 /* ------------------------------------------------------------------ Claude */
 
@@ -166,7 +184,9 @@ function intakeBrief(intake: Intake): string {
   }
   lines.push(
     issue.tips.length
-      ? `Safe fixes you may suggest for this issue: ${issue.tips.join(" | ")}`
+      ? `Safe fixes you may suggest for this issue: ${issue.tips
+        .map((t) => `${tipText(t)}${tipGuide(t) ? ` [guide: ${tipGuide(t)}]` : ""}`)
+        .join(" | ")}`
       : "There is no safe self-fix for this issue; once the basics are covered it needs a person.",
   );
   return lines.join("\n");
@@ -189,6 +209,7 @@ async function triageWithClaude(
     category: z.enum(CATEGORIES),
     priority: z.enum(["low", "normal", "high", "urgent"]),
     summary: z.string(),
+    guides: z.array(z.enum(GUIDE_IDS)),
   });
 
   const client = new Anthropic();
@@ -213,7 +234,7 @@ async function triageWithClaude(
     // Room for the model to reason before answering. The reply itself is a few
     // hundred words; the headroom is for thinking.
     max_tokens: 16000,
-    system: SYSTEM_PROMPT,
+    system: systemPrompt(),
     messages,
     // Working out which of several causes fits the symptoms is the whole job
     // here, and it is what decides whether the tenant fixes it themselves or
@@ -228,7 +249,11 @@ async function triageWithClaude(
   if (response.stop_reason === "refusal" || !response.parsed_output) {
     throw new Error(`unusable triage response (stop_reason=${response.stop_reason})`);
   }
-  return { ...response.parsed_output, engine: "claude" };
+  const out = response.parsed_output;
+  // Only ids that are actually in the catalogue, and not on a reply that asks
+  // a question or hands over — there is nothing there to follow.
+  const guides = out.action === "ask" ? guidesFor(out.guides).slice(0, 3).map((x) => x.id) : [];
+  return { ...out, guides, engine: "claude" };
 }
 
 /* ------------------------------------------------------- Rule-based fallback */
@@ -247,8 +272,8 @@ interface Playbook {
   keywords: string[];
   /** What is usually going on, and why that fits. */
   likely: string;
-  /** Each: what to do, and what the outcome tells them. */
-  checks: { do: string; means?: string }[];
+  /** Each: what to do, what the outcome tells them, and a guide to doing it. */
+  checks: { do: string; means?: string; guide?: GuideId }[];
   /** The line between what is theirs and what is not, when there is one. */
   boundary?: string;
   /** The one question whose answer decides what happens next. */
@@ -256,7 +281,7 @@ interface Playbook {
   priority: Priority;
 }
 
-const PLAYBOOKS: Playbook[] = [
+export const PLAYBOOKS: Playbook[] = [
   {
     category: "plumbing",
     keywords: ["disposal", "garbage disposal", "insinkerator"],
@@ -265,6 +290,7 @@ const PLAYBOOKS: Playbook[] = [
     checks: [
       { do: "Switch it off at the wall, reach under the sink, and press the small red button on "
           + "the underside of the disposal until it clicks. Switch back on.",
+        guide: "disposal-reset",
         means: "If it runs, that was it — the overload trips when something jams it briefly." },
       { do: "If it hums but does not turn, switch it off and turn the blades by hand from below "
           + "with the hex key that came with it (a 1/4\" allen key fits).",
@@ -286,9 +312,11 @@ const PLAYBOOKS: Playbook[] = [
           + "means the blockage is within arm's reach." },
       { do: "Plunge it properly: an inch of standing water so the cup seals, a wet rag held over "
           + "the overflow hole, then 15-20 hard strokes.",
+        guide: "plunge-sink",
         means: "Most hair and grease clogs give way here. No change after a proper attempt "
           + "usually means it is further down than a plunger reaches." },
       { do: "Put a bucket under the U-bend and undo the two slip nuts by hand.",
+        guide: "clean-p-trap",
         means: "They are meant to be hand-tight. What comes out is usually the answer." },
     ],
     boundary: "Skip the trap if the pipes are corroded or the nuts will not move by hand — "
@@ -304,6 +332,7 @@ const PLAYBOOKS: Playbook[] = [
     checks: [
       { do: "Lift the tank lid and look at the flapper. It should sit flat over the hole, with a "
           + "little slack in its chain rather than being pulled taut.",
+        guide: "toilet-flapper",
         means: "A taut chain holds the flapper open a fraction. Shortening the slack fixes it." },
       { do: "Press the flapper down with a finger and see if the running stops.",
         means: "If it stops, the flapper is the problem and it is a cheap part." },
@@ -333,6 +362,7 @@ const PLAYBOOKS: Playbook[] = [
     checks: [
       { do: "Unscrew the screen at the tip of the spout counter-clockwise (a rag gives grip), "
           + "rinse the grit out, and screw it back on.",
+        guide: "clean-aerator",
         means: "If flow returns, that was it. If the flow is just as weak with the aerator off "
           + "entirely, the restriction is further back and it is not yours to chase." },
     ],
@@ -367,10 +397,12 @@ const PLAYBOOKS: Playbook[] = [
     checks: [
       { do: "Find outlets with RESET and TEST buttons — kitchen, bathroom, garage, outside, "
           + "sometimes a hallway — and press RESET firmly on each until it clicks.",
+        guide: "gfci-reset",
         means: "A click and the outlet coming back means you found it. GFCIs trip for a reason, "
           + "so if it goes again immediately, something plugged in downstream is at fault." },
       { do: "If that finds nothing, look at the breaker panel for a switch sitting between ON and "
           + "OFF. Push it fully OFF, then back ON.",
+        guide: "breaker-reset",
         means: "A breaker that trips again straight away is telling you something real." },
     ],
     boundary: "The breaker handles on the front of the panel are yours. The cover comes off for "
@@ -404,12 +436,14 @@ const PLAYBOOKS: Playbook[] = [
     checks: [
       { do: "At the thermostat: set it to HEAT, put the target several degrees above the current "
           + "room temperature, and if it has a battery door, put fresh batteries in.",
+        guide: "thermostat-batteries",
         means: "A blank screen is nearly always dead batteries. A lit screen with nothing "
           + "happening moves suspicion to the furnace." },
       { do: "Find the furnace switch — it looks like an ordinary light switch, on or beside the "
           + "unit — and check it is on. Check its breaker too.",
         means: "These get knocked off by accident more often than anyone expects." },
       { do: "Pull the air filter out and hold it to the light.",
+        guide: "hvac-filter",
         means: "If you cannot see light through it, a blocked filter can shut the system down on "
           + "its own safety cut-out." },
     ],
@@ -426,6 +460,7 @@ const PLAYBOOKS: Playbook[] = [
     checks: [
       { do: "Set the thermostat to COOL, target well below the room, then pull the filter and "
           + "hold it to the light.",
+        guide: "hvac-filter",
         means: "Grey and opaque means replace it — that alone fixes a lot of weak-cooling calls." },
       { do: "Put a hand at a vent, and check the outdoor unit is running.",
         means: "No air at all points at the fan or the filter. Room-temperature air with the "
@@ -433,6 +468,139 @@ const PLAYBOOKS: Playbook[] = [
     ],
     question: "Is air coming out of the vents at all, and is it cool or room temperature?",
     priority: "high",
+  },
+  {
+    category: "other",
+    keywords: ["smoke alarm", "smoke detector", "chirp", "chirping", "beeping", "low battery"],
+    likely: "A single chirp every minute or so is the alarm asking for a new battery. Hard-wired "
+      + "alarms do it too — the battery inside is the backup, and it still runs down.",
+    checks: [
+      { do: "Twist the alarm anticlockwise off its base, swap the 9V or AA battery, and press "
+          + "TEST until it sounds. If it's wired in and you'd have to unplug wires to reach the "
+          + "battery, or the back says it has a sealed 10-year battery, stop — that one is the "
+          + "landlord's.",
+        guide: "smoke-alarm-chirp",
+        means: "Chirping stops, alarm tests loud: that was it. Still chirping with a fresh battery "
+          + "usually means the alarm itself has reached the end of its life (they last about ten "
+          + "years), which is the landlord's to replace." },
+    ],
+    boundary: "If it is labelled CO or carbon monoxide and it is sounding continuously rather "
+      + "than chirping, stop here, get everyone outside, and call 911 — do not silence it.",
+    question: "Is it a short chirp every minute or so, or a continuous alarm?",
+    priority: "high",
+  },
+  {
+    category: "appliance",
+    keywords: ["dishwasher not draining", "dishwasher won't drain", "water in the dishwasher",
+               "dishwasher", "dishes dirty"],
+    likely: "A dishwasher that leaves water in the bottom or dirty dishes is almost always its own "
+      + "filter, which is designed to be lifted out and rinsed, or the garbage disposal it drains "
+      + "through.",
+    checks: [
+      { do: "Run the garbage disposal for a few seconds, if there is one.",
+        means: "The dishwasher drains through it. A disposal full of food blocks the dishwasher too." },
+      { do: "Pull out the bottom rack, twist out the filter in the floor of the tub, and rinse it "
+          + "under the tap.",
+        guide: "dishwasher-filter",
+        means: "A filter matted with food is the usual cause of both standing water and gritty "
+          + "dishes. Run an empty cycle afterwards." },
+    ],
+    question: "Is there water left in the bottom, or does it drain but leave the dishes dirty?",
+    priority: "normal",
+  },
+  {
+    category: "appliance",
+    keywords: ["dryer", "not drying", "clothes still wet", "takes forever to dry", "lint"],
+    likely: "A dryer that runs but takes two cycles to dry is nearly always airflow — a packed "
+      + "lint screen or a crushed vent hose behind it — not the heater.",
+    checks: [
+      { do: "Pull out the lint screen, clear it, and rinse it if it looks waxy from dryer sheets.",
+        guide: "dryer-lint",
+        means: "Water sitting on the mesh instead of running through means it is coated, and air "
+          + "is not getting through either." },
+      { do: "Look behind the dryer at the flexible silver hose. It should run fairly straight to "
+          + "the wall, not squashed flat or kinked.",
+        means: "A crushed hose starves the dryer of air. Straighten it if you can do that without "
+          + "moving the dryer; if it has come off or is torn, leave it for the landlord." },
+    ],
+    boundary: "Don't move a gas dryer or disconnect anything at the wall. A blocked vent is a fire "
+      + "risk, so if the dryer or the room gets unusually hot, stop using it.",
+    question: "Does it get warm inside at all, or is it tumbling cold?",
+    priority: "normal",
+  },
+  {
+    category: "appliance",
+    keywords: ["washer won't start", "washing machine won't start", "washer", "washing machine",
+               "won't spin", "not spinning"],
+    likely: "A washer that does nothing is usually refusing to start rather than broken: the door "
+      + "or lid is not latched, a child lock or delay-start is on, or it has lost power.",
+    checks: [
+      { do: "Push the door or lid firmly shut until it clicks, and look on the panel for a lock "
+          + "symbol or a delay timer.",
+        guide: "washer-wont-start",
+        means: "Most machines hold a child lock by pressing and holding one or two buttons for three "
+          + "seconds — the symbol or the manual says which." },
+      { do: "For a washer that fills but will not spin, spread the load out evenly and run a "
+          + "spin-only cycle.",
+        means: "One heavy towel wrapped round the drum is enough to make it refuse to spin." },
+    ],
+    question: "Does the display light up at all, and is there an error code?",
+    priority: "normal",
+  },
+  {
+    category: "appliance",
+    keywords: ["fridge not cold", "fridge warm", "refrigerator not cooling", "not cooling",
+               "fridge", "refrigerator", "freezer"],
+    likely: "A fridge that has gone warm while its light still works is more often airflow than a "
+      + "fault: the dial has been knocked, food is blocking the vents inside, or the door is not "
+      + "sealing.",
+    checks: [
+      { do: "Check the temperature dial is near the middle, and clear anything pressed against "
+          + "the vents at the back of the fridge and freezer.",
+        guide: "fridge-not-cooling",
+        means: "Blocked vents keep the cold in the freezer. It takes up to a day to settle after "
+          + "a change, so give it that before deciding." },
+      { do: "Shut the door on a sheet of paper and pull it out.",
+        means: "Slides out easily means the seal is not gripping there, and warm air is getting in." },
+    ],
+    boundary: "Don't pull the fridge out from the wall or unscrew any panels to reach the coils. "
+      + "Move food at risk to a cooler or a neighbour's fridge in the meantime.",
+    question: "Is the light on inside, and can you hear it running?",
+    priority: "high",
+  },
+  {
+    category: "plumbing",
+    keywords: ["shower", "shower head", "showerhead", "weak shower", "low pressure shower"],
+    likely: "A shower that has gone weak while the taps are fine is nearly always limescale in the "
+      + "shower head's nozzles.",
+    checks: [
+      { do: "Fill a plastic bag with white vinegar, tie it over the head so the nozzles sit in it, "
+          + "and leave it a few hours or overnight. Run the water to flush it.",
+        guide: "showerhead-soak",
+        means: "Flow back to normal means scale. No better afterwards means the restriction is in "
+          + "the valve, which is the landlord's." },
+    ],
+    question: "Is it only the shower, or are the bathroom taps weak too?",
+    priority: "low",
+  },
+  {
+    category: "structural",
+    keywords: ["window sticks", "window stuck", "sticking window", "window won't open",
+               "window hard to open", "cabinet", "drawer"],
+    likely: "A window that drags is usually dirt in the tracks; a cabinet door that sags is usually "
+      + "loose hinge screws. Neither needs parts.",
+    checks: [
+      { do: "Window: vacuum and wipe the tracks, then a little silicone spray (not oil, which "
+          + "gathers grit) along them.",
+        guide: "sticky-window",
+        means: "Slides again means it was grime. Still jammed with clean tracks usually means the "
+          + "frame has swollen or a balance has gone, which is the landlord's." },
+      { do: "Cabinet: tighten the hinge screws with a screwdriver — snug, not hard.",
+        means: "If the screws spin without tightening, the holes have torn out and it needs a repair." },
+    ],
+    boundary: "If window glass is cracked, don't force it — tape cardboard over it and report it.",
+    question: "Is it a window or a cabinet, and does it move at all?",
+    priority: "low",
   },
   {
     category: "appliance",
@@ -512,7 +680,8 @@ const PLAYBOOKS: Playbook[] = [
 const EMERGENCY = [
   { kw: ["gas", "smell gas", "propane"], why: "possible gas leak" },
   { kw: ["smoke", "fire", "burning smell", "sparks", "sparking"], why: "fire or electrical hazard" },
-  { kw: ["carbon monoxide", "co detector"], why: "possible carbon monoxide" },
+  { kw: ["co alarm", "co detector"], why: "possible carbon monoxide" },
+  { kw: ["carbon monoxide"], why: "possible carbon monoxide" },
   { kw: ["flood", "flooding", "burst", "gushing", "pouring", "water everywhere"], why: "active flooding" },
   { kw: ["sewage", "sewer backup", "raw sewage"], why: "sewage backup" },
   { kw: ["ceiling collapse", "collapsed", "falling"], why: "structural failure" },
@@ -525,6 +694,19 @@ const NO = ["no", "nope", "didn't work", "didnt work", "still", "not working", "
 const WANTS_HUMAN = ["someone", "come out", "send a", "plumber", "electrician", "technician", "landlord", "maintenance", "person", "repair guy", "just fix"];
 
 const norm = (s: string) => s.toLowerCase();
+
+/**
+ * A smoke alarm chirping for a battery is not a fire. Without this, "the smoke
+ * alarm keeps chirping" matched "smoke" and was handled as an emergency, and
+ * the tenant was never told the fix was a nine-volt. Mirrors the same
+ * exception in src/sla.ts. A carbon monoxide alarm gets no such exception.
+ */
+function emergencyText(text: string): string {
+  if (/\bchirp|\bbeep|\bbattery\b/.test(text) && !/\b(co|carbon monoxide)\b/.test(text)) {
+    return text.replace(/\bsmoke (alarm|detector)s?\b/g, "alarm");
+  }
+  return text;
+}
 
 /**
  * Whole-word match.
@@ -599,12 +781,16 @@ function issuePlaybook(issue: Issue): Playbook {
     category: issue.category,
     keywords: [],
     likely: "",
-    checks: issue.tips.map((t) => ({ do: t })),
+    checks: issue.tips.map((t) => ({ do: tipText(t), guide: tipGuide(t) ?? undefined })),
     question: issue.questions[0]
       ?? "Is there anything else worth knowing before this goes on the list?",
     priority: issue.priority,
   };
 }
+
+/** The catalogued guides for these checks, in order, skipping any not in the catalogue. */
+const guidesOf = (checks: Playbook["checks"]) =>
+  guidesFor(checks.map((c) => c.guide ?? "")).map((x) => x.id);
 
 /** Never more than this many basics asked in the chat; the form covers the rest. */
 const MAX_GAP_QUESTIONS = 2;
@@ -657,7 +843,7 @@ function triageWithRules(title: string, history: Message[], intake: Intake | nul
   // 1. Emergencies short-circuit everything.
   const emergency = issue?.urgent
     ? { why: issue.name.toLowerCase(), steps: issue.emergency?.steps ?? [] }
-    : EMERGENCY.find((e) => hits(all, e.kw));
+    : EMERGENCY.find((e) => hits(emergencyText(all), e.kw));
   if (emergency) {
     const steps = "steps" in emergency && emergency.steps.length
       ? emergency.steps.map((s, i) => `${i + 1}. ${s}`).join("\n")
@@ -677,7 +863,8 @@ function triageWithRules(title: string, history: Message[], intake: Intake | nul
       summary: `URGENT (${emergency.why}): ${
         intake && issue ? intakeSummary(intake, issue, [], tenantTurns, 0) : label
       }`,
-      engine: "rules",
+    guides: [],
+    engine: "rules",
     };
   }
 
@@ -703,7 +890,8 @@ function triageWithRules(title: string, history: Message[], intake: Intake | nul
       category,
       priority: book?.priority ?? "normal",
       summary: `${label} — resolved by tenant during triage`,
-      engine: "rules",
+    guides: [],
+    engine: "rules",
     };
   }
 
@@ -724,7 +912,8 @@ function triageWithRules(title: string, history: Message[], intake: Intake | nul
       category,
       priority: book?.priority ?? issue?.priority ?? "normal",
       summary: summarize(0),
-      engine: "rules",
+    guides: [],
+    engine: "rules",
     };
   }
   // How far into the troubleshooting we are, gap questions aside.
@@ -744,7 +933,8 @@ function triageWithRules(title: string, history: Message[], intake: Intake | nul
         category,
         priority: book.priority,
         summary: summarize(0),
-        engine: "rules",
+        guides: guidesOf(book.checks),
+    engine: "rules",
       };
     }
     // The basics are covered and there is nothing safe to try — straight on the list.
@@ -758,7 +948,8 @@ function triageWithRules(title: string, history: Message[], intake: Intake | nul
         category,
         priority: book?.priority ?? issue?.priority ?? "normal",
         summary: summarize(0),
-        engine: "rules",
+    guides: [],
+    engine: "rules",
       };
     }
     return {
@@ -771,7 +962,8 @@ function triageWithRules(title: string, history: Message[], intake: Intake | nul
       category,
       priority: "normal",
       summary: label,
-      engine: "rules",
+    guides: [],
+    engine: "rules",
     };
   }
 
@@ -791,7 +983,8 @@ function triageWithRules(title: string, history: Message[], intake: Intake | nul
       category,
       priority: book.priority,
       summary: summarize(1),
-      engine: "rules",
+      guides: guidesOf(book.checks.slice(1)),
+    engine: "rules",
     };
   }
 
@@ -814,6 +1007,7 @@ function triageWithRules(title: string, history: Message[], intake: Intake | nul
       : ruledOut > 0
         ? `${label} — tenant ruled out ${ruledOut} common cause${ruledOut === 1 ? "" : "s"}, still unresolved`
         : label,
+    guides: [],
     engine: "rules",
   };
 }

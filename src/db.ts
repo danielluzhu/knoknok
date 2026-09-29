@@ -229,6 +229,10 @@ CREATE TABLE IF NOT EXISTS messages (
   author     TEXT NOT NULL CHECK (author IN ('tenant','bot','landlord','vendor','system')),
   user_id    INTEGER REFERENCES users(id),
   body       TEXT NOT NULL,
+  -- How-to guides the assistant attached to this reply: a JSON array of ids from
+  -- the vetted catalogue in src/guides.ts. Ids rather than links, so a guide
+  -- whose page moves is fixed in one place and every old message follows.
+  guide_ids  TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -582,6 +586,10 @@ async function evolve(): Promise<void> {
     });
   }
 
+  if (!(await tableColumns("messages")).has("guide_ids")) {
+    await client().execute("ALTER TABLE messages ADD COLUMN guide_ids TEXT");
+  }
+
   // Contact details, for notifications and password resets.
   const people = await tableColumns("users");
   if (!people.has("email")) await client().execute("ALTER TABLE users ADD COLUMN email TEXT");
@@ -843,6 +851,10 @@ export interface Message {
   author_name?: string | null;
   /** Attached photos, as ids the client fetches separately. Never the bytes. */
   photos?: { id: number; mime: string }[];
+  /** Stored JSON of guide ids; expanded into `guides` on the way out. */
+  guide_ids?: string | null;
+  /** How-to links the assistant attached, looked up from the catalogue. */
+  guides?: { id: string; title: string; source: string; url: string }[];
 }
 
 export interface Attachment {

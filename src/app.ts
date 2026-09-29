@@ -27,6 +27,7 @@ import {
   type ChatMessage, type Message, type RecurringTask, type Ticket, type User,
 } from "./db";
 import { triage, usingClaude } from "./bot";
+import { guidesFor } from "./guides";
 import {
   channels, notifyTicket, notifyUser, parseEmail, parsePhone, recentNotifications,
   rememberOrigin, appUrl, configuredAppUrl, type Party,
@@ -729,10 +730,12 @@ async function addMessage(
   body: string,
   userId: number | null = null,
   photos: { mime: string; bytes: Buffer }[] = [],
+  guides: string[] = [],
 ) {
   const message = (await db.get<{ id: number }>(
-    "INSERT INTO messages (ticket_id, author, user_id, body) VALUES (?, ?, ?, ?) RETURNING id",
-    [ticketId, author, userId, body.trim()],
+    `INSERT INTO messages (ticket_id, author, user_id, body, guide_ids)
+     VALUES (?, ?, ?, ?, ?) RETURNING id`,
+    [ticketId, author, userId, body.trim(), guides.length ? JSON.stringify(guides) : null],
   ))!;
   for (const photo of photos) {
     await db.run(
@@ -756,6 +759,13 @@ async function ticketMessages(ticketId: number): Promise<Message[]> {
   for (const m of messages) {
     const mine = photos.get(m.id);
     if (mine) m.photos = mine;
+    if (m.guide_ids) {
+      try {
+        const found = guidesFor(JSON.parse(m.guide_ids) as string[]);
+        if (found.length) m.guides = found;
+      } catch { /* a malformed list is just no links */ }
+    }
+    delete m.guide_ids;
   }
   return messages;
 }
@@ -1000,7 +1010,7 @@ async function runTriage(ticket: Ticket) {
   const history = await ticketMessages(ticket.id);
   const result = await triage(ticket.title, history, storedIntake(ticket));
 
-  await addMessage(ticket.id, "bot", result.reply);
+  await addMessage(ticket.id, "bot", result.reply, null, [], result.guides);
 
   if (result.action === "escalate") {
     await db.run(

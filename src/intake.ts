@@ -17,6 +17,17 @@ import type { Category } from "./bot";
 import type { Priority } from "./db";
 import { inHeatingSeason } from "./sla";
 import { ENTRY_LABEL, ENTRY_OPTIONS, parseEntry, type Entry } from "./workorder";
+import type { GuideId } from "./guides";
+
+/**
+ * Something the tenant can safely try. A plain string, or the same with the
+ * guide that walks through it. What counts as safe is TENANT_FIX_RULE in
+ * src/guides.ts.
+ */
+export type Tip = string | { text: string; guide: GuideId };
+
+export const tipText = (t: Tip) => (typeof t === "string" ? t : t.text);
+export const tipGuide = (t: Tip): GuideId | null => (typeof t === "string" ? null : t.guide);
 
 export interface Issue {
   id: string;
@@ -44,7 +55,7 @@ export interface Issue {
   /** Issue-specific follow-ups, asked after the four basics are covered. */
   questions: string[];
   /** Safe things the tenant can try themselves. Empty means it needs a person. */
-  tips: string[];
+  tips: Tip[];
 }
 
 export interface IssueGroup {
@@ -95,7 +106,8 @@ export const INTAKE: IssueGroup[] = [
         "Are the other drains in the unit draining normally?",
       ],
       tips: [
-        "Try a plunger with an inch of standing water so the cup seals. A cup plunger works best on sinks and tubs.",
+        { text: "Try a plunger with an inch of standing water so the cup seals. A cup plunger works best on sinks and tubs.", guide: "plunge-sink" },
+        { text: "Sink only: put a bucket under the U-shaped pipe and undo its two slip nuts by hand. They should turn without tools — if they won't, stop there, because old fittings crack.", guide: "clean-p-trap" },
         "Skip chemical drain cleaners. They damage pipes and make the plumber's job unsafe.",
       ] },
     { id: "toilet", name: "Toilet problem", eg: "Won't flush, runs constantly, overflows",
@@ -106,7 +118,8 @@ export const INTAKE: IssueGroup[] = [
       ],
       tips: [
         "If it's overflowing, turn the valve behind the toilet clockwise to shut off the water right away.",
-        "For a weak flush, plunge with a flange plunger. For constant running, lift the tank lid and check that the flapper is seated flat.",
+        { text: "For a weak flush or a clog, plunge with a flange plunger — the kind with a rubber sleeve that fits into the bowl.", guide: "plunge-toilet" },
+        { text: "For constant running, lift the tank lid and check that the flapper at the bottom sits flat, with a little slack in its chain.", guide: "toilet-flapper" },
       ] },
     { id: "nohot", name: "No hot water", eg: "Cold or lukewarm at every tap",
       category: "plumbing", priority: "high", whenMatters: true,
@@ -135,7 +148,8 @@ export const INTAKE: IssueGroup[] = [
         "Hot, cold, or both?",
       ],
       tips: [
-        "For one faucet, unscrew the aerator at the tip and rinse out the grit.",
+        { text: "For one faucet, unscrew the aerator at the tip and rinse out the grit.", guide: "clean-aerator" },
+        { text: "For a weak shower, fill a plastic bag with white vinegar, tie it over the shower head so the nozzles sit in it, and leave it a few hours. Run the water to flush it.", guide: "showerhead-soak" },
         "If it's the whole unit, check whether a neighbour has the same issue. It may be a building shut-off.",
       ] },
     { id: "flood", name: "Flooding or burst pipe", eg: "Water you can't stop",
@@ -156,8 +170,8 @@ export const INTAKE: IssueGroup[] = [
         "Did something trip when you plugged in a hair dryer, space heater, or similar?",
       ],
       tips: [
-        "Kitchen, bathroom, and outdoor outlets are usually on a GFCI. Find the outlet with RESET and TEST buttons nearby and press RESET firmly.",
-        "Open the breaker panel and look for a switch sitting between ON and OFF. Push it fully OFF, then back ON.",
+        { text: "Kitchen, bathroom, and outdoor outlets are usually on a GFCI. Find the outlet with RESET and TEST buttons nearby and press RESET firmly.", guide: "gfci-reset" },
+        { text: "Open the breaker panel door (never the cover behind it) and look for a switch sitting between ON and OFF. Push it fully OFF, then back ON.", guide: "breaker-reset" },
       ] },
     { id: "breaker", name: "Breaker keeps tripping", eg: "Resets, then trips again",
       category: "electrical", priority: "high", whenMatters: true,
@@ -166,7 +180,7 @@ export const INTAKE: IssueGroup[] = [
         "Does it trip immediately after you reset it, even with everything unplugged?",
       ],
       tips: [
-        "Unplug everything on that circuit, reset the breaker once, then plug things back in one at a time to find the load that trips it.",
+        { text: "Unplug everything on that circuit, reset the breaker once, then plug things back in one at a time to find the load that trips it.", guide: "breaker-reset" },
         "If it trips with nothing plugged in, leave it off and report it. Don't keep resetting it.",
       ] },
     { id: "lights", name: "Lights flickering or out", eg: "One fixture or several",
@@ -222,8 +236,9 @@ export const INTAKE: IssueGroup[] = [
       ],
       tips: [
         "Set the thermostat to HEAT and at least 5 degrees above the current room temperature, then wait 10 minutes.",
-        "If the display is blank, replace the thermostat batteries. Most take two AA.",
+        { text: "If the display is blank, replace the thermostat batteries. Most take two AA.", guide: "thermostat-batteries" },
         "Check the furnace breaker in the panel. It's often labelled FURNACE or AIR HANDLER.",
+        { text: "If you can reach the air filter without opening the furnace (usually a slot beside it, or a grille in a wall or ceiling), check whether it's grey and clogged. A clogged filter can make the system shut itself off.", guide: "hvac-filter" },
       ] },
     { id: "noac", name: "No cooling", eg: "AC blows warm or not at all",
       category: "hvac", priority: "high", whenMatters: true,
@@ -233,14 +248,14 @@ export const INTAKE: IssueGroup[] = [
       ],
       tips: [
         "Set the thermostat to COOL and at least 5 degrees below the room temperature.",
-        "A clogged filter can freeze the coil. If you can see the filter, check whether it's grey with dust.",
+        { text: "A clogged filter can freeze the coil. If you can see the filter, check whether it's grey with dust.", guide: "hvac-filter" },
         "Check the AC or CONDENSER breaker in the panel.",
       ] },
     { id: "thermostat", name: "Thermostat blank or unresponsive", eg: "Screen off, buttons do nothing",
       category: "hvac", priority: "normal", whenMatters: false,
       questions: ["Is the screen completely blank, or on but not responding?"],
       tips: [
-        "Pull the thermostat off its base and replace the batteries. Most use two AA.",
+        { text: "Pull the thermostat off its base and replace the batteries. Most use two AA.", guide: "thermostat-batteries" },
         "If there are no batteries, check the FURNACE or AIR HANDLER breaker. The thermostat is powered from there.",
       ] },
     { id: "noise", name: "Noise or smell from vents", eg: "Banging, rattling, musty or burning",
@@ -271,9 +286,9 @@ export const INTAKE: IssueGroup[] = [
         "Is the light on inside when you open the door?",
       ],
       tips: [
-        "Check the temperature dial. It should be near the middle setting.",
+        { text: "Check the temperature dial. It should be near the middle setting, and it takes a full day to settle after a change.", guide: "fridge-not-cooling" },
         "Make sure the plug is seated and the outlet works. Try a lamp in it.",
-        "Clear items away from the vents at the back inside, and check the door seal closes fully.",
+        "Clear items away from the vents at the back inside, and check the door seal closes fully — a sheet of paper shut in the door should be hard to pull out.",
       ] },
     { id: "stove", name: "Stove or oven", eg: "Burner, oven, igniter",
       category: "appliance", priority: "high", whenMatters: false,
@@ -293,7 +308,7 @@ export const INTAKE: IssueGroup[] = [
       ],
       tips: [
         "Run the garbage disposal first. The dishwasher drains through it.",
-        "Pull out the bottom rack and clean the filter at the base of the tub.",
+        { text: "Pull out the bottom rack and clean the filter at the base of the tub.", guide: "dishwasher-filter" },
       ] },
     { id: "laundry", name: "Washer or dryer", eg: "Won't start, drain, spin, or heat",
       category: "appliance", priority: "normal", whenMatters: false,
@@ -302,7 +317,9 @@ export const INTAKE: IssueGroup[] = [
         "Any error code on the display?",
       ],
       tips: [
-        "Dryer not heating: clean the lint trap and check the DRYER breaker, which is a double-wide one.",
+        { text: "Dryer not drying: clean the lint screen, and check the flexible vent hose behind the dryer isn't crushed or kinked. A blocked vent is slow drying and a fire risk.", guide: "dryer-lint" },
+        "Dryer not heating at all: check the DRYER breaker, which is a double-wide one.",
+        { text: "Washer won't start: make sure the lid or door is pushed fully shut until it clicks, and that a child lock or delay-start isn't on (the manual or a symbol on the panel shows which).", guide: "washer-wont-start" },
         "Washer not spinning: the load may be unbalanced. Redistribute it and restart.",
       ] },
     { id: "disposal", name: "Garbage disposal", eg: "Hums, jammed, dead",
@@ -312,7 +329,7 @@ export const INTAKE: IssueGroup[] = [
         "Did something hard go down it, like a bone, a spoon, or a bottle cap?",
       ],
       tips: [
-        "Silent: press the red RESET button on the bottom of the disposal under the sink.",
+        { text: "Silent: press the red RESET button on the bottom of the disposal under the sink.", guide: "disposal-reset" },
         "Humming: it's jammed. Turn it off, never put your hand in, and turn the hex socket on the bottom with an allen key to free it.",
       ] },
     { id: "otherappl", name: "Microwave or other appliance", eg: "Anything else that came with the unit",
@@ -350,12 +367,21 @@ export const INTAKE: IssueGroup[] = [
       category: "locks_security", priority: "normal", whenMatters: false,
       questions: ["Does it rub at the top, bottom, or side?"],
       tips: ["Tighten the hinge screws. A sagging door is often just a loose top hinge."] },
+    { id: "cabinet", name: "Cabinet door or drawer loose", eg: "Sagging, won't close, fell off its runner",
+      category: "structural", priority: "low", whenMatters: false,
+      questions: ["Is the hinge or runner broken, or just loose?"],
+      tips: [
+        "A sagging cabinet door is almost always loose hinge screws. Tighten them with a screwdriver — snug, not hard, or they strip the wood.",
+        "A drawer off its runner: pull it fully out, line the wheels up with the track, and push it back in level.",
+        "If a hinge or runner is cracked or the screw holes have torn out, leave it — that's a replacement part.",
+      ] },
     { id: "window", name: "Window won't open, close, or is broken", eg: "Stuck, cracked, or off track",
       category: "structural", priority: "normal", whenMatters: false,
       questions: ["Is the glass cracked or broken?", "Is it stuck, or does it fall down when you open it?"],
       tips: [
         "If glass is broken, tape cardboard over it from the inside and keep pets and kids away.",
         "For a stuck window, check the locks are open on both sides before pushing.",
+        { text: "For a window that sticks or drags, vacuum and wipe the tracks, then a little silicone spray (not oil, which gathers grit) helps it slide.", guide: "sticky-window" },
       ] },
     { id: "screen", name: "Screen torn or missing", eg: "Window or patio screen",
       category: "structural", priority: "low", whenMatters: false,
@@ -433,13 +459,23 @@ export const INTAKE: IssueGroup[] = [
       tips: ["Cover a lifted edge with a mat so no one trips on it."] },
   ]},
   { id: "other", name: "Something else", eg: "Detectors, common areas, anything unlisted", issues: [
-    { id: "detector", name: "Smoke or CO detector beeping", eg: "Chirping or alarming",
+    { id: "detector", name: "Smoke alarm chirping or beeping", eg: "A chirp every minute, or a false alarm",
       category: "other", priority: "high", whenMatters: false,
       questions: ["A chirp every 30 to 60 seconds, or a continuous alarm?"],
       tips: [
-        "A single chirp every minute is a low battery. Twist the detector off its base and replace the 9V or AA battery.",
-        "A continuous alarm with no smoke: press and hold the TEST button to silence it, then open windows. If it keeps alarming, leave and call the emergency line.",
+        { text: "A single chirp every minute is a low battery. Twist the alarm off its base and swap the 9V or AA battery. If it's wired in and the battery is behind wires you'd have to unplug, or it says 10-year sealed battery on the back, leave it — that's the landlord's.", guide: "smoke-alarm-chirp" },
+        "A continuous alarm after cooking or a steamy shower, with no smoke or fire anywhere: open a window, fan the air near the alarm, and press its hush button. If there is any smoke you can't account for, leave.",
+        { text: "If the alarm is labelled CO or carbon monoxide — including a combined smoke and CO alarm — do not silence it. Get outside and report it as a carbon monoxide alarm instead.", guide: "co-alarm" },
       ] },
+    { id: "coalarm", name: "Carbon monoxide alarm going off", eg: "A CO or combined smoke/CO alarm sounding",
+      category: "hvac", priority: "urgent", urgent: true, statutory: true, whenMatters: false,
+      emergency: { title: "Get everyone outside now", steps: [
+        "Carbon monoxide has no smell. Don't wait for symptoms, and don't stop to find the source or silence the alarm.",
+        "Get everyone, including pets, out into fresh air. Leave the door open behind you if it's on your way.",
+        `From outside, call 911 or the fire department, even if nobody feels ill. Then: ${EMERGENCY_CONTACT}`,
+      ] },
+      questions: ["Is everyone out of the unit?", "Does anyone have a headache, dizziness, or nausea?"],
+      tips: [] },
     { id: "common", name: "Common area or building exterior", eg: "Hallway, laundry room, lobby, stairs",
       category: "common_area", priority: "normal", whenMatters: false,
       questions: ["Is it blocking access to anything, or a fire route?"],
@@ -642,7 +678,7 @@ export function intakeForClient() {
       issues: g.issues.map((i) => ({
         id: i.id, name: i.name, eg: i.eg, category: i.category,
         urgent: Boolean(i.urgent), emergency: emergencyFor(i),
-        whenMatters: i.whenMatters, tips: i.tips,
+        whenMatters: i.whenMatters, tips: i.tips.map(tipText),
       })),
     })),
     rooms: ROOMS,

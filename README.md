@@ -241,6 +241,25 @@ behind that single interface:
   cases (GFCI resets, disposal reset buttons, thermostat batteries, P-traps, aerators,
   appliance power-cycles) when it did not, plus emergency detection either way.
 
+**What a tenant is asked to fix.** How easy a DIY site rates a job is not the test.
+Home Depot rates swapping a faucet or a light switch as beginner-level, and it is still not a
+tenant's job: the fixtures are the landlord's, and a repair that goes wrong comes out of the
+tenant's deposit. The rule, in `src/guides.ts` and given to both engines, is that a tenant may be
+walked through:
+
+- resetting, cleaning, clearing or adjusting something, or swapping a battery, bulb or air filter;
+- using only tools a renter owns (hands, a bucket, a plunger, a screwdriver, vinegar);
+- nothing behind a cover over live parts, gas or a heating element;
+- nothing where a mistake makes things worse.
+
+A test checks that no suggested fix tells a tenant to replace, install or rewire anything.
+
+**How-to links.** Where a fix has a good walkthrough, the assistant's message carries a link to
+it, shown as a card under the reply. The links come only from a catalogue in `src/guides.ts`, and
+each one was opened and checked to cover the step being suggested. Claude picks guide ids from
+that list and never writes a URL. Messages store ids, not links, so fixing a guide that moves
+fixes it in every old thread too.
+
 The fallback isn't only for missing keys: any API error, or a refusal, drops through to the
 rules engine, so a request is never lost because the model was unreachable. The badge in the
 top bar shows which engine is answering.
