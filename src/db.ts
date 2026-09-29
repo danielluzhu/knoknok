@@ -90,6 +90,12 @@ CREATE TABLE IF NOT EXISTS users (
   -- A landlord's portfolio-wide vendor invite: one code that covers everything
   -- they own, now and later. Null for everyone else.
   vendor_code   TEXT,
+  -- How to reach someone when they are not looking at the app. Both optional:
+  -- nothing about using knoknok requires handing over either. Email carries
+  -- updates and password-reset links; a phone number only ever gets a text for
+  -- an emergency. Not unique — a couple sharing one inbox is two accounts.
+  email         TEXT,
+  phone         TEXT,
   created_at    TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -153,6 +159,10 @@ CREATE TABLE IF NOT EXISTS tickets (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   property_id INTEGER NOT NULL REFERENCES properties(id),
   tenant_id   INTEGER REFERENCES users(id),
+  -- The unit this was about, copied when it was raised. The tenant's own unit
+  -- is where they live now; this is where the leak was. They stop being the
+  -- same thing the day somebody moves out.
+  unit        TEXT,
   created_by  INTEGER NOT NULL REFERENCES users(id),
   title       TEXT NOT NULL,
   summary     TEXT NOT NULL DEFAULT '',
@@ -295,6 +305,42 @@ CREATE TABLE IF NOT EXISTS chat_reads (
   PRIMARY KEY (tenant_id, user_id)
 );
 
+-- Everything anyone was told outside the app, one row per person per event,
+-- whether or not it reached them. email_status / sms_status are null when that
+-- channel was not attempted (no address on file, or not urgent enough for a
+-- text), 'logged' when no provider is configured and it went to the server log
+-- instead, and otherwise 'sent' or 'failed'. The body never holds a reset token.
+CREATE TABLE IF NOT EXISTS notifications (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id      INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  ticket_id    INTEGER REFERENCES tickets(id) ON DELETE CASCADE,
+  kind         TEXT NOT NULL,
+  subject      TEXT NOT NULL,
+  body         TEXT NOT NULL,
+  email_status TEXT,
+  sms_status   TEXT,
+  created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- One-time ways back into an account whose password is forgotten. Two kinds:
+--   link   emailed to the account's own address; long, expires in an hour
+--   code   issued by the landlord to one of their tenants who has no email on
+--          file; short enough to read out, expires in a day, and only good
+--          together with the username it was issued for
+-- Only a hash of the secret is kept, so a copy of this table opens nothing.
+CREATE TABLE IF NOT EXISTS password_resets (
+  token_hash TEXT PRIMARY KEY,
+  user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  kind       TEXT NOT NULL CHECK (kind IN ('link','code')),
+  issued_by  INTEGER REFERENCES users(id),
+  expires_at TEXT NOT NULL,
+  used_at    TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, id);
+CREATE INDEX IF NOT EXISTS idx_notifications_recent ON notifications(user_id, kind, ticket_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_password_resets_user ON password_resets(user_id);
 CREATE INDEX IF NOT EXISTS idx_chat_conversation ON chat_messages(tenant_id, id);
 CREATE INDEX IF NOT EXISTS idx_property_vendors_vendor ON property_vendors(vendor_id);
 CREATE INDEX IF NOT EXISTS idx_landlord_vendors_vendor ON landlord_vendors(vendor_id);
@@ -536,6 +582,22 @@ async function evolve(): Promise<void> {
     });
   }
 
+  // Contact details, for notifications and password resets.
+  const people = await tableColumns("users");
+  if (!people.has("email")) await client().execute("ALTER TABLE users ADD COLUMN email TEXT");
+  if (!people.has("phone")) await client().execute("ALTER TABLE users ADD COLUMN phone TEXT");
+
+  // The unit a request was about, frozen at the time. Requests raised before
+  // this column existed take the tenant's unit now, which for anyone still in
+  // residence is the same answer.
+  if (!(await tableColumns("tickets")).has("unit")) {
+    await client().execute("ALTER TABLE tickets ADD COLUMN unit TEXT");
+    await client().execute(
+      `UPDATE tickets SET unit = (SELECT u.unit FROM users u WHERE u.id = tickets.tenant_id)
+        WHERE unit IS NULL AND tenant_id IS NOT NULL`,
+    );
+  }
+
   // Last, because these index columns only exist once the steps above have run.
   await client().execute(
     "CREATE INDEX IF NOT EXISTS idx_properties_landlord ON properties(landlord_id)",
@@ -681,6 +743,8 @@ export interface User {
   /** A landlord's portfolio-wide vendor invite. Null for other roles. */
   vendor_code?: string | null;
   unit: string | null;
+  email: string | null;
+  phone: string | null;
   created_at: string;
 }
 
@@ -690,6 +754,8 @@ export interface Ticket {
   id: number;
   property_id: number;
   tenant_id: number | null;
+  /** The unit this was about, as it was when raised. */
+  unit: string | null;
   created_by: number;
   title: string;
   summary: string;

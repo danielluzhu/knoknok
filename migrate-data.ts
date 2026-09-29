@@ -32,6 +32,7 @@ const TABLES = [
   "users",
   "landlord_vendors",
   "property_vendors",
+  "preferred_vendors",
   "recurring_tasks",
   "tickets",
   "messages",
@@ -41,6 +42,8 @@ const TABLES = [
   "chat_reads",
   "sessions",
   "login_attempts",
+  "notifications",
+  "password_resets",
 ];
 
 async function rows(client: ReturnType<typeof createClient>, table: string) {

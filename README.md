@@ -14,7 +14,7 @@ and deploys to Vercel against Turso, with the same code and the same SQL.
 bun install
 bun run seed     # optional demo data
 bun start        # http://localhost:4321
-bun test         # end-to-end API suite (33 tests, throwaway database)
+bun test         # end-to-end API suite (throwaway database)
 ```
 
 `PORT` and `DB_PATH` are configurable via environment variables; see `.env.example` for the
@@ -98,6 +98,56 @@ it back with the bot; reopening anything else puts it back on the landlord's lis
 insurance") or raised with a specific tenant ("engineer needs access Thursday"). A raised one
 appears in that tenant's list marked *from landlord*, and the two of them talk it through in
 the same thread — no triage, since the landlord already knows what it is.
+
+**Telling people.** Everyone can add an email address and a mobile number under **Account**;
+both are optional. Things that need someone to act reach them outside the app
+(`src/notify.ts`):
+
+| Who | Hears about |
+| --- | ----------- |
+| Landlord | a tenant's new request; anything waiting on their approval, including an invoice over the cap; work marked done |
+| Vendor | a job sent or assigned to them; approval to go ahead; being removed from a landlord's network |
+| Tenant | a visit booked or cancelled; work done, with a request to confirm or say what's still wrong; a recharge; a declined repair; their tenancy ending |
+| Anyone on a thread | replies from the others — once per half hour of back-and-forth, not once per message |
+
+Nobody is told about their own actions. Parties are checked against the access they have
+*now*, so a tenant who has moved out or a vendor who has been dropped hears nothing more.
+Email carries everything; **a text is sent only for an emergency**, because a phone that buzzes for
+every reply gets muted before the gas leak. Every message links straight to its thread.
+
+Email goes through Resend (`RESEND_API_KEY`) and texts through Twilio (`TWILIO_*`). Without
+them, notifications are written to the server log instead, which is how a reset link reaches
+you when you run the app locally. Either way each one is recorded against the person it was
+for, with whether it was sent, logged, or failed. The **Account** screen lists them as *What
+you've been sent*. Delivery never fails the request that caused it.
+
+**Getting back in.** Two routes, because not every tenant has an email on file:
+
+- **A link by email.** *Forgot your password?* on the sign-in page takes a username or an
+  email address and sends a one-hour, single-use link to the account's own address. The
+  answer is the same whether or not the account exists.
+- **A code from the landlord.** For a tenant with no email, the landlord presses **Reset
+  code** beside their name and reads out a code like `K7QM-4PZX`. It works once, for 24 hours,
+  and only together with the tenant's username. Guesses are throttled like sign-in attempts,
+  and issuing a new code cancels the old one. Vendors can't be reset this way: they work for
+  other landlords too, and no single one of them should be able to take over the account.
+
+Only a hash of each link or code is stored. Using one signs the account out everywhere else
+and sends a "your password was changed" email to the address on file.
+
+**Moving out, and dropping a vendor.** The landlord's sidebar lists tenants and vendors, each
+with its own action:
+
+- **End tenancy** removes the tenant's access to the property at once: its requests, its
+  messages, its photos. Their open requests stay on the landlord's list, because the leak
+  is still a leak. Anything still in private triage is closed. Every request keeps the
+  **unit** it was raised for, so the history belongs to the flat, not to whoever lived there.
+  The account survives, and they can join their next building with its code.
+- **Remove** drops a vendor from everything the landlord owns. Their open jobs go back to the
+  pool, or straight to the next first-choice vendor. Their first-choice slots and recurring
+  assignments are cleared. Finished work keeps their name.
+- **New code** replaces a tenant, vendor, or portfolio invite code. Nobody already in loses
+  access. Anyone who has the old code and hasn't used it will need the new one.
 
 **Re-filing.** The bot's category and priority are a starting point, not a verdict. The
 landlord can change either from the task header, and the change is written into the thread
@@ -215,6 +265,7 @@ src/bot.ts         triage — Claude and the rule-based fallback
 src/intake.ts      the new-request decision tree, and the four basics it collects
 src/workorder.ts   trade, spend cap, approval, access and billing — the rules, kept pure
 src/sla.ts         response-time targets, and what counts as a statutory emergency
+src/notify.ts      email and text notifications, and the record of what was sent
 public/            the whole front end (index.html, app.js, styles.css)
 seed.ts            demo property, users, and tickets
 test/api.test.ts   end-to-end HTTP tests
@@ -249,6 +300,15 @@ All routes are JSON and cookie-authenticated.
 | POST | `/api/chats/:tenantId/messages` | send a direct message |
 | GET | `/api/property` | landlord only — join code, tenants, counts |
 | POST | `/api/password` | change password; signs out every other session |
+| POST | `/api/password/forgot` | signed out — `{login}` (username or email); emails a reset link if there is an address |
+| POST | `/api/password/reset` | signed out — `{token, username?, newPassword}`; a link token, or a landlord's code plus username. Signs in |
+| POST | `/api/account` | your own `{email?, phone?}`; empty clears |
+| GET | `/api/notifications` | what you have been sent, and whether it went |
+| POST | `/api/tenants/:id/reset-code` | landlord only — a one-time code for one of their tenants |
+| POST | `/api/tenants/:id/remove` | landlord only — end a tenancy, `{note?}` |
+| POST | `/api/vendors/:id/remove` | landlord only — drop a vendor from every property they own |
+| POST | `/api/codes` | landlord only — `{kind: tenant \| vendor \| portfolio, propertyId?}` issues a new invite code |
+| POST | `/api/properties/join` | vendor `{vendorCode}`, or a tenant with no property `{joinCode, unit}` |
 
 Tenants can only reach their own tickets; landlords are scoped to their own property. Both
 are enforced server-side on every request, not just hidden in the UI.
@@ -262,7 +322,10 @@ Changing a password invalidates every other session for that account.
 same way the browser does — signup and join codes, all three triage outcomes, escalation,
 closing and reopening, re-filing, tenant-targeted to-dos, unread tracking, direct messaging
 and who is allowed to message whom, password change and session invalidation, throttling,
-cross-property isolation, and static path traversal.
+cross-property isolation, and static path traversal. It also covers who gets notified of what
+(and who doesn't), both reset routes end to end, ending a tenancy, removing a vendor, and
+replacing invite codes. The emailed-link test reads the link from the server's log, so it is
+skipped when `TEST_BASE_URL` points at a remote server.
 
 Point the same suite at any other running copy — a Vercel preview deployment, say — with:
 
@@ -297,6 +360,11 @@ vercel link
 vercel env add TURSO_DATABASE_URL      # paste the libsql:// URL
 vercel env add TURSO_AUTH_TOKEN        # paste the token
 vercel env add ANTHROPIC_API_KEY       # optional — triage falls back to rules without it
+vercel env add APP_URL                 # the front end's public URL, for links in emails
+vercel env add RESEND_API_KEY          # optional — email notifications and reset links
+vercel env add NOTIFY_FROM             # e.g. "knoknok <notifications@your-domain.com>"
+vercel env add TWILIO_ACCOUNT_SID      # optional, with TWILIO_AUTH_TOKEN and TWILIO_FROM —
+                                       # texts for emergencies
 vercel deploy --prod
 ```
 
@@ -389,9 +457,16 @@ an account made on one works on the other.
 
 - The thread polls every 15 seconds rather than using websockets. On Vercel that is a
   function invocation per poll per open tab, which is the main thing to watch on cost.
-- No password reset, email, or push notifications.
-- One property per user.
-- No photo attachments on requests — often the fastest way to describe a leak.
+- Notifications are email and text only; there are no push notifications to a phone app.
+  They are sent inside the request that caused them, with a 5-second timeout per provider,
+  rather than from a queue, so a slow provider slows that one request.
+- The Resend and Twilio integrations are written against their documented APIs but have not
+  been run against live accounts. Without keys, everything goes to the log.
+- Without `APP_URL`, links in emails are built from the address requests arrive on. That is
+  fine on Vercel, but set `APP_URL` anywhere the Host header can't be trusted, and always for
+  a GitHub Pages front end.
+- A former tenant's direct-message conversation leaves the landlord's list along with them.
+  It is kept in the database, but no screen shows it.
 - The Claude triage path is written and type-checked against the SDK but has not been run
   against the live API; without a key the rule-based engine handles everything.
 - Triage runs inside the request, so a slow model response counts against the function

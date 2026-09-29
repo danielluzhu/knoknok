@@ -578,6 +578,7 @@ function setAuthMode(mode) {
   $("#signupOnly").classList.toggle("hidden", mode === "login");
   $("#authSubmit").textContent = mode === "login" ? "Sign in" : "Create account";
   $("#authError").classList.add("hidden");
+  $("#forgotRow").classList.toggle("hidden", mode !== "login");
   $("#authForm").password.autocomplete = mode === "login" ? "current-password" : "new-password";
 }
 
@@ -622,7 +623,142 @@ function wireAuth() {
   });
 }
 
+/* ---------------------------------------------------------- password reset */
+
+/**
+ * A reset link arrives as #reset=<token>. It is held here and wiped from the
+ * address bar straight away, so it does not sit in history or end up in a
+ * screenshot someone shares.
+ */
+let resetToken = null;
+
+function showReset(show, token = null) {
+  resetToken = token;
+  $("#authForm").classList.toggle("hidden", show);
+  $("#authTabs").classList.toggle("hidden", show);
+  $("#resetPane").classList.toggle("hidden", !show);
+  if (!show) return;
+
+  const fromLink = Boolean(token);
+  $("#resetTitle").textContent = fromLink ? "Choose a new password" : "Reset your password";
+  $("#forgotForm").classList.toggle("hidden", fromLink);
+  $("#codeFields").classList.toggle("hidden", fromLink);
+  // With both routes on screen, the emailed link is the main one; the code is
+  // the fallback and should look like it.
+  $("#resetSubmit").className = fromLink ? "primary block" : "ghost block";
+  $("#resetLede").textContent = fromLink
+    ? "The link works once. Choosing a password here signs you out everywhere else."
+    : "No email on your account? Ask your landlord for a reset code, then enter it here.";
+  for (const id of ["#forgotMsg", "#forgotError", "#resetError"]) $(id).classList.add("hidden");
+  $("#forgotForm").reset();
+  $("#resetForm").reset();
+  (fromLink ? $("#resetForm").newPassword : $("#forgotForm").login).focus();
+}
+
+function wireReset() {
+  $("#forgotBtn").addEventListener("click", () => {
+    const typed = $("#authForm").username.value.trim();
+    showReset(true);
+    // Whatever they already typed as a username is the likeliest answer to both.
+    $("#forgotForm").login.value = typed;
+    $("#resetForm").username.value = typed;
+  });
+  $("#resetBack").addEventListener("click", () => showReset(false));
+
+  $("#forgotForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const msg = $("#forgotMsg");
+    const err = $("#forgotError");
+    msg.classList.add("hidden");
+    err.classList.add("hidden");
+    $("#forgotSubmit").disabled = true;
+    try {
+      const { message } = await api("/api/password/forgot", {
+        method: "POST", body: { login: e.target.login.value.trim() },
+      });
+      msg.textContent = message;
+      msg.classList.remove("hidden");
+    } catch (ex) {
+      err.textContent = ex.message;
+      err.classList.remove("hidden");
+    } finally {
+      $("#forgotSubmit").disabled = false;
+    }
+  });
+
+  $("#resetForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const f = e.target;
+    const err = $("#resetError");
+    err.classList.add("hidden");
+    $("#resetSubmit").disabled = true;
+    try {
+      const { user, token } = await api("/api/password/reset", {
+        method: "POST",
+        body: resetToken
+          ? { token: resetToken, newPassword: f.newPassword.value }
+          : { token: f.token.value, username: f.username.value.trim(), newPassword: f.newPassword.value },
+      });
+      setToken(token);
+      state.me = user;
+      showReset(false);
+      enterApp();
+    } catch (ex) {
+      err.textContent = ex.message;
+      err.classList.remove("hidden");
+    } finally {
+      $("#resetSubmit").disabled = false;
+    }
+  });
+}
+
+/** Take a `#name=value` fragment off the address bar, returning the value. */
+function takeHash(name) {
+  const m = new RegExp(`^#${name}=([^&]+)$`).exec(location.hash);
+  if (!m) return null;
+  history.replaceState(null, "", location.pathname + location.search);
+  return decodeURIComponent(m[1]);
+}
+
 /* --------------------------------------------------------------- app view */
+
+/** A tenant whose landlord has ended their tenancy: signed in, but nowhere. */
+const noTenancy = () => state.me?.role === "tenant" && !state.me.property;
+
+function renderNoTenancy() {
+  $(".sidebar-head").classList.add("hidden");
+  $("#list").innerHTML = '<div class="empty">You\'re not on a property right now.</div>';
+  $("#detail").innerHTML = `<div class="placeholder"><div>
+    <p class="mark" aria-hidden="true">🔑</p>
+    <p>Your tenancy has ended, so your old building's requests and messages are no longer in
+      your account.</p>
+    <p>Moved somewhere else that uses knoknok? Enter its property code and your unit.</p>
+    <form id="rejoinForm" class="rejoin">
+      <label class="field"><span>Property code</span>
+        <input name="joinCode" required placeholder="e.g. K4M2QP" style="text-transform:uppercase"></label>
+      <label class="field"><span>Unit</span><input name="unit" required placeholder="4B"></label>
+      <p id="rejoinError" class="error hidden"></p>
+      <button class="primary block" type="submit">Join</button>
+    </form>
+  </div></div>`;
+  $("#rejoinForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const err = $("#rejoinError");
+    err.classList.add("hidden");
+    try {
+      const { user } = await api("/api/properties/join", {
+        method: "POST",
+        body: { joinCode: e.target.joinCode.value.trim().toUpperCase(), unit: e.target.unit.value.trim() },
+      });
+      state.me = user;
+      enterApp();
+    } catch (ex) {
+      err.textContent = ex.message;
+      err.classList.remove("hidden");
+    }
+  });
+}
+
 
 function enterApp() {
   const me = state.me;
@@ -639,13 +775,20 @@ function enterApp() {
   $("#propName").textContent = me.property?.name ?? "";
 
   $("#whoami").textContent = me.role === "tenant"
-    ? `${me.displayName} · Unit ${me.unit}`
+    ? (me.unit ? `${me.displayName} · Unit ${me.unit}` : me.displayName)
     : `${me.displayName} · ${me.role}`;
   const badge = $("#botBadge");
   badge.textContent = me.botEngine === "claude" ? "bot: claude" : "bot: built-in";
   badge.title = me.botEngine === "claude"
     ? "Triage answered by Claude Opus 5"
     : "Triage answered by the built-in diagnostic script (set ANTHROPIC_API_KEY for Claude)";
+
+  if (noTenancy()) {
+    $("#landlordInfo").classList.add("hidden");
+    renderNoTenancy();
+    return;
+  }
+  $(".sidebar-head").classList.remove("hidden");
 
   // Vendors do not open work, they pick it up — so there is nothing to add.
   $("#newBtn").classList.toggle("hidden", me.role === "vendor");
@@ -667,6 +810,10 @@ function enterApp() {
   refresh();
   // Fetched even on the requests view, so the Messages badge is right on arrival.
   refreshChats().catch(() => {});
+
+  // Arrived from a notification email: go straight to the thread it was about.
+  const linked = takeHash("ticket");
+  if (linked && /^\d+$/.test(linked)) openTicket(Number(linked)).catch(() => {});
 }
 
 /* ------------------------------------------------------------- properties */
@@ -800,6 +947,7 @@ async function loadProperty() {
       ? `<div class="portfolio-code">
            <div class="portfolio-code-label">Vendors join everything you manage with:</div>
            ${codeChip("all properties", state.me.portfolioCode)}
+           <button type="button" class="linkish small-link" data-rotate="portfolio">New code</button>
          </div>`
       : "";
 
@@ -821,6 +969,10 @@ async function loadProperty() {
       : `<div class="code-row single">
            ${codeChip("tenants", state.me.property.joinCode)}
            ${codeChip("vendors", state.me.property.vendorCode)}
+         </div>
+         <div class="rotate-row">New code for
+           <button type="button" class="linkish small-link" data-rotate="tenant">tenants</button> ·
+           <button type="button" class="linkish small-link" data-rotate="vendor">vendors</button>
          </div>`;
 
     $("#landlordInfo").innerHTML = `
@@ -831,20 +983,10 @@ async function loadProperty() {
       </div>
       ${portfolio}
       ${codes}
-      <div style="margin-top:10px">${
-        tenants.length
-          ? tenants.map((t) => `${esc(t.display_name)} (${esc(t.unit || "—")})`).join(", ")
-          : "No tenants have joined yet."
-      }</div>
-      <div style="margin-top:10px">${
-        vendors && vendors.length
-          ? vendors.map((v) =>
-              `${esc(v.display_name)}${v.jobs ? ` (${v.jobs} job${v.jobs === 1 ? "" : "s"})` : ""}`
-            ).join(", ")
-          : "No vendors yet — share a code above with a contractor."
-      }</div>
+      ${renderPeople(tenants, vendors ?? [], everything)}
       ${renderDispatch()}`;
     wireDispatch();
+    wirePeople();
 
     // Loaded after the panel is drawn, so the sidebar never waits on it.
     loadDispatch();
@@ -856,6 +998,113 @@ async function loadProperty() {
   } catch {
     /* sidebar extras are optional — never block the list on them */
   }
+}
+
+/* ------------------------------------------------------------------ people */
+
+/**
+ * Who is on the landlord's properties, and the three things a landlord does to
+ * that list: give a locked-out tenant a way back in, end a tenancy, and drop a
+ * contractor. Each is a small text button beside the name rather than a menu —
+ * rare enough not to need more, serious enough to need naming.
+ */
+function renderPeople(tenants, vendors, everything) {
+  const tenantRows = tenants.map((t) => `
+    <li class="person">
+      <span class="person-name">${esc(t.display_name)}
+        <small>${esc(t.unit || "—")}${everything ? ` · ${esc(t.property_name)}` : ""}</small></span>
+      <span class="person-actions">
+        <button type="button" class="linkish small-link" data-reset="${t.id}"
+          title="${t.has_email ? "They can also reset it themselves from the sign-in page."
+            : "They have no email on file, so this is their way back in."}">Reset code</button>
+        <button type="button" class="linkish small-link danger" data-end="${t.id}"
+          data-name="${esc(t.display_name)}" data-where="${esc(t.property_name)}">End tenancy</button>
+      </span>
+    </li>`).join("");
+  const vendorRows = vendors.map((v) => `
+    <li class="person">
+      <span class="person-name">${esc(v.display_name)}
+        <small>${v.jobs ? `${v.jobs} open job${v.jobs === 1 ? "" : "s"}` : "no open jobs"}</small></span>
+      <span class="person-actions">
+        <button type="button" class="linkish small-link danger" data-drop="${v.id}"
+          data-name="${esc(v.display_name)}" data-jobs="${v.jobs || 0}">Remove</button>
+      </span>
+    </li>`).join("");
+  return `<div class="people">
+    <div class="people-head">Tenants</div>
+    ${tenantRows ? `<ul class="people-list">${tenantRows}</ul>` : '<p class="people-none">No tenants have joined yet.</p>'}
+    <div class="people-head">Vendors</div>
+    ${vendorRows ? `<ul class="people-list">${vendorRows}</ul>`
+      : '<p class="people-none">No vendors yet — share a code above with a contractor.</p>'}
+  </div>`;
+}
+
+function wirePeople() {
+  const root = $("#landlordInfo");
+  const run = async (fn) => {
+    try { await fn(); } catch (ex) { alert(ex.message); }
+  };
+
+  root.querySelectorAll("[data-reset]").forEach((b) => b.addEventListener("click", () => run(async () => {
+    showResetCode(await api(`/api/tenants/${b.dataset.reset}/reset-code`, { method: "POST" }));
+  })));
+
+  root.querySelectorAll("[data-end]").forEach((b) => b.addEventListener("click", () => run(async () => {
+    if (!confirm(
+      `End ${b.dataset.name}'s tenancy at ${b.dataset.where}?\n\n`
+      + "They lose access to the property's requests and messages straight away. Anything they "
+      + "reported that is still open stays on your list. Their account stays, so they can join "
+      + "their next home with its code.",
+    )) return;
+    await api(`/api/tenants/${b.dataset.end}/remove`, { method: "POST", body: {} });
+    await loadProperty();
+    await refresh();
+    refreshChats().catch(() => {});
+  })));
+
+  root.querySelectorAll("[data-drop]").forEach((b) => b.addEventListener("click", () => run(async () => {
+    const jobs = Number(b.dataset.jobs);
+    if (!confirm(
+      `Remove ${b.dataset.name} from all your properties?\n\n`
+      + (jobs ? `Their ${jobs} open job${jobs === 1 ? "" : "s"} go back to the pool, or to your next `
+        + "first-choice vendor. " : "")
+      + "Finished work keeps their name. They'd need a new code to come back.",
+    )) return;
+    await api(`/api/vendors/${b.dataset.drop}/remove`, { method: "POST" });
+    await loadProperty();
+    await refresh();
+  })));
+
+  root.querySelectorAll("[data-rotate]").forEach((b) => b.addEventListener("click", () => run(async () => {
+    const kind = b.dataset.rotate;
+    const what = { tenant: "tenant code", vendor: "vendor code", portfolio: "portfolio vendor code" }[kind];
+    if (!confirm(
+      `Replace the ${what}?\n\nEveryone already in keeps their access. Anyone who has the old `
+      + "code and hasn't used it yet will need the new one.",
+    )) return;
+    const { user, properties } = await api("/api/codes", {
+      method: "POST", body: { kind, propertyId: state.me.property?.id },
+    });
+    state.me = user;
+    state.properties = properties;
+    await loadProperty();
+  })));
+}
+
+/** The code a landlord reads out to a locked-out tenant. */
+function showResetCode({ code, username, displayName, expiresAt }) {
+  const expires = new Date(expiresAt.replace(" ", "T") + "Z")
+    .toLocaleString(undefined, { weekday: "short", hour: "numeric", minute: "2-digit" });
+  $("#codeModalBody").innerHTML = `
+    <p>Give this to ${esc(displayName)}. On the sign-in page they choose
+      <b>Forgot your password?</b>, then enter their username and this code.</p>
+    <div class="reset-code">${codeChip("code", code)}</div>
+    <p>Username: <b>${esc(username)}</b></p>
+    <p class="hint">Works once, until ${esc(expires)}. Issuing another cancels this one, and
+      using it signs them out everywhere else.</p>`;
+  wireCodeChips($("#codeModalBody"));
+  $("#codeModal").classList.remove("hidden");
+  $("#codeModalClose").focus();
 }
 
 /* ------------------------------------------------------- dispatch settings */
@@ -2253,6 +2502,35 @@ $("#logout").addEventListener("click", async () => {
   location.reload();
 });
 
+const DELIVERY = {
+  sent: "emailed", logged: "not sent — email isn't set up on this server", failed: "email failed",
+};
+
+/** What this person has been told, and whether it actually reached them. */
+async function loadNotifications() {
+  try {
+    const { notifications, channels } = await api("/api/notifications");
+    $("#channelNote").textContent = channels.email
+      ? "Texts go out only for emergencies — no heat in winter, no water, a gas smell."
+      : "Email isn't switched on for this server yet, so updates are listed below instead of sent.";
+    $("#notifList").innerHTML = notifications.length
+      ? `<ul class="notif-list">${notifications.map((n) => `
+          <li><span class="notif-subject">${esc(n.subject)}</span>
+            <span class="notif-meta">${when(n.created_at)} · ${
+              n.email_status ? DELIVERY[n.email_status] : "no email on file"}${
+              n.sms_status === "sent" ? " · texted" : ""}</span></li>`).join("")}</ul>`
+      : '<p class="hint">Nothing yet.</p>';
+  } catch { /* the list is informational; the form still works without it */ }
+}
+
+function wireCodeModal() {
+  const modal = $("#codeModal");
+  const close = () => modal.classList.add("hidden");
+  $("#codeModalClose").addEventListener("click", close);
+  modal.addEventListener("click", (e) => { if (e.target === modal) close(); });
+  modal.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); });
+}
+
 function wireAccount() {
   const modal = $("#accountModal");
   const close = () => modal.classList.add("hidden");
@@ -2260,9 +2538,36 @@ function wireAccount() {
     $("#accountWho").textContent =
       `Signed in as ${state.me.displayName} (${state.me.username}).`;
     $("#passwordForm").reset();
-    $("#accountError").classList.add("hidden");
-    $("#accountOk").classList.add("hidden");
+    $("#contactForm").email.value = state.me.email || "";
+    $("#contactForm").phone.value = state.me.phone || "";
+    for (const id of ["#accountError", "#accountOk", "#contactError", "#contactOk"]) {
+      $(id).classList.add("hidden");
+    }
     modal.classList.remove("hidden");
+    loadNotifications();
+  });
+
+  $("#contactForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const err = $("#contactError");
+    const ok = $("#contactOk");
+    err.classList.add("hidden");
+    ok.classList.add("hidden");
+    $("#contactSubmit").disabled = true;
+    try {
+      const { user } = await api("/api/account", {
+        method: "POST",
+        body: { email: e.target.email.value, phone: e.target.phone.value },
+      });
+      state.me = user;
+      e.target.phone.value = user.phone || "";
+      ok.classList.remove("hidden");
+    } catch (ex) {
+      err.textContent = ex.message;
+      err.classList.remove("hidden");
+    } finally {
+      $("#contactSubmit").disabled = false;
+    }
   });
   $("#accountCancel").addEventListener("click", close);
   modal.addEventListener("click", (e) => { if (e.target === modal) close(); });
@@ -2291,9 +2596,11 @@ function wireAccount() {
 }
 
 wireAuth();
+wireReset();
 wireModal();
 wireIntake();
 wireAccount();
+wireCodeModal();
 wirePropertySwitch();
 wirePhotoViewer();
 wireStandards();
@@ -2309,6 +2616,11 @@ if (!CROSS_ORIGIN && /\.github\.io$/.test(location.hostname)) {
     "<p class=\"tagline\">This page is hosted on GitHub Pages, which serves files but " +
     "cannot run the API. Set the repository variable <b>API_BASE_URL</b> to the deployed " +
     "API's origin and re-run the Pages workflow.</p></div></div>";
+} else if (location.hash.startsWith("#reset=")) {
+  // A reset link wins over any session this browser already has: whoever opened
+  // it is trying to change the password, not to carry on as someone.
+  $("#auth").classList.remove("hidden");
+  showReset(true, takeHash("reset"));
 } else {
   api("/api/me")
     .then(({ user }) => {
@@ -2322,9 +2634,22 @@ if (!CROSS_ORIGIN && /\.github\.io$/.test(location.hostname)) {
     });
 }
 
+// A link followed while the app is already open changes only the fragment, which
+// does not reload the page — so the same two links are handled here as well.
+window.addEventListener("hashchange", () => {
+  if (location.hash.startsWith("#reset=")) {
+    $("#app").classList.add("hidden");
+    $("#auth").classList.remove("hidden");
+    showReset(true, takeHash("reset"));
+  } else if (state.me && !noTenancy() && location.hash.startsWith("#ticket=")) {
+    const id = takeHash("ticket");
+    if (/^\d+$/.test(id)) openTicket(Number(id)).catch(() => {});
+  }
+});
+
 // Keep things fresh so each side sees the other's replies without a refresh.
 setInterval(() => {
-  if (!state.me || state.busy || document.hidden) return;
+  if (!state.me || state.busy || document.hidden || noTenancy()) return;
   // Conversations are polled in either view, so the Messages badge stays live.
   refreshChats().catch(() => {});
   if (state.view === "requests") {

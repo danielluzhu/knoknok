@@ -23,6 +23,14 @@ const EXTERNAL = process.env.TEST_BASE_URL?.replace(/\/$/, "");
 const BASE = EXTERNAL ?? `http://localhost:${PORT}`;
 let server: ReturnType<typeof Bun.spawn> | null = null;
 
+/**
+ * Everything the server has printed. With no mail provider configured,
+ * notifications go to the log instead — which is how a reset link reaches a
+ * developer, and so how these tests get hold of one. Also keeps the pipe
+ * drained, so a chatty server never blocks on a full buffer.
+ */
+let serverLog = "";
+
 /** A cookie jar per signed-in user, so tests can hold several sessions at once. */
 class Session {
   cookie = "";
@@ -58,9 +66,17 @@ beforeAll(async () => {
         DB_PATH: DB,
         ANTHROPIC_API_KEY: "",
         ALLOWED_ORIGINS: "https://example.github.io",
+        // Never reach a real provider from the tests, whatever .env says.
+        RESEND_API_KEY: "", TWILIO_ACCOUNT_SID: "", TWILIO_AUTH_TOKEN: "", TWILIO_FROM: "",
+        APP_URL: "",
       },
       stdout: "pipe", stderr: "pipe",
     });
+    const out = server.stdout as ReadableStream<Uint8Array>;
+    void (async () => {
+      const decoder = new TextDecoder();
+      for await (const chunk of out) serverLog += decoder.decode(chunk);
+    })();
   }
   // Wait for the port to answer rather than sleeping a fixed amount.
   for (let i = 0; i < 100; i++) {
@@ -2283,5 +2299,388 @@ describe("the work order end to end", () => {
     const settings = await owner.get("/api/dispatch");
     expect(settings.data.properties.find((p: any) => p.id === propertyId)
       .approval_threshold_cents).toBe(50000);
+  });
+});
+
+/* ---------------------------------------------------------- notifications */
+
+/** Sign up a landlord, a tenant and a first-choice plumber on one property. */
+async function household(prefix: string) {
+  const owner = new Session();
+  const resident = new Session();
+  const vendor = new Session();
+  const made = await owner.post("/api/signup", {
+    role: "landlord", username: uniq(`${prefix}l`), password: "password123",
+    displayName: "Nora Lind", propertyName: `${prefix} House`, email: `${uniq(prefix)}@example.com`,
+  });
+  const res = await resident.post("/api/signup", {
+    role: "tenant", username: uniq(`${prefix}t`), password: "password123",
+    displayName: "Tam Okafor", joinCode: made.data.user.property.joinCode, unit: "3C",
+    email: `${uniq(prefix)}@example.com`,
+  });
+  const ven = await vendor.post("/api/signup", {
+    role: "vendor", username: uniq(`${prefix}v`), password: "password123",
+    displayName: "Pipe Pros", vendorCode: made.data.user.portfolioCode,
+  });
+  await owner.post("/api/dispatch", { trade: "plumber", vendorId: ven.data.user.id });
+  return {
+    owner, resident, vendor,
+    owners: made.data.user, tenantUser: res.data.user, vendorUser: ven.data.user,
+    joinCode: made.data.user.property.joinCode as string,
+    propertyId: made.data.user.property.id as number,
+  };
+}
+
+/** Raise something the bot hands straight on, and return its id. */
+async function escalated(who: Session, title: string, description: string) {
+  const { data } = await who.post("/api/tickets", { title, description });
+  if (data.ticket.status === "triage") await who.post(`/api/tickets/${data.ticket.id}/escalate`);
+  return data.ticket.id as number;
+}
+
+const feed = async (who: Session) => (await who.get("/api/notifications")).data.notifications as any[];
+
+describe("notifications", () => {
+  let h: Awaited<ReturnType<typeof household>>;
+  let job = 0;
+
+  beforeAll(async () => {
+    h = await household("nt");
+  });
+
+  test("contact details are the owner's to set, and bad ones are refused", async () => {
+    expect((await h.owner.post("/api/account", { email: "not-an-address" })).status).toBe(400);
+    expect((await h.owner.post("/api/account", { phone: "12" })).status).toBe(400);
+
+    const set = await h.owner.post("/api/account", { phone: "+1 (555) 123-4567" });
+    expect(set.status).toBe(200);
+    expect(set.data.user.phone).toBe("+15551234567");
+    expect(set.data.user.email).toContain("@example.com");
+
+    const cleared = await h.vendor.post("/api/account", { email: "" });
+    expect(cleared.data.user.email).toBeNull();
+  });
+
+  test("a tenant's request tells the landlord, and the first-choice vendor is sent it", async () => {
+    job = await escalated(h.resident, "Kitchen tap drips", "It drips all night and the washer looks worn.");
+
+    const landlordHeard = (await feed(h.owner)).find((n) => n.ticket_id === job);
+    expect(landlordHeard.kind).toBe("new_request");
+    expect(landlordHeard.body).toContain("Pipe Pros");
+    // No provider configured, so it went to the log — and it did go somewhere.
+    expect(landlordHeard.email_status).toBe("logged");
+    // Not an emergency, so no text even though a phone is on file.
+    expect(landlordHeard.sms_status).toBeNull();
+
+    const vendorHeard = (await feed(h.vendor)).find((n) => n.ticket_id === job);
+    expect(vendorHeard.kind).toBe("assigned");
+    // No email on file: nothing was sent, but the record says what they missed.
+    expect(vendorHeard.email_status).toBeNull();
+  });
+
+  test("a notification links back to the thread", async () => {
+    const n = (await feed(h.owner)).find((x) => x.ticket_id === job);
+    expect(n.body).toContain(`#ticket=${job}`);
+  });
+
+  test("an emergency is a text as well as an email", async () => {
+    const { data } = await h.resident.post("/api/tickets", {
+      title: "Gas smell", description: "Strong smell of gas in the kitchen",
+    });
+    const n = (await feed(h.owner)).find((x) => x.ticket_id === data.ticket.id);
+    expect(n.subject).toStartWith("URGENT");
+    expect(n.sms_status).toBe("logged");
+  });
+
+  test("a landlord's own to-do is not news to them", async () => {
+    const { data } = await h.owner.post("/api/tickets", { title: "Clear the gutters" });
+    expect((await feed(h.owner)).some((n) => n.ticket_id === data.ticket.id)).toBe(false);
+  });
+
+  test("replies are told once per burst, not once per message", async () => {
+    await h.owner.post(`/api/tickets/${job}/messages`, { body: "Plumber is on it." });
+    await h.owner.post(`/api/tickets/${job}/messages`, { body: "Should be tomorrow." });
+    const replies = (await feed(h.resident)).filter((n) => n.ticket_id === job && n.kind === "message");
+    expect(replies.length).toBe(1);
+    expect(replies[0].subject).toContain("Nora Lind replied");
+    // And the author is never told about their own message.
+    expect((await feed(h.owner)).some((n) => n.ticket_id === job && n.kind === "message")).toBe(false);
+  });
+
+  test("booking a visit, and finishing it, reach the tenant", async () => {
+    const when = new Date(Date.now() + 2 * 86400_000).toISOString();
+    expect((await h.vendor.post(`/api/tickets/${job}/schedule`, { when })).status).toBe(200);
+    expect((await h.vendor.post(`/api/tickets/${job}/done`, { cost: "80" })).status).toBe(200);
+    const kinds = (await feed(h.resident)).filter((n) => n.ticket_id === job).map((n) => n.kind);
+    expect(kinds).toContain("schedule");
+    expect(kinds).toContain("work_done");
+  });
+
+  test("a direct message reaches the other side", async () => {
+    await h.resident.post(`/api/chats/${h.tenantUser.id}/messages`, { body: "Can I get a second key?" });
+    const n = (await feed(h.owner)).find((x) => x.kind === `chat:${h.tenantUser.id}`);
+    expect(n.body).toContain("second key");
+  });
+
+  test("the feed is your own", async () => {
+    expect((await new Session().get("/api/notifications")).status).toBe(401);
+    const theirs = await feed(h.resident);
+    expect(theirs.every((n) => !String(n.kind).startsWith("chat:"))).toBe(true);
+  });
+});
+
+/* --------------------------------------------------------- password reset */
+
+/** The last reset token emailed to this address, read off the server log. */
+async function resetLinkFor(address: string): Promise<string> {
+  for (let i = 0; i < 40; i++) {
+    const blocks = serverLog.split("[notify] ").filter((b) => b.startsWith(`email to ${address}:`));
+    const token = blocks.at(-1)?.match(/#reset=([0-9a-f]{64})/)?.[1];
+    if (token) return token;
+    await Bun.sleep(50);
+  }
+  throw new Error(`no reset link logged for ${address}`);
+}
+
+describe("password reset", () => {
+  let h: Awaited<ReturnType<typeof household>>;
+  const address = `${uniq("reset")}@example.com`;
+  let username = "";
+
+  beforeAll(async () => {
+    h = await household("pr");
+    await h.resident.post("/api/account", { email: address });
+    username = h.tenantUser.username;
+  });
+
+  test("asking for a link says the same thing whether or not the account exists", async () => {
+    const real = await new Session().post("/api/password/forgot", { login: username });
+    const fake = await new Session().post("/api/password/forgot", { login: uniq("nobody") });
+    expect(real.status).toBe(200);
+    expect(fake.status).toBe(200);
+    expect(fake.data.message).toBe(real.data.message);
+  });
+
+  test.skipIf(Boolean(EXTERNAL))("the emailed link sets a new password, signs in, and signs out everything else", async () => {
+    await new Session().post("/api/password/forgot", { login: address.toUpperCase() });
+    const token = await resetLinkFor(address);
+    const me = new Session();
+
+    // A password too short to accept does not spend the link.
+    expect((await me.post("/api/password/reset", { token, newPassword: "short" })).status).toBe(400);
+
+    const done = await me.post("/api/password/reset", { token, newPassword: "brand-new-pass" });
+    expect(done.status).toBe(200);
+    expect(done.data.user.username).toBe(username);
+    expect((await me.get("/api/me")).data.user.username).toBe(username);
+    // The session that was signed in before is gone.
+    expect((await h.resident.get("/api/me")).data.user).toBeNull();
+
+    // Once only.
+    expect((await new Session().post("/api/password/reset", { token, newPassword: "another-one" })).status)
+      .toBe(400);
+    const back = await h.resident.post("/api/login", { username, password: "brand-new-pass" });
+    expect(back.status).toBe(200);
+  });
+
+  test("the token is never kept in the notification record", async () => {
+    await new Session().post("/api/password/forgot", { login: username });
+    const n = (await feed(h.resident)).find((x) => x.kind === "password_reset");
+    expect(n.body).toContain("[redacted]");
+    expect(n.body).not.toMatch(/[0-9a-f]{64}/);
+  });
+
+  test("a landlord can issue a code for their own tenant, and nobody else", async () => {
+    const stranger = new Session();
+    await stranger.post("/api/signup", {
+      role: "landlord", username: uniq("strg"), password: "password123", displayName: "S",
+    });
+    expect((await stranger.post(`/api/tenants/${h.tenantUser.id}/reset-code`)).status).toBe(404);
+    // Vendors work for other landlords too; no one of them can take the account.
+    expect((await h.owner.post(`/api/vendors/${h.vendorUser.id}/reset-code`)).status).toBe(404);
+    // And tenants cannot issue codes at all.
+    expect((await h.resident.post(`/api/tenants/${h.tenantUser.id}/reset-code`)).status).toBe(403);
+
+    const { status, data } = await h.owner.post(`/api/tenants/${h.tenantUser.id}/reset-code`);
+    expect(status).toBe(200);
+    expect(data.code).toMatch(/^[A-Z2-9]{4}-[A-Z2-9]{4}$/);
+    expect(data.username).toBe(username);
+  });
+
+  test("a code only works with its username, typed any old way, and only once", async () => {
+    const { data } = await h.owner.post(`/api/tenants/${h.tenantUser.id}/reset-code`);
+    const typed = data.code.replace("-", " ").toLowerCase();
+
+    expect((await new Session().post("/api/password/reset", {
+      token: typed, username: "someone-else", newPassword: "code-pass-1",
+    })).status).toBe(400);
+
+    const me = new Session();
+    const ok = await me.post("/api/password/reset", {
+      token: typed, username, newPassword: "code-pass-1",
+    });
+    expect(ok.status).toBe(200);
+    expect((await new Session().post("/api/password/reset", {
+      token: typed, username, newPassword: "code-pass-2",
+    })).status).toBe(400);
+
+    // The tenant's own inbox is told it happened, in case it was not them.
+    expect((await feed(me)).some((n) => n.kind === "password_changed")).toBe(true);
+    // The reset signed every earlier session out; carry on as the new one.
+    h.resident.cookie = me.cookie;
+  });
+
+  test("issuing a new code cancels the last one", async () => {
+    const first = (await h.owner.post(`/api/tenants/${h.tenantUser.id}/reset-code`)).data.code;
+    await h.owner.post(`/api/tenants/${h.tenantUser.id}/reset-code`);
+    expect((await new Session().post("/api/password/reset", {
+      token: first, username, newPassword: "never-set",
+    })).status).toBe(400);
+  });
+
+  test("guessing at codes is throttled", async () => {
+    let last = 0;
+    for (let i = 0; i < 9; i++) {
+      last = (await new Session().post("/api/password/reset", {
+        token: "AAAA-AAAA", username, newPassword: "guessing-away",
+      })).status;
+    }
+    expect(last).toBe(429);
+  });
+});
+
+/* ----------------------------------------------------- who is in, and out */
+
+describe("ending a tenancy and removing a vendor", () => {
+  let h: Awaited<ReturnType<typeof household>>;
+  let openJob = 0;
+  let triageJob = 0;
+
+  beforeAll(async () => {
+    h = await household("mo");
+    openJob = await escalated(h.resident, "Bathroom tap leaks", "Drips from the base whenever it runs.");
+    const t = await h.resident.post("/api/tickets", {
+      title: "Hallway light flickers", description: "The hallway light flickers sometimes",
+    });
+    triageJob = t.data.ticket.id;
+  });
+
+  test("only the tenant's own landlord can end the tenancy", async () => {
+    const stranger = new Session();
+    await stranger.post("/api/signup", {
+      role: "landlord", username: uniq("strm"), password: "password123", displayName: "S",
+    });
+    expect((await stranger.post(`/api/tenants/${h.tenantUser.id}/remove`)).status).toBe(404);
+    expect((await h.vendor.post(`/api/tenants/${h.tenantUser.id}/remove`)).status).toBe(403);
+  });
+
+  test("ending a tenancy takes access away at once, and leaves the history with the flat", async () => {
+    const triageBefore = (await h.resident.get(`/api/tickets/${triageJob}`)).data.ticket.status;
+    const { status, data } = await h.owner.post(`/api/tenants/${h.tenantUser.id}/remove`, {
+      note: "Thanks for everything.",
+    });
+    expect(status).toBe(200);
+    expect(data.stillOpen).toBe(1);
+    expect(data.closed).toBe(triageBefore === "triage" ? 1 : 0);
+
+    // Nothing on the property is theirs to open any more.
+    expect((await h.resident.get(`/api/tickets/${openJob}`)).status).toBe(404);
+    expect((await h.resident.get("/api/tickets?status=all")).data.tickets).toEqual([]);
+    expect((await h.resident.get("/api/chats")).data.chats).toEqual([]);
+    expect((await h.resident.get(`/api/chats/${h.tenantUser.id}`)).status).toBe(404);
+    expect((await h.resident.post("/api/tickets", { title: "x", description: "y" })).status).toBe(403);
+    expect((await h.resident.get("/api/me")).data.user.property).toBeNull();
+
+    // The leak is still a leak, and still in 3C.
+    const seen = await h.owner.get(`/api/tickets/${openJob}`);
+    expect(seen.data.ticket.status).toBe("open");
+    expect(seen.data.ticket.tenant_unit).toBe("3C");
+    expect(seen.data.messages.some((m: any) => m.body.includes("moved out"))).toBe(true);
+
+    const overview = await h.owner.get("/api/property");
+    expect(overview.data.tenants.some((t: any) => t.id === h.tenantUser.id)).toBe(false);
+    expect((await feed(h.resident)).some((n) => n.kind === "tenancy_ended")).toBe(true);
+  });
+
+  test("a fresh tenant code shuts out the old one", async () => {
+    const { status, data } = await h.owner.post("/api/codes", { kind: "tenant", propertyId: h.propertyId });
+    expect(status).toBe(200);
+    const fresh = data.properties.find((p: any) => p.id === h.propertyId).join_code;
+    expect(fresh).not.toBe(h.joinCode);
+
+    const late = await new Session().post("/api/signup", {
+      role: "tenant", username: uniq("late"), password: "password123",
+      displayName: "Late", joinCode: h.joinCode, unit: "9",
+    });
+    expect(late.status).toBe(400);
+    const onTime = await new Session().post("/api/signup", {
+      role: "tenant", username: uniq("ontime"), password: "password123",
+      displayName: "On Time", joinCode: fresh, unit: "9",
+    });
+    expect(onTime.status).toBe(200);
+    expect((await h.resident.post("/api/codes", { kind: "tenant" })).status).toBe(403);
+  });
+
+  test("the former tenant can join their next building, and only once", async () => {
+    const next = new Session();
+    const made = await next.post("/api/signup", {
+      role: "landlord", username: uniq("nextl"), password: "password123",
+      displayName: "Next L", propertyName: "Elm Yard",
+    });
+    const joined = await h.resident.post("/api/properties/join", {
+      joinCode: made.data.user.property.joinCode, unit: "7",
+    });
+    expect(joined.status).toBe(200);
+    expect(joined.data.user.property.name).toBe("Elm Yard");
+    expect(joined.data.user.unit).toBe("7");
+    // The old building's requests do not follow them.
+    expect((await h.resident.get("/api/tickets?status=all")).data.tickets).toEqual([]);
+
+    expect((await h.resident.post("/api/properties/join", {
+      joinCode: made.data.user.property.joinCode, unit: "8",
+    })).status).toBe(409);
+  });
+
+  test("removing a vendor takes their open jobs back, and their access with it", async () => {
+    // The first tenant has gone, so a new one raises work for the plumber.
+    const code = (await h.owner.get("/api/properties")).data.properties
+      .find((p: any) => p.id === h.propertyId).join_code;
+    const renter = new Session();
+    await renter.post("/api/signup", {
+      role: "tenant", username: uniq("renter"), password: "password123",
+      displayName: "Rin", joinCode: code, unit: "1A",
+    });
+    const job = await escalated(renter, "Kitchen tap drips", "It drips all night and the washer looks worn.");
+    expect((await h.owner.get(`/api/tickets/${job}`)).data.ticket.assigned_vendor_id)
+      .toBe(h.vendorUser.id);
+
+    const { status, data } = await h.owner.post(`/api/vendors/${h.vendorUser.id}/remove`);
+    expect(status).toBe(200);
+    expect(data.reassigned).toBeGreaterThanOrEqual(1);
+
+    const after = (await h.owner.get(`/api/tickets/${job}`)).data;
+    expect(after.ticket.assigned_vendor_id).toBeNull();
+    expect(after.ticket.wo_status).toBe("new");
+    expect(after.messages.some((m: any) => m.body.includes("needs someone else"))).toBe(true);
+
+    expect((await h.vendor.get(`/api/tickets/${job}`)).status).toBe(404);
+    expect((await h.vendor.get("/api/properties")).data.properties).toEqual([]);
+    const plumber = (await h.owner.get("/api/dispatch")).data.trades.find((t: any) => t.trade === "plumber");
+    expect(plumber.vendorId).toBeNull();
+    expect((await feed(h.vendor)).some((n) => n.kind === "network_removed")).toBe(true);
+
+    // Removing them twice finds nobody.
+    expect((await h.owner.post(`/api/vendors/${h.vendorUser.id}/remove`)).status).toBe(404);
+  });
+
+  test("a fresh portfolio code shuts out the old one", async () => {
+    const old = h.owners.portfolioCode;
+    const { data } = await h.owner.post("/api/codes", { kind: "portfolio" });
+    expect(data.user.portfolioCode).not.toBe(old);
+    const stale = await new Session().post("/api/signup", {
+      role: "vendor", username: uniq("stale"), password: "password123",
+      displayName: "Stale", vendorCode: old,
+    });
+    expect(stale.status).toBe(400);
   });
 });

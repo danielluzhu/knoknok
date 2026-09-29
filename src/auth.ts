@@ -4,7 +4,7 @@
  * Hashing uses scrypt from node:crypto rather than Bun.password, so the same
  * code runs on Bun locally and on Node in production.
  */
-import { randomBytes, scrypt as scryptCb, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, randomInt, scrypt as scryptCb, timingSafeEqual } from "node:crypto";
 import { promisify } from "node:util";
 import { db, type User } from "./db";
 
@@ -66,6 +66,97 @@ export async function dropOtherSessions(userId: number, keepToken: string | null
 export async function sweepExpiredSessions(): Promise<number> {
   const { rowsAffected } = await db.run("DELETE FROM sessions WHERE expires_at <= datetime('now')");
   return rowsAffected;
+}
+
+/* ---------------------------------------------------------- password reset */
+
+/**
+ * Two ways back into an account, for two different people.
+ *
+ * Someone with an email on file asks for a link and gets one at that address.
+ * The token is 32 random bytes, good for an hour, and useless to anyone who
+ * cannot read that inbox.
+ *
+ * A tenant with no email — plenty of them, and nobody should be locked out of
+ * reporting a leak for want of one — asks their landlord, who can already see
+ * everything on their property and is the person they would phone anyway. The
+ * landlord gets a code short enough to read aloud. Because it is short, it is
+ * only good together with the username it was issued for, it lasts a day, and
+ * guesses at it are throttled like guesses at a password.
+ *
+ * Either way only the SHA-256 of the secret is stored, a secret works once, and
+ * issuing a new one cancels any the account still had outstanding.
+ */
+const LINK_TTL = "+1 hour";
+const CODE_TTL = "+1 day";
+// Same alphabet as the invite codes: no I/O/0/1, because this gets read aloud.
+const CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+
+const digest = (secret: string) => createHash("sha256").update(secret).digest("hex");
+
+/** Codes are typed by hand: case, spaces and the dash in the middle do not matter. */
+export const normalizeResetCode = (code: string) => code.toUpperCase().replace(/[^A-Z0-9]/g, "");
+
+export async function issueReset(
+  userId: number,
+  kind: "link" | "code",
+  issuedBy: number | null = null,
+): Promise<{ secret: string; expiresAt: string }> {
+  const secret = kind === "link"
+    ? randomBytes(32).toString("hex")
+    // 8 characters of a 32-letter alphabet is 40 bits: not a password, but not
+    // guessable inside a throttle that allows a handful of tries per window.
+    : Array.from({ length: 8 }, () => CODE_ALPHABET[randomInt(CODE_ALPHABET.length)]).join("");
+
+  await db.run("DELETE FROM password_resets WHERE user_id = ? AND used_at IS NULL", [userId]);
+  const row = (await db.get<{ expires_at: string }>(
+    `INSERT INTO password_resets (token_hash, user_id, kind, issued_by, expires_at)
+     VALUES (?, ?, ?, ?, datetime('now', ?)) RETURNING expires_at`,
+    [digest(kind === "code" ? normalizeResetCode(secret) : secret), userId, kind, issuedBy,
+     kind === "link" ? LINK_TTL : CODE_TTL],
+  ))!;
+  return {
+    secret: kind === "code" ? `${secret.slice(0, 4)}-${secret.slice(4)}` : secret,
+    expiresAt: row.expires_at,
+  };
+}
+
+/**
+ * Spend a reset secret. Returns the reset row it matched, or null — expired,
+ * used, never existed, or a code offered without its username all look the same
+ * from outside.
+ *
+ * The UPDATE is the check: two requests racing with the same token cannot both
+ * see it unused, because only one of them changes a row.
+ */
+export async function redeemReset(
+  secret: string,
+  username: string | null,
+): Promise<{ user_id: number; kind: "link" | "code"; issued_by: number | null } | null> {
+  const trimmed = secret.trim();
+  if (!trimmed) return null;
+  // A link token is 64 hex characters; anything else is treated as a code.
+  const isLink = /^[0-9a-f]{64}$/i.test(trimmed);
+  const hash = digest(isLink ? trimmed.toLowerCase() : normalizeResetCode(trimmed));
+
+  const row = await db.get<{ user_id: number; kind: "link" | "code"; issued_by: number | null; username: string }>(
+    `SELECT r.user_id, r.kind, r.issued_by, u.username
+       FROM password_resets r JOIN users u ON u.id = r.user_id
+      WHERE r.token_hash = ? AND r.used_at IS NULL AND r.expires_at > datetime('now')`,
+    [hash],
+  );
+  if (!row) return null;
+  if (row.kind === "code" && (!username || username.toLowerCase() !== row.username.toLowerCase())) {
+    return null;
+  }
+  const { rowsAffected } = await db.run(
+    "UPDATE password_resets SET used_at = datetime('now') WHERE token_hash = ? AND used_at IS NULL",
+    [hash],
+  );
+  if (!rowsAffected) return null;
+  // Anything else still outstanding for this account is now moot.
+  await db.run("DELETE FROM password_resets WHERE user_id = ? AND used_at IS NULL", [row.user_id]);
+  return { user_id: row.user_id, kind: row.kind, issued_by: row.issued_by };
 }
 
 /* -------------------------------------------------------------- throttling */

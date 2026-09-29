@@ -35,6 +35,7 @@
           <label class="role"><input type="radio" name="role" value="vendor" /><span><strong>I'm a vendor</strong><small>Pick up maintenance jobs</small></span></label>
         </div>
         <label class="field"><span>Your name</span><input name="displayName" placeholder="Alex Rivera" /></label>
+        <label class="field"><span>Email <small>optional — for updates, and to reset a forgotten password</small></span><input name="email" type="email" autocomplete="email" placeholder="alex@example.com" /></label>
         <div id="tenantFields">
           <label class="field"><span>Property code</span><input name="joinCode" placeholder="From your landlord, e.g. K4M2QP" style="text-transform:uppercase" /></label>
           <label class="field"><span>Unit</span><input name="unit" placeholder="4B" /></label>
@@ -54,7 +55,35 @@
 
       <p id="authError" class="error hidden"></p>
       <button class="primary block" type="submit" id="authSubmit">Sign in</button>
+      <p class="auth-aside" id="forgotRow"><button type="button" class="linkish" id="forgotBtn">Forgot your password?</button></p>
     </form>
+
+    <!-- Getting back in. Two routes, because not everyone has an email on file:
+         a link to the account's own inbox, or a one-time code from the landlord. -->
+    <div id="resetPane" class="hidden">
+      <h2 class="reset-title" id="resetTitle">Reset your password</h2>
+      <form id="forgotForm">
+        <label class="field"><span>Username or email</span>
+          <input name="login" autocomplete="username" required /></label>
+        <p id="forgotMsg" class="ok-note hidden" role="status"></p>
+        <p id="forgotError" class="error hidden"></p>
+        <button class="primary block" type="submit" id="forgotSubmit">Email me a reset link</button>
+      </form>
+      <form id="resetForm">
+        <p class="hint" id="resetLede">No email on your account? Ask your landlord for a reset code, then enter it here.</p>
+        <div id="codeFields">
+          <label class="field"><span>Username</span>
+            <input name="username" autocomplete="username" /></label>
+          <label class="field"><span>Reset code</span>
+            <input name="token" autocomplete="one-time-code" placeholder="ABCD-EFGH" style="text-transform:uppercase" /></label>
+        </div>
+        <label class="field"><span>New password</span>
+          <input name="newPassword" type="password" autocomplete="new-password" minlength="8" required /></label>
+        <p id="resetError" class="error hidden"></p>
+        <button class="primary block" type="submit" id="resetSubmit">Set new password</button>
+      </form>
+      <p class="auth-aside"><button type="button" class="linkish" id="resetBack">Back to sign in</button></p>
+    </div>
   </div>
 </div>
 
@@ -232,9 +261,27 @@
 <!-- -------------------------------------------------------------- account -->
 <div id="accountModal" class="modal hidden">
   <div class="modal-card">
-    <h2>Change password</h2>
+    <h2>Account</h2>
+    <p class="hint" id="accountWho"></p>
+    <form id="contactForm">
+      <h3 class="modal-sub">How to reach you</h3>
+      <label class="field"><span>Email <small>updates, and password resets</small></span>
+        <input name="email" type="email" autocomplete="email" placeholder="you@example.com" /></label>
+      <label class="field"><span>Mobile <small>texts for emergencies only</small></span>
+        <input name="phone" type="tel" autocomplete="tel" placeholder="+1 555 123 4567" /></label>
+      <p class="hint" id="channelNote"></p>
+      <p id="contactError" class="error hidden"></p>
+      <p id="contactOk" class="ok-note hidden">Saved.</p>
+      <div class="modal-actions">
+        <button type="submit" class="primary" id="contactSubmit">Save contact details</button>
+      </div>
+    </form>
+    <details class="notif-log" id="notifLog">
+      <summary>What you've been sent</summary>
+      <div id="notifList"></div>
+    </details>
     <form id="passwordForm">
-      <p class="hint" id="accountWho"></p>
+      <h3 class="modal-sub">Change password</h3>
       <label class="field"><span>Current password</span>
         <input name="currentPassword" type="password" autocomplete="current-password" required /></label>
       <label class="field"><span>New password</span>
@@ -247,6 +294,17 @@
         <button type="submit" class="primary" id="accountSubmit">Update password</button>
       </div>
     </form>
+  </div>
+</div>
+
+<!-- -------------------------------------------------------- reset code -->
+<div id="codeModal" class="modal hidden">
+  <div class="modal-card" role="dialog" aria-labelledby="codeModalTitle">
+    <h2 id="codeModalTitle">Reset code</h2>
+    <div id="codeModalBody"></div>
+    <div class="modal-actions">
+      <button type="button" class="primary" id="codeModalClose">Done</button>
+    </div>
   </div>
 </div>
 

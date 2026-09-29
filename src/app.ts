@@ -14,8 +14,10 @@ import {
   destroySession,
   dropOtherSessions,
   hashPassword,
+  issueReset,
   loginBlocked,
   noteFailedLogin,
+  redeemReset,
   sessionCookie,
   sweepExpiredSessions,
   verifyPassword,
@@ -25,6 +27,10 @@ import {
   type ChatMessage, type Message, type RecurringTask, type Ticket, type User,
 } from "./db";
 import { triage, usingClaude } from "./bot";
+import {
+  channels, notifyTicket, notifyUser, parseEmail, parsePhone, recentNotifications,
+  rememberOrigin, appUrl, configuredAppUrl, type Party,
+} from "./notify";
 import {
   EMERGENCY_CONTACT, findIssue, intakeForClient, intakeMessage, intakeTitle, isStatutoryIssue,
   parseIntake, type Intake,
@@ -68,6 +74,22 @@ function corsHeaders(req: Request): Record<string, string> {
     // The response differs per origin, so it must not be cached across them.
     vary: "Origin",
   };
+}
+
+/**
+ * Where the page that made this request lives, for links sent back to it by
+ * email. A front end on an allowed other origin (GitHub Pages) says so in its
+ * Origin header; otherwise it is this server. APP_URL overrides both, and should
+ * be set anywhere the Host header cannot be trusted or the front end lives under
+ * a path — see src/notify.ts.
+ */
+function frontEndOrigin(req: Request): string {
+  const origin = req.headers.get("origin");
+  if (origin && ALLOWED_ORIGINS.includes(origin)) return origin;
+  const url = new URL(req.url);
+  const proto = req.headers.get("x-forwarded-proto")?.split(",")[0]?.trim()
+    || url.protocol.replace(":", "");
+  return `${proto}://${req.headers.get("host") ?? url.host}`;
 }
 
 function withCors(res: Response, cors: Record<string, string>): Response {
@@ -330,6 +352,61 @@ async function noteResponseTime(ticketId: number) {
   await addMessage(ticketId, "system", `Response time for this: ${SLA_LABEL[tier]}.`);
 }
 
+/* ---------------------------------------------------------- notifications */
+
+/**
+ * What a message sent outside the app needs to say about a job: which one, and
+ * where. Read fresh, because the callers hold rows from before whatever they
+ * just changed.
+ */
+async function jobContext(ticketId: number) {
+  const row = await db.get<{
+    title: string; summary: string; sla_tier: string | null; unit: string | null;
+    property_name: string; vendor_name: string | null; nte_cents: number | null;
+  }>(
+    `SELECT t.title, t.summary, t.sla_tier, t.nte_cents, COALESCE(t.unit, u.unit) AS unit,
+            p.name AS property_name, v.display_name AS vendor_name
+       FROM tickets t
+       JOIN properties p ON p.id = t.property_id
+       LEFT JOIN users u ON u.id = t.tenant_id
+       LEFT JOIN users v ON v.id = t.assigned_vendor_id
+      WHERE t.id = ?`,
+    [ticketId],
+  );
+  if (!row) return null;
+  return {
+    ...row,
+    where: [row.property_name, row.unit ? `unit ${row.unit}` : null].filter(Boolean).join(", "),
+    // Emergencies are the only thing that earns a text message.
+    urgent: row.sla_tier === "emergency",
+  };
+}
+
+/**
+ * Tell the people on a ticket something, in the one shape every event uses:
+ * a subject naming the job, then where it is, then what happened. Returns how
+ * many people were told, which nothing needs except the tests.
+ */
+async function tell(
+  ticketId: number,
+  parties: Party[],
+  kind: string,
+  headline: string,
+  detail: string,
+  actor: User | null = null,
+  opts: { urgent?: boolean; throttleMinutes?: number } = {},
+) {
+  const job = await jobContext(ticketId);
+  if (!job) return 0;
+  return notifyTicket(ticketId, parties, {
+    kind,
+    subject: `${(opts.urgent ?? job.urgent) ? "URGENT — " : ""}${headline}: ${job.title}`,
+    body: `${job.where}\n\n${detail}`.trim(),
+    urgent: opts.urgent ?? job.urgent,
+    throttleMinutes: opts.throttleMinutes,
+  }, actor?.id ?? null);
+}
+
 /* ------------------------------------------------------------ work orders */
 
 /**
@@ -407,6 +484,13 @@ async function dispatch(t: Ticket, trade: Trade): Promise<boolean> {
     t.id, "system",
     `Sent to ${vendor.display_name}, the first-choice ${TRADE_LABEL[trade].toLowerCase()} for this property.`,
   );
+  const job = await jobContext(t.id);
+  await tell(
+    t.id, ["vendor"], "assigned", "New job for you",
+    `You are the first-choice ${TRADE_LABEL[trade].toLowerCase()} for this property, so it has `
+      + `come straight to you${job?.nte_cents ? `, up to ${money(job.nte_cents)} without asking` : ""}.`
+      + ` If you can't take it, hand it back and it goes to the open pool.\n\n${job?.summary ?? ""}`,
+  );
   return true;
 }
 
@@ -444,6 +528,7 @@ async function openWorkOrder(ticketId: number) {
     t.id, "system",
     `Work order raised: ${TRADE_LABEL[decided.trade].toLowerCase()}, up to ${money(decided.nte)}.`,
   );
+  let sent = false;
   if (decided.approval === "pending") {
     await addMessage(t.id, "system", `Waiting on the landlord to approve. ${decided.approvalWhy}`);
   } else {
@@ -451,7 +536,27 @@ async function openWorkOrder(ticketId: number) {
     if (decided.approval === "approved") {
       await addMessage(t.id, "system", decided.approvalWhy);
     }
-    await dispatch(t, decided.trade);
+    sent = await dispatch(t, decided.trade);
+  }
+
+  // The landlord hears about anything they did not raise themselves: a tenant's
+  // request, or planned upkeep that has come due and wants a yes. A to-do they
+  // just typed in is not news to them.
+  const raisedByTenant = t.tenant_id !== null && t.created_by === t.tenant_id;
+  if (raisedByTenant || (t.recurring_id && decided.approval === "pending")) {
+    const job = await jobContext(t.id);
+    const next = decided.approval === "pending"
+      ? `At ${money(decided.nte)} it is over your approval limit, so nothing happens until you `
+        + "approve it or turn it down."
+      : sent
+        ? `It has gone to ${job?.vendor_name ?? "your first-choice vendor"}, up to ${money(decided.nte)}.`
+        : `Nobody has it yet — assign a vendor, or set a first choice for `
+          + `${TRADE_LABEL[decided.trade].toLowerCase()} under Dispatch rules so the next one goes on its own.`;
+    await tell(
+      t.id, ["landlord"], decided.approval === "pending" ? "approval" : "new_request",
+      decided.approval === "pending" ? "Approval needed" : "New request",
+      `${job?.summary ?? ""}\n\n${next}`,
+    );
   }
   return decided;
 }
@@ -758,7 +863,7 @@ async function propertyTenant(user: User, tenantId: number): Promise<User | null
  */
 async function visibleTicket(user: User, id: number): Promise<Ticket | null> {
   const t = await db.get<Ticket>(
-    `SELECT t.*, u.display_name AS tenant_name, u.unit AS tenant_unit,
+    `SELECT t.*, u.display_name AS tenant_name, COALESCE(t.unit, u.unit) AS tenant_unit,
             c.display_name AS creator_name, c.role AS creator_role,
             v.display_name AS vendor_name, pr.name AS property_name,
             r.title AS recurring_title, r.interval_days AS recurring_days
@@ -854,7 +959,11 @@ async function publicUser(u: User) {
     role: u.role,
     displayName: u.display_name,
     unit: u.unit,
-    // Null for a vendor who has signed up but holds no property code yet.
+    // Their own contact details — publicUser is only ever handed to its owner.
+    email: u.email ?? null,
+    phone: u.phone ?? null,
+    // Null for a vendor who has signed up but holds no property code yet, and
+    // for a tenant whose tenancy the landlord has ended.
     property: property && {
       id: u.property_id,
       name: property.name,
@@ -944,6 +1053,9 @@ async function handleSignup(req: Request): Promise<Response> {
   }
   if (password.length < 8) return fail("Password must be at least 8 characters.");
   if (!displayName) return fail("Please enter your name.");
+  // Optional, and the way back in if the password is ever forgotten.
+  const email = parseEmail(b.email);
+  if (email === false) return fail("That email address doesn't look right.");
   if (await db.get("SELECT 1 AS x FROM users WHERE username = ?", [username])) {
     return fail("That username is taken.");
   }
@@ -1016,9 +1128,9 @@ async function handleSignup(req: Request): Promise<Response> {
 
   const hash = await hashPassword(password);
   const user = (await db.get<User>(
-    `INSERT INTO users (username, password_hash, role, display_name, property_id, unit)
-     VALUES (?, ?, ?, ?, ?, ?) RETURNING *`,
-    [username, hash, role, displayName, propertyId, unit],
+    `INSERT INTO users (username, password_hash, role, display_name, property_id, unit, email)
+     VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+    [username, hash, role, displayName, propertyId, unit, email],
   ))!;
 
   if (claimProperty) {
@@ -1112,7 +1224,7 @@ async function listTickets(user: User, url: URL): Promise<Response> {
   }
 
   const tickets = await db.all(
-    `SELECT t.*, u.display_name AS tenant_name, u.unit AS tenant_unit,
+    `SELECT t.*, u.display_name AS tenant_name, COALESCE(t.unit, u.unit) AS tenant_unit,
             c.display_name AS creator_name, c.role AS creator_role,
             v.display_name AS vendor_name, pr.name AS property_name,
             r.title AS recurring_title, r.interval_days AS recurring_days,
@@ -1161,6 +1273,9 @@ async function createTicket(user: User, req: Request): Promise<Response> {
     return fail("Vendors work the list rather than adding to it.", 403);
   }
 
+  if (user.role === "tenant" && !user.property_id) {
+    return fail("You are not on a property any more. Join one with the code from your landlord.", 403);
+  }
   if (user.role === "tenant") {
     // The structured path: the tenant picked an issue and filled in the
     // basics. The title and the opening message are composed from those, so
@@ -1179,13 +1294,13 @@ async function createTicket(user: User, req: Request): Promise<Response> {
     const issue = intake ? findIssue(intake.issue) : null;
     const ticket = (await db.get<Ticket>(
       `INSERT INTO tickets
-         (property_id, tenant_id, created_by, title, summary, category, priority, status, intake,
-          entry_permission, access_notes, pets)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'triage', ?, ?, ?, ?) RETURNING *`,
+         (property_id, tenant_id, unit, created_by, title, summary, category, priority, status,
+          intake, entry_permission, access_notes, pets)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'triage', ?, ?, ?, ?) RETURNING *`,
       // Access is copied out of the intake JSON onto columns of its own because
       // it is the vendor's, not the assistant's: it has to be readable — and
       // editable — on a work order raised from a free-text request too.
-      [user.property_id, user.id, user.id, title, title,
+      [user.property_id, user.id, user.unit, user.id, title, title,
        issue?.category ?? "other", issue?.priority ?? "normal",
        intake ? JSON.stringify(intake) : null,
        intake?.entry || null, intake?.access || null, intake?.pets || null],
@@ -1238,18 +1353,21 @@ async function createTicket(user: User, req: Request): Promise<Response> {
   }
 
   let tenantId: number | null = null;
+  let unit: string | null = null;
   if (b?.tenantId) {
     const tenant = await propertyTenant(user, Number(b.tenantId));
     if (!tenant || tenant.property_id !== propertyId) {
       return fail("That tenant is not on this property.");
     }
     tenantId = tenant.id;
+    unit = tenant.unit;
   }
 
   const ticket = (await db.get<Ticket>(
-    `INSERT INTO tickets (property_id, tenant_id, created_by, title, summary, category, priority, status)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 'open') RETURNING *`,
-    [propertyId, tenantId, user.id, title, description || title, category, priority],
+    `INSERT INTO tickets
+       (property_id, tenant_id, unit, created_by, title, summary, category, priority, status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open') RETURNING *`,
+    [propertyId, tenantId, unit, user.id, title, description || title, category, priority],
   ))!;
 
   if (description || photos.length) {
@@ -1282,6 +1400,15 @@ async function postMessage(user: User, ticket: Ticket, req: Request): Promise<Re
   let botResult = null;
   if (ticket.status === "triage" && user.role === "tenant") {
     botResult = await runTriage(ticket);
+  } else if (ticket.status !== "triage") {
+    // Once a thread is between people, the others on it hear about a reply —
+    // once per half hour of back-and-forth, not once per message.
+    await tell(
+      ticket.id, ["tenant", "landlord", "vendor"], "message",
+      `${user.display_name} replied`,
+      body || "(sent a photo)",
+      user, { urgent: false, throttleMinutes: 30 },
+    );
   }
   await markRead(ticket.id, user.id);
 
@@ -1386,6 +1513,13 @@ async function closeTicket(user: User, ticket: Ticket, req: Request): Promise<Re
     [resolution, user.display_name, ticket.id],
   );
   await addMessage(ticket.id, "system", `Closed by ${user.display_name}: ${resolution}`, user.id);
+  if (ticket.status !== "triage") {
+    await tell(
+      ticket.id, ["tenant", "landlord", "vendor"], "closed", "Closed",
+      `${user.display_name} closed this: ${resolution}\n\nIf it isn't actually sorted, reopen it.`,
+      user, { urgent: false },
+    );
+  }
   return json({
     ticket: await visibleTicket(user, ticket.id),
     messages: await ticketMessages(ticket.id),
@@ -1412,6 +1546,14 @@ async function reopenTicket(user: User, ticket: Ticket): Promise<Response> {
     [next, next, ticket.id],
   );
   await addMessage(ticket.id, "system", `Reopened by ${user.display_name}.`, user.id);
+  if (next === "open") {
+    // Usually a tenant saying the work did not hold — the people who did it
+    // need to know it is back.
+    await tell(
+      ticket.id, ["landlord", "vendor"], "reopened", "Reopened",
+      `${user.display_name} reopened this.`, user,
+    );
+  }
   return json({
     ticket: await visibleTicket(user, ticket.id),
     messages: await ticketMessages(ticket.id),
@@ -1498,6 +1640,14 @@ async function assignTicket(user: User, ticket: Ticket, req: Request): Promise<R
       ticket.id, "system",
       `${user.display_name} assigned this to ${vendor.display_name}.`, user.id,
     );
+    const job = await jobContext(ticket.id);
+    await tell(
+      ticket.id, ["vendor"], "assigned", "New job for you",
+      `${user.display_name} has assigned this to you${
+        job?.nte_cents ? `, up to ${money(job.nte_cents)} without asking` : ""}.`
+        + ` If you can't take it, hand it back.\n\n${job?.summary ?? ""}`,
+      user,
+    );
   } else {
     if (!ticket.assigned_vendor_id) return fail("Nobody has this one.");
     await db.run(
@@ -1566,7 +1716,10 @@ async function propertyOverview(user: User, url: URL): Promise<Response> {
   const holes = scope.map(() => "?").join(",");
 
   const tenants = await db.all(
-    `SELECT u.id, u.display_name, u.unit, u.username, u.property_id, p.name AS property_name
+    `SELECT u.id, u.display_name, u.unit, u.username, u.property_id, p.name AS property_name,
+            -- Whether they can reset their own password, or will need a code from
+            -- the landlord. The address itself is theirs, not the landlord's.
+            (u.email IS NOT NULL) AS has_email
      FROM users u JOIN properties p ON p.id = u.property_id
      WHERE u.property_id IN (${holes}) AND u.role = 'tenant'
      ORDER BY p.name, u.unit, u.display_name`,
@@ -1622,7 +1775,7 @@ async function slaTracking(user: User, url: URL) {
     due_at: string | null; property_name: string; unit: string | null;
   }>(
     `SELECT t.id, t.title, t.status, t.sla_tier, t.due_at,
-            p.name AS property_name, u.unit
+            p.name AS property_name, COALESCE(t.unit, u.unit) AS unit
      FROM tickets t
      JOIN properties p ON p.id = t.property_id
      LEFT JOIN users u ON u.id = t.tenant_id
@@ -1910,6 +2063,14 @@ async function sendChat(user: User, tenantId: number, req: Request): Promise<Res
     [propertyId, tenantId, user.id, body],
   );
   await markChatRead(tenantId, user.id);
+  // Per conversation, so a landlord hearing from two tenants hears from both.
+  const link = appUrl();
+  await notifyUser(partner.id, {
+    kind: `chat:${tenantId}`,
+    subject: `Message from ${user.display_name}`,
+    body: `${body}${link ? `\n\n${link}` : ""}`,
+    throttleMinutes: 30,
+  });
   return json({ messages: await chatMessages(tenantId) });
 }
 
@@ -1949,6 +2110,10 @@ async function approveWork(user: User, ticket: Ticket, req: Request): Promise<Re
     await addMessage(
       ticket.id, "system",
       `${user.display_name} did not approve this work: ${note}`, user.id,
+    );
+    await tell(
+      ticket.id, ["tenant", "vendor"], "declined", "Not going ahead",
+      `${user.display_name} did not approve this work: ${note}`, user, { urgent: false },
     );
     return json({
       ticket: await visibleTicket(user, ticket.id),
@@ -1990,7 +2155,17 @@ async function approveWork(user: User, ticket: Ticket, req: Request): Promise<Re
 
   const after = (await db.get<Ticket>("SELECT * FROM tickets WHERE id = ?", [ticket.id]))!;
   if (!after.assigned_vendor_id && after.wo_status === "new") {
+    // dispatch() tells the vendor it picks.
     await dispatch(after, (after.trade ?? tradeFor(after.category, after.title)) as Trade);
+  } else if (after.assigned_vendor_id) {
+    await tell(
+      ticket.id, ["vendor"], "approved",
+      next === "work_done" ? "Invoice approved" : "Approved — go ahead",
+      next === "work_done"
+        ? `${user.display_name} signed off the invoice.`
+        : `${user.display_name} approved this, up to ${money(nte)}.${note ? ` ${note}` : ""}`,
+      user,
+    );
   }
   return json({
     ticket: await visibleTicket(user, ticket.id),
@@ -2024,6 +2199,11 @@ async function scheduleWork(user: User, ticket: Ticket, req: Request): Promise<R
     const err = await setWoStatus(ticket, "assigned", { scheduled_for: null });
     if (err) return fail(err);
     await addMessage(ticket.id, "system", `${user.display_name} cancelled the appointment.`, user.id);
+    await tell(
+      ticket.id, ["tenant", "landlord", "vendor"], "schedule", "Appointment cancelled",
+      `${user.display_name} cancelled the appointment. A new time will follow.`, user,
+      { urgent: false },
+    );
     return json({
       ticket: await visibleTicket(user, ticket.id),
       messages: await ticketMessages(ticket.id),
@@ -2050,6 +2230,15 @@ async function scheduleWork(user: User, ticket: Ticket, req: Request): Promise<R
         ? " The tenant asked to be home — please confirm the time works for them."
         : ""),
     user.id,
+  );
+  // The tenant is the one who has to be in, or leave the door on the latch.
+  await tell(
+    ticket.id, ["tenant", "landlord", "vendor"], "schedule", "Visit booked",
+    `${user.display_name} booked this for ${readable}.`
+      + (ticket.entry_permission === "must_be_home"
+        ? " You asked to be home for it — reply on the request if that time doesn't work."
+        : ""),
+    user, { urgent: false },
   );
   return json({
     ticket: await visibleTicket(user, ticket.id),
@@ -2110,6 +2299,22 @@ async function completeWork(user: User, ticket: Ticket, req: Request): Promise<R
         + "asked to sign off the difference.",
     );
   }
+  // Done is the tenant's call to confirm, so they are the one who has to hear.
+  await tell(
+    ticket.id, ["tenant"], "work_done", "Work done",
+    `${user.display_name} says the work is done.${notes ? `\n\n${notes}` : ""}\n\n`
+      + "If it's fixed, close the request. If it isn't, reply and say what's still wrong.",
+    user, { urgent: false },
+  );
+  await tell(
+    ticket.id, ["landlord"], over ? "approval" : "work_done",
+    over ? "Invoice over the cap" : "Work done",
+    over
+      ? `${user.display_name} reported ${money(cost)} against a ${money(ticket.nte_cents)} cap. `
+        + "The work is done; the difference needs your sign-off."
+      : `${user.display_name} marked the work done${cost !== null ? ` at ${money(cost)}` : ""}.`,
+    user, { urgent: false },
+  );
   return json({
     ticket: await visibleTicket(user, ticket.id),
     messages: await ticketMessages(ticket.id),
@@ -2152,6 +2357,16 @@ async function setBilling(user: User, ticket: Ticket, req: Request): Promise<Res
     `${user.display_name} recorded that this ${said[to]}.${note ? ` ${note}` : ""}`,
     user.id,
   );
+  // A recharge is money out of the tenant's pocket; they hear it from us, now,
+  // rather than from their deposit statement later.
+  if (to === "tenant") {
+    await tell(
+      ticket.id, ["tenant"], "billing", "You may be charged for this repair",
+      `${user.display_name} has recorded that the cost of this repair is being recharged to you: `
+        + `${note}\n\nIf you disagree, say so on the request — it is the record of what was decided.`,
+      user, { urgent: false },
+    );
+  }
   return json({
     ticket: await visibleTicket(user, ticket.id),
     messages: await ticketMessages(ticket.id),
@@ -2283,6 +2498,326 @@ async function saveDispatchSettings(user: User, req: Request): Promise<Response>
   return await dispatchSettings(user, new URL("http://x/api/dispatch"));
 }
 
+/* ---------------------------------------------------------------- account */
+
+/** Contact details: where notifications and reset links go. */
+async function updateAccount(user: User, req: Request): Promise<Response> {
+  const b = (await req.json().catch(() => null)) as Record<string, unknown> | null;
+  if (!b) return fail("Malformed request body.");
+
+  const sets: string[] = [];
+  const params: Record<string, unknown> = { id: user.id };
+  if (b.email !== undefined) {
+    const email = parseEmail(b.email);
+    if (email === false) return fail("That email address doesn't look right.");
+    sets.push("email = $email");
+    params.email = email;
+  }
+  if (b.phone !== undefined) {
+    const phone = parsePhone(b.phone);
+    if (phone === false) {
+      return fail("That phone number doesn't look right — digits only, with the country code, e.g. +15551234567.");
+    }
+    sets.push("phone = $phone");
+    params.phone = phone;
+  }
+  if (sets.length) {
+    await db.run(`UPDATE users SET ${sets.join(", ")} WHERE id = $id`, params);
+  }
+  const fresh = (await db.get<User>("SELECT * FROM users WHERE id = ?", [user.id]))!;
+  return json({ user: await publicUser(fresh) });
+}
+
+/* --------------------------------------------------------- password reset */
+
+const RESET_SENT =
+  "If that account has an email address on file, a reset link is on its way. It works once, "
+  + "for an hour. No email on your account? Ask your landlord for a reset code.";
+
+/**
+ * Ask for a reset link. Answers the same way whether or not the account exists
+ * or has an email, so it cannot be used to find out either.
+ *
+ * Throttled per name asked about, like sign-in — otherwise it is a way to fill
+ * somebody's inbox.
+ */
+async function forgotPassword(req: Request): Promise<Response> {
+  const b = (await req.json().catch(() => null)) as Record<string, unknown> | null;
+  const login = String(b?.login ?? "").trim();
+  if (!login) return fail("Enter your username or email address.");
+
+  const key = `reset:${login.toLowerCase()}`;
+  if (await loginBlocked(key)) return fail("Too many reset requests. Try again in 15 minutes.", 429);
+  await noteFailedLogin(key);
+
+  const users = login.includes("@")
+    ? await db.all<User>("SELECT * FROM users WHERE email = ?", [login.toLowerCase()])
+    : await db.all<User>("SELECT * FROM users WHERE username = ?", [login]);
+
+  // Configured, or this request's own — never an address learned from some
+  // earlier request, which a forged Host header could have planted there.
+  const base = configuredAppUrl() || frontEndOrigin(req);
+  for (const u of users) {
+    if (!u.email) continue;
+    const { secret } = await issueReset(u.id, "link");
+    await notifyUser(u.id, {
+      kind: "password_reset",
+      subject: "Reset your knoknok password",
+      body: `Someone — hopefully you — asked to reset the password for ${u.username}.\n\n`
+        + `Choose a new one here:\n${base}/#reset=${secret}\n\n`
+        + "The link works once and expires in an hour. If you didn't ask for this, ignore it: "
+        + "your password hasn't changed.",
+      secret,
+    });
+  }
+  return json({ ok: true, message: RESET_SENT });
+}
+
+/**
+ * Set a new password with a reset link or a landlord's code, and sign in.
+ *
+ * Every other session on the account ends: whoever had the old password — which
+ * may be the reason for the reset — is out.
+ */
+async function resetPassword(req: Request): Promise<Response> {
+  const b = (await req.json().catch(() => null)) as Record<string, unknown> | null;
+  const secret = String(b?.token ?? "").trim();
+  const username = String(b?.username ?? "").trim() || null;
+  const next = String(b?.newPassword ?? "");
+
+  if (!secret) return fail("Enter the reset code, or open the link from the email.");
+  // Checked before the secret is spent, so a too-short password does not burn it.
+  if (next.length < 8) return fail("New password must be at least 8 characters.");
+
+  // A code is short, so guesses at one are counted against the username, the
+  // same way guesses at a password are.
+  const key = username ? `reset-code:${username.toLowerCase()}` : null;
+  if (key && await loginBlocked(key)) {
+    return fail("Too many wrong codes. Try again in 15 minutes.", 429);
+  }
+
+  const redeemed = await redeemReset(secret, username);
+  if (!redeemed) {
+    if (key) await noteFailedLogin(key);
+    return fail("That reset link or code has expired, has already been used, or doesn't match.", 400);
+  }
+
+  await db.run("UPDATE users SET password_hash = ? WHERE id = ?", [await hashPassword(next), redeemed.user_id]);
+  await dropOtherSessions(redeemed.user_id, null);
+  const user = (await db.get<User>("SELECT * FROM users WHERE id = ?", [redeemed.user_id]))!;
+  await clearLoginAttempts(user.username.toLowerCase());
+  if (key) await clearLoginAttempts(key);
+
+  // Always worth telling the account's own address. If it was not them, this is
+  // how they find out.
+  await notifyUser(user.id, {
+    kind: "password_changed",
+    subject: "Your knoknok password was changed",
+    body: redeemed.kind === "code"
+      ? "Your password was reset using a code from your landlord, and every other device was "
+        + "signed out. If that wasn't you, contact your landlord straight away."
+      : "Your password was reset from the emailed link, and every other device was signed out. "
+        + "If that wasn't you, reset it again now.",
+  });
+
+  const token = await createSession(user.id);
+  return json({ user: await publicUser(user), token }, 200, {
+    "set-cookie": sessionCookie(req, token),
+  });
+}
+
+/**
+ * A landlord issues a one-time reset code for one of their tenants.
+ *
+ * For the tenant with no email on file who has forgotten their password and is
+ * standing in the hallway with a leak. The landlord reads the code out; the
+ * tenant types it with their username. Tenants only — a vendor works for other
+ * landlords too, and no one landlord gets to take over that account.
+ */
+async function tenantResetCode(landlord: User, tenantId: number): Promise<Response> {
+  const tenant = await propertyTenant(landlord, tenantId);
+  if (!tenant) return fail("That tenant is not on any of your properties.", 404);
+  const { secret, expiresAt } = await issueReset(tenant.id, "code", landlord.id);
+  return json({
+    code: secret,
+    username: tenant.username,
+    displayName: tenant.display_name,
+    expiresAt,
+  });
+}
+
+/* ---------------------------------------------------------- who is in */
+
+/**
+ * End a tenancy: the tenant loses access to the property, and to everything on
+ * it, from their next request onwards.
+ *
+ * Their requests stay — the leak they reported is still a leak — and keep the
+ * unit they were about, so the history is the flat's, not the person's.
+ * Anything still in private triage with the bot is closed, since nobody will
+ * finish that conversation. The account itself survives: the same person can
+ * join their next building with its code.
+ */
+async function endTenancy(landlord: User, tenantId: number, req: Request): Promise<Response> {
+  const tenant = await propertyTenant(landlord, tenantId);
+  if (!tenant) return fail("That tenant is not on any of your properties.", 404);
+  const b = (await req.json().catch(() => null)) as Record<string, unknown> | null;
+  const note = String(b?.note ?? "").trim().slice(0, 500);
+  const property = (await db.get<{ name: string }>(
+    "SELECT name FROM properties WHERE id = ?", [tenant.property_id]))!;
+
+  const triaging = await db.all<{ id: number }>(
+    "SELECT id FROM tickets WHERE tenant_id = ? AND property_id = ? AND status = 'triage'",
+    [tenant.id, tenant.property_id],
+  );
+  for (const t of triaging) {
+    await db.run(
+      `UPDATE tickets SET status = 'closed', resolution = 'Closed when the tenancy ended.',
+                          closed_by = ?, closed_at = datetime('now'), updated_at = datetime('now')
+        WHERE id = ?`,
+      [landlord.display_name, t.id],
+    );
+    await addMessage(t.id, "system", "Closed when the tenancy ended.", landlord.id);
+  }
+
+  const open = await db.all<{ id: number }>(
+    "SELECT id FROM tickets WHERE tenant_id = ? AND property_id = ? AND status = 'open'",
+    [tenant.id, tenant.property_id],
+  );
+  for (const t of open) {
+    await addMessage(
+      t.id, "system",
+      `${tenant.display_name} has moved out and can no longer see this request. The work is still open.`,
+      landlord.id,
+    );
+  }
+
+  await db.run("UPDATE users SET property_id = NULL, unit = NULL WHERE id = ?", [tenant.id]);
+  await notifyUser(tenant.id, {
+    kind: "tenancy_ended",
+    subject: `Your access to ${property.name} has ended`,
+    body: `${landlord.display_name} has ended your tenancy at ${property.name}`
+      + `${tenant.unit ? `, unit ${tenant.unit}` : ""}, so its requests and messages are no `
+      + `longer in your account.${note ? `\n\n${note}` : ""}\n\n`
+      + "Moving somewhere else that uses knoknok? Sign in and enter the new property's code.",
+  });
+  return json({ ok: true, closed: triaging.length, stillOpen: open.length });
+}
+
+/**
+ * Drop a vendor from everything this landlord owns.
+ *
+ * Their open jobs here go back to the pool — or straight on to the next
+ * first-choice vendor, if there is one — so removing a contractor never strands
+ * a repair with nobody on it. Finished work keeps their name: that is the
+ * record of who did it.
+ */
+async function removeVendor(landlord: User, vendorId: number): Promise<Response> {
+  const owned = await accessibleProperties(landlord);
+  if (!owned.length) return fail("That vendor is not in your network.", 404);
+  const vendor = (await networkVendors(landlord, owned)).find((v) => v.id === vendorId);
+  if (!vendor) return fail("That vendor is not in your network.", 404);
+  const holes = owned.map(() => "?").join(",");
+
+  await db.run("DELETE FROM landlord_vendors WHERE landlord_id = ? AND vendor_id = ?", [landlord.id, vendorId]);
+  await db.run(`DELETE FROM property_vendors WHERE vendor_id = ? AND property_id IN (${holes})`,
+    [vendorId, ...owned]);
+  await db.run("DELETE FROM preferred_vendors WHERE landlord_id = ? AND vendor_id = ?", [landlord.id, vendorId]);
+  await db.run(
+    `UPDATE recurring_tasks SET assigned_vendor_id = NULL
+      WHERE assigned_vendor_id = ? AND property_id IN (${holes})`,
+    [vendorId, ...owned],
+  );
+
+  const jobs = await db.all<Ticket>(
+    `SELECT * FROM tickets
+      WHERE assigned_vendor_id = ? AND property_id IN (${holes})
+        AND status = 'open' AND wo_status IN ('new', 'assigned', 'scheduled', 'awaiting_approval')`,
+    [vendorId, ...owned],
+  );
+  for (const job of jobs) {
+    await db.run(
+      `UPDATE tickets SET assigned_vendor_id = NULL, scheduled_for = NULL, updated_at = datetime('now'),
+                          wo_status = CASE WHEN wo_status IN ('assigned', 'scheduled')
+                                           THEN 'new' ELSE wo_status END
+        WHERE id = ?`,
+      [job.id],
+    );
+    await addMessage(
+      job.id, "system",
+      `${vendor.display_name} is no longer working with ${landlord.display_name}, so this job `
+        + "needs someone else.",
+      landlord.id,
+    );
+    const fresh = (await db.get<Ticket>("SELECT * FROM tickets WHERE id = ?", [job.id]))!;
+    if (fresh.wo_status === "new") {
+      await dispatch(fresh, (fresh.trade ?? tradeFor(fresh.category, fresh.title)) as Trade);
+    }
+  }
+
+  // Their cursor may be pointing at a building they can no longer see.
+  const v = (await db.get<User>("SELECT * FROM users WHERE id = ?", [vendorId]))!;
+  if (v.property_id && owned.includes(v.property_id)) {
+    const remaining = await accessibleProperties(v);
+    await db.run("UPDATE users SET property_id = ? WHERE id = ?", [remaining[0] ?? null, vendorId]);
+  }
+  await notifyUser(vendorId, {
+    kind: "network_removed",
+    subject: `${landlord.display_name} has removed you from their properties`,
+    body: `You no longer have access to ${landlord.display_name}'s properties or jobs. `
+      + (jobs.length
+        ? `${jobs.length} open job${jobs.length === 1 ? " you had has" : "s you had have"} been reassigned.`
+        : ""),
+  });
+  return json({ ok: true, reassigned: jobs.length });
+}
+
+/**
+ * Replace an invite code. Nobody already in is affected — a code only ever
+ * lets new people in — but anyone who has the old one and has not used it yet
+ * will need the new one. This is what to do when a code has been handed to
+ * someone it should not have been, or a tenant who has left still has it.
+ */
+async function rotateCode(landlord: User, req: Request): Promise<Response> {
+  const b = (await req.json().catch(() => null)) as Record<string, unknown> | null;
+  const kind = String(b?.kind ?? "");
+  if (kind === "portfolio") {
+    await db.run("UPDATE users SET vendor_code = ? WHERE id = ?",
+      [await uniqueCode("portfolio_code"), landlord.id]);
+  } else if (kind === "tenant" || kind === "vendor") {
+    const propertyId = Number(b?.propertyId ?? landlord.property_id);
+    if (!(await landlordOwns(landlord.id, propertyId))) return fail("That property is not yours.", 403);
+    const column = kind === "tenant" ? "join_code" : "vendor_code";
+    await db.run(`UPDATE properties SET ${column} = ? WHERE id = ?`,
+      [await uniqueCode(column), propertyId]);
+  } else {
+    return fail("Which code? tenant, vendor or portfolio.");
+  }
+  const fresh = (await db.get<User>("SELECT * FROM users WHERE id = ?", [landlord.id]))!;
+  return json({ user: await publicUser(fresh), properties: await propertiesFor(fresh) });
+}
+
+/**
+ * A tenant with no property — their last tenancy ended — joins a new one. The
+ * same code and unit as signing up; the account and its history come along.
+ */
+async function joinPropertyAsTenant(user: User, req: Request): Promise<Response> {
+  if (user.property_id) {
+    return fail("You're already on a property. Your landlord needs to end that tenancy first.", 409);
+  }
+  const b = (await req.json().catch(() => null)) as Record<string, string> | null;
+  const joinCode = String(b?.joinCode ?? "").trim().toUpperCase();
+  const unit = String(b?.unit ?? "").trim();
+  if (!joinCode) return fail("Enter the property code your landlord gave you.");
+  if (!unit) return fail("Enter your unit number.");
+  const property = await db.get<{ id: number }>("SELECT id FROM properties WHERE join_code = ?", [joinCode]);
+  if (!property) return fail("No property matches that code.");
+
+  await db.run("UPDATE users SET property_id = ?, unit = ? WHERE id = ?", [property.id, unit, user.id]);
+  const fresh = (await db.get<User>("SELECT * FROM users WHERE id = ?", [user.id]))!;
+  return json({ user: await publicUser(fresh) });
+}
+
 /* ------------------------------------------------------------- the router */
 
 /** Handles every `/api/*` request. Returns null for anything else. */
@@ -2292,6 +2827,7 @@ export async function handleApi(req: Request): Promise<Response | null> {
   if (!path.startsWith("/api/")) return null;
 
   const cors = corsHeaders(req);
+  rememberOrigin(frontEndOrigin(req));
   // Preflight: the browser asks before sending the real cross-origin request.
   if (req.method === "OPTIONS") {
     return withCors(new Response(null, { status: 204 }), cors);
@@ -2314,6 +2850,9 @@ export async function handleApi(req: Request): Promise<Response | null> {
 async function route(req: Request, url: URL, path: string): Promise<Response> {
   if (path === "/api/signup" && req.method === "POST") return await handleSignup(req);
   if (path === "/api/login" && req.method === "POST") return await handleLogin(req);
+  // Both of these are for someone who cannot sign in, so neither needs to.
+  if (path === "/api/password/forgot" && req.method === "POST") return await forgotPassword(req);
+  if (path === "/api/password/reset" && req.method === "POST") return await resetPassword(req);
 
   if (path === "/api/logout" && req.method === "POST") {
     const token = currentToken(req);
@@ -2376,8 +2915,23 @@ async function route(req: Request, url: URL, path: string): Promise<Response> {
     }
   }
   if (path === "/api/properties/join" && req.method === "POST") {
-    if (user.role !== "vendor") return fail("Vendors only.", 403);
+    if (user.role === "tenant") return await joinPropertyAsTenant(user, req);
+    if (user.role !== "vendor") return fail("Vendors and tenants only.", 403);
     return await joinPropertyAsVendor(user, req);
+  }
+  if (path === "/api/codes" && req.method === "POST") {
+    if (user.role !== "landlord") return fail("Landlords only.", 403);
+    return await rotateCode(user, req);
+  }
+  // The people on a landlord's properties: ending a tenancy, a reset code for a
+  // tenant locked out, and dropping a vendor.
+  const person = path.match(/^\/api\/(tenants|vendors)\/(\d+)\/(remove|reset-code)$/);
+  if (person && req.method === "POST") {
+    if (user.role !== "landlord") return fail("Landlords only.", 403);
+    const [, kind, id, action] = person;
+    if (kind === "tenants" && action === "remove") return await endTenancy(user, Number(id), req);
+    if (kind === "tenants" && action === "reset-code") return await tenantResetCode(user, Number(id));
+    if (kind === "vendors" && action === "remove") return await removeVendor(user, Number(id));
   }
   const selecting = path.match(/^\/api\/properties\/(\d+)\/select$/);
   if (selecting && req.method === "POST") {
@@ -2389,6 +2943,11 @@ async function route(req: Request, url: URL, path: string): Promise<Response> {
 
   if (path === "/api/password" && req.method === "POST") {
     return await changePassword(user, req, currentToken(req));
+  }
+  if (path === "/api/account" && req.method === "POST") return await updateAccount(user, req);
+  // What this person has been told outside the app, and whether it reached them.
+  if (path === "/api/notifications" && req.method === "GET") {
+    return json({ notifications: await recentNotifications(user.id), channels: channels() });
   }
   if (path === "/api/chats" && req.method === "GET") {
     return await listChats(user, url);
